@@ -49,9 +49,11 @@
 //    E - E0,1 means read channel zero, line 1. Line 0 is voltage out, line 1 is current sense.
 //        Returns (prints over serial) value in raw adc units.
 //    V - V0 means default serial reporting, V1 means verbose
+//    Q - sine wave
 
 
 #include <Stimjim.h>
+#include <math.h>
 
 #define PT_ARRAY_LENGTH 100
 #define MAX_NUM_STAGES 10
@@ -166,6 +168,88 @@ int pulse (volatile PulseTrain* PT)
 
     return 1;
 }
+int sinewave(volatile PulseTrain* PT)
+{
+    Serial.println("Q0start");
+    //check if the pulseTrain is finished; if so, exit
+    /*if (micros() - PT->trainStartTime >= PT->duration)
+        return 0;*/
+    
+    Serial.println("Q0start5");
+    uint32_t t0, t;
+    t0 = micros();
+  
+
+
+
+    int dac0val, dac1val;
+    float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
+    float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
+    float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
+    dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+    dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+
+    if (PT->mode[0] < 2 && PT->mode[1] < 2) {
+        Stimjim.writeToDacs(dac0val, dac1val);
+    } else if (PT->mode[0] < 2) {
+        Stimjim.writeToDac(0, dac0val);
+    } else if (PT->mode[1] < 2) {
+        Stimjim.writeToDac(1, dac1val);
+    }
+    if (PT->mode[0] < 2)
+        Stimjim.setOutputMode(0, PT->mode[0]);
+
+    if (PT->mode[1] < 2)
+        Stimjim.setOutputMode(1, PT->mode[1]);
+    for (int i = 0; i < 5000; i++) {
+        t = micros()-t0;
+        //delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
+        Serial.printf("%d ",i);
+
+        // read ADCs
+        if (PT->mode[0] < 2)
+            PT->measuredAmplitude[0][i] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+        if (PT->mode[1] < 2)
+            PT->measuredAmplitude[1][i] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+
+        if ( i + 1 < 5000) {
+            dac0val = int(round(100.*sin(t*100/1000000.))) / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+            dac1val = int(round(500.*sin(t*100/1000000.))) / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+        } else { // we're in the last stage, set DACs back to zero
+            dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
+            dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
+        }
+    
+
+
+    
+
+
+        // write to dacs
+        if (PT->mode[0] < 2 && PT->mode[1] < 2) {
+            Stimjim.writeToDacs(dac0val, dac1val);
+        } else if (PT->mode[0] < 2) {
+            Stimjim.writeToDac(0, dac0val);
+        } else if (PT->mode[1] < 2) {
+            Stimjim.writeToDac(1, dac1val);
+        }
+    }
+    Serial.printf("Q0stop %ld\n", t);
+
+    // switch outputs to ground
+    if (PT->mode[0] < 2)
+        Stimjim.setOutputMode(0, 3);
+
+  Serial.printf("a");
+    if (PT->mode[1] < 2)
+        Stimjim.setOutputMode(1, 3);
+
+    PT->nPulses++;
+    Serial.printf("b\n");
+
+
+    return 1;
+}
 
 
 void printTrainResultSummary(volatile PulseTrain* PT)
@@ -186,6 +270,29 @@ void printTrainResultSummary(volatile PulseTrain* PT)
 void pulse0()
 {
     if (!pulse(activePT0)) {
+
+        IT0.end();
+        printTrainResultSummary(activePT0);
+
+        if (activePT0->mode[0] < 2) {
+            digitalWriteFast(LED0, LOW);
+            digitalWriteFast(GPIO_10, LOW);
+            if (trigOutput[0])
+                digitalWriteFast(IN0, LOW);
+        }
+
+        if (activePT0->mode[1] < 2) {
+            digitalWriteFast(LED1, LOW);
+            digitalWriteFast(GPIO_11, LOW);
+            if (trigOutput[1])
+                digitalWriteFast(IN1, LOW);
+        }
+    }
+}
+
+void sinewave0()
+{
+    if (!sinewave(activePT0)) {
 
         IT0.end();
         printTrainResultSummary(activePT0);
@@ -288,6 +395,54 @@ void startIT0(int ptIndex)
     }
 
     pulse0(); //intervalTimer starts with delay - we want to start with pulse!
+}
+
+void startSINE(int ptIndex)
+{
+    if (ptIndex < 0) {
+
+        Serial.println("Forcing T train to stop");
+        IT0.end();
+
+        if (activePT0->mode[0] < 2) {
+            digitalWriteFast(LED0, LOW);
+            digitalWriteFast(GPIO_10, LOW);
+            if (trigOutput[0])
+              digitalWriteFast(IN0, LOW);
+        }
+
+        if (activePT0->mode[1] < 2) {
+            digitalWriteFast(LED1, LOW);
+            digitalWriteFast(GPIO_11, LOW);
+            if (trigOutput[1])
+                digitalWriteFast(IN1, LOW);
+        }
+
+        return;
+    }
+
+    activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
+    activePT0->trainStartTime = micros();
+    if (!IT0.begin(sinewave0, activePT0->period))
+        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+
+    Serial.print("\r\nStarted T train with parameters of PulseTrain "); Serial.println(ptIndex);
+
+    if (activePT0->mode[0] < 2) {
+        digitalWriteFast(LED0, HIGH);
+        digitalWriteFast(GPIO_10, HIGH);
+        if (trigOutput[0])
+          digitalWriteFast(IN0, HIGH);
+    }
+
+    if (activePT0->mode[1] < 2){
+        digitalWriteFast(LED1, HIGH);
+        digitalWriteFast(GPIO_11, HIGH);
+        if (trigOutput[1])
+          digitalWriteFast(IN1, HIGH);
+    }
+
+    sinewave0(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
 void startIT1(int ptIndex)
@@ -483,7 +638,22 @@ void loop()
                     startIT0(ptIndex);
                 if (comBuf[0] == 'U')
                     startIT1(ptIndex);
+            
 
+            } else if (comBuf[0] == 'Q') {
+
+                ptIndex = atoi(comBuf + 1);
+                if (ptIndex >= PT_ARRAY_LENGTH) {
+                    Serial.println("Invalid PulseTrain index.");
+                    bytesRecvd = 0;
+                    return;
+                }
+                Serial.println("Im here.");
+
+                if (comBuf[0] == 'Q')
+                    //startSINE(ptIndex);
+                    sinewave(PTs + ptIndex);
+                
             } else if (comBuf[0] == 'B') {
 
                 Stimjim.getAdcOffsets();
@@ -571,4 +741,5 @@ void loop()
             bytesRecvd = 0; // reset the pointer!
         }
     }
+
 }
