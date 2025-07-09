@@ -57,6 +57,7 @@
 
 #define PT_ARRAY_LENGTH 100
 #define MAX_NUM_STAGES 10
+#define pi 3.141592653
 
 // ------------- Serial setup ---------------------------------- //
 char comBuf[1000];
@@ -77,6 +78,9 @@ struct PulseTrain {
     int nPulses;
     int measuredAmplitude[4][MAX_NUM_STAGES];     // Ch0_V, Ch0_I, Ch1_V, Ch1_I
 };
+
+float sinetable[8192];
+
 
 
 volatile PulseTrain PTs[PT_ARRAY_LENGTH];
@@ -188,6 +192,15 @@ int sinewave(volatile PulseTrain* PT)
     float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
     dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
     dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+    float f= 8192*100/1000000.;
+    float f1 = 8192*(PT-> amplitude[1][1])/1000000.;
+    float f0 = 8192*(PT-> amplitude[0][1])/1000000.;
+    //8192-tablazat hossza(periodus)
+    // /1000000- us-> s
+
+
+    
+
 
     if (PT->mode[0] < 2 && PT->mode[1] < 2) {
         Stimjim.writeToDacs(dac0val, dac1val);
@@ -201,20 +214,20 @@ int sinewave(volatile PulseTrain* PT)
 
     if (PT->mode[1] < 2)
         Stimjim.setOutputMode(1, PT->mode[1]);
-    for (int i = 0; i < 5000; i++) {
+    for (  ; t < PT->stageDuration[0]; ){
         t = micros()-t0;
+    
         //delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
-        Serial.printf("%d ",i);
 
         // read ADCs
         if (PT->mode[0] < 2)
-            PT->measuredAmplitude[0][i] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
         if (PT->mode[1] < 2)
-            PT->measuredAmplitude[1][i] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
 
-        if ( i + 1 < 5000) {
-            dac0val = int(round(100.*sin(t*100/1000000.))) / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-            dac1val = int(round(500.*sin(t*100/1000000.))) / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+        if (t < PT->stageDuration[0]) {
+            dac0val = int(round(PT->amplitude[0][0]*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+            dac1val = int(round(PT->amplitude[1][0]*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
         } else { // we're in the last stage, set DACs back to zero
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
@@ -535,6 +548,15 @@ void setup()
     Serial.begin(112500);
     bytesRecvd = 0;
     delay(1000);
+    float reciprok;
+
+    //sine table values
+    sinetable[0]= 0;
+    reciprok = 1/8192.;
+
+    for(int i=0; i<8192; i++){
+      sinetable[i] = sin(2*pi*i*reciprok);
+    }
 
     Serial.println("Booting StimJim on Teensy 3.5!");
 
@@ -571,6 +593,8 @@ void setup()
       Serial.println(str);
 
       Serial.println("Ready to go!\r\n\r\n");
+
+
 }
 
 void loop()
