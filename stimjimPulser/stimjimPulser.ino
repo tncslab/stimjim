@@ -95,7 +95,7 @@ bool trigOutput[2];
 int pulse (volatile PulseTrain* PT);
 void pulse0();
 void pulse1();
-void startIT0(int ptIndex);
+void startIT0(int ptIndex, int isWave =0);
 void startIT0ViaInputTrigger();
 void startIT1(int ptIndex);
 void startIT1ViaInputTrigger();
@@ -362,7 +362,7 @@ void startIT1ViaInputTrigger()
         startIT1(triggerTargetPTs[1]);
 }
 
-void startIT0(int ptIndex)
+void startIT0(int ptIndex, int isWave = 0)
 {
     if (ptIndex < 0) {
 
@@ -388,9 +388,14 @@ void startIT0(int ptIndex)
 
     activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT0->trainStartTime = micros();
-    if (!IT0.begin(pulse0, activePT0->period))
+    if (isWave){
+      if (!IT0.begin(sinewave0, activePT0->period))
         Serial.println("startIT0: failure to initiate IntervalTimer IT0");
 
+    } else {
+    if (!IT0.begin(pulse0, activePT0->period))
+        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+    }
     Serial.print("\r\nStarted T train with parameters of PulseTrain "); Serial.println(ptIndex);
 
     if (activePT0->mode[0] < 2) {
@@ -676,7 +681,7 @@ void loop()
 
                 if (comBuf[0] == 'Q')
                     //startSINE(ptIndex);
-                    sinewave(PTs + ptIndex);
+                    startIT0(ptIndex, 1);
                 
             } else if (comBuf[0] == 'B') {
 
