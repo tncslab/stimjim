@@ -192,6 +192,9 @@ int sinewave(volatile PulseTrain* PT)
 
     float f1 = 8192*(PT-> amplitude[1][1])/1000000.;
     float f0 = 8192*(PT-> amplitude[0][1])/1000000.;
+    float meresido0 = 0.25 / f0;
+    float meresido1 = 0.25 / f1;
+    int merendo0 = 1, merendo1 = 1;
     //8192-tablazat hossza(periodus)
     // /1000000- us-> s
 
@@ -214,18 +217,22 @@ int sinewave(volatile PulseTrain* PT)
     
         //delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
 
-        // read ADCs
-        if (PT->mode[0] < 2)
-            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
-        if (PT->mode[1] < 2)
-            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
-
         if (t < PT->stageDuration[0]) {
             dac0val = int(round(PT->amplitude[0][0]*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
             dac1val = int(round(PT->amplitude[1][0]*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
         } else { // we're in the last stage, set DACs back to zero
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
+        }
+        
+        // read ADCs, TODO measure both voltage and current for impedance estimation 
+        if (merendo0 && (meresido0 < t) && (PT->mode[0] < 2)) {
+            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            merendo0 = 0;
+        }
+        if (merendo1 && (meresido1 < t) && (PT->mode[1] < 2)) {
+            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            merendo1 = 0;
         }
 
         // write to dacs
