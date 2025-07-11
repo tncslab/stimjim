@@ -180,27 +180,20 @@ int sinewave(volatile PulseTrain* PT)
         return 0;*/
     
     Serial.println("Q0start5");
-    uint32_t t0, t;
+    uint32_t t0, t=0;
     t0 = micros();
-  
-
-
 
     int dac0val, dac1val;
-    float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
-    float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
-    float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
+    //float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
+    //float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
+    //float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
     dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
     dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
-    float f= 8192*100/1000000.;
+
     float f1 = 8192*(PT-> amplitude[1][1])/1000000.;
     float f0 = 8192*(PT-> amplitude[0][1])/1000000.;
     //8192-tablazat hossza(periodus)
     // /1000000- us-> s
-
-
-    
-
 
     if (PT->mode[0] < 2 && PT->mode[1] < 2) {
         Stimjim.writeToDacs(dac0val, dac1val);
@@ -232,11 +225,6 @@ int sinewave(volatile PulseTrain* PT)
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
         }
-    
-
-
-    
-
 
         // write to dacs
         if (PT->mode[0] < 2 && PT->mode[1] < 2) {
@@ -362,7 +350,7 @@ void startIT1ViaInputTrigger()
         startIT1(triggerTargetPTs[1]);
 }
 
-void startIT0(int ptIndex, int isWave = 0)
+void startIT0(int ptIndex, int isWave)
 {
     if (ptIndex < 0) {
 
