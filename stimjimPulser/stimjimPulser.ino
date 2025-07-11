@@ -208,7 +208,8 @@ int sinewave(volatile PulseTrain* PT)
     if (PT->mode[1] < 2)
         Stimjim.setOutputMode(1, PT->mode[1]);
 
-    for (  ; t < PT->stageDuration[0]; ){
+    int c;
+    for (c = 0; t < PT->stageDuration[0]; c++){
         t = micros()-t0;
     
         //delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
@@ -236,7 +237,7 @@ int sinewave(volatile PulseTrain* PT)
             Stimjim.writeToDac(1, dac1val);
         }
     }
-    Serial.printf("Q0stop %ld\n", t);
+    Serial.printf("Q0stop %ld %d\n", t, c);
 
     // switch outputs to ground
     if (PT->mode[0] < 2)
@@ -246,7 +247,6 @@ int sinewave(volatile PulseTrain* PT)
         Stimjim.setOutputMode(1, 3);
 
     PT->nPulses++;
-
 
     return 1;
 }
@@ -400,7 +400,10 @@ void startIT0(int ptIndex, int isWave)
           digitalWriteFast(IN1, HIGH);
     }
 
-    pulse0(); //intervalTimer starts with delay - we want to start with pulse!
+    if (isWave)
+        sinewave0();
+    else
+        pulse0(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
 void startSINE(int ptIndex)
