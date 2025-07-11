@@ -174,15 +174,15 @@ int pulse (volatile PulseTrain* PT)
 }
 int sinewave(volatile PulseTrain* PT)
 {
-    Serial.println("Q0start");
     //check if the pulseTrain is finished; if so, exit
-    /*if (micros() - PT->trainStartTime >= PT->duration)
-        return 0;*/
+    if (micros() - PT->trainStartTime >= PT->duration)
+        return 0;
     
-    Serial.println("Q0start5");
     uint32_t t0, t=0;
     t0 = micros();
 
+    Serial.printf("Q0start %ld\n", t0);
+    
     int dac0val, dac1val;
     //float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
     //float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
@@ -207,6 +207,7 @@ int sinewave(volatile PulseTrain* PT)
 
     if (PT->mode[1] < 2)
         Stimjim.setOutputMode(1, PT->mode[1]);
+
     for (  ; t < PT->stageDuration[0]; ){
         t = micros()-t0;
     
@@ -241,12 +242,10 @@ int sinewave(volatile PulseTrain* PT)
     if (PT->mode[0] < 2)
         Stimjim.setOutputMode(0, 3);
 
-  Serial.printf("a");
     if (PT->mode[1] < 2)
         Stimjim.setOutputMode(1, 3);
 
     PT->nPulses++;
-    Serial.printf("b\n");
 
 
     return 1;
@@ -379,12 +378,13 @@ void startIT0(int ptIndex, int isWave)
     if (isWave){
       if (!IT0.begin(sinewave0, activePT0->period))
         Serial.println("startIT0: failure to initiate IntervalTimer IT0");
-
+        Serial.print("\r\nStarted T wave with parameters of PulseTrain ");
     } else {
     if (!IT0.begin(pulse0, activePT0->period))
         Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+        Serial.print("\r\nStarted T train with parameters of PulseTrain ");
     }
-    Serial.print("\r\nStarted T train with parameters of PulseTrain "); Serial.println(ptIndex);
+    Serial.println(ptIndex);
 
     if (activePT0->mode[0] < 2) {
         digitalWriteFast(LED0, HIGH);
