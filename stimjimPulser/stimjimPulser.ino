@@ -95,9 +95,9 @@ bool trigOutput[2];
 int pulse (volatile PulseTrain* PT);
 void pulse0();
 void pulse1();
-void startIT0(int ptIndex, int isWave =0);
+void startIT0(int ptIndex, int isWave=0);
 void startIT0ViaInputTrigger();
-void startIT1(int ptIndex);
+void startIT1(int ptIndex, int isWave=0);
 void startIT1ViaInputTrigger();
 
 void printPulseTrainParameters(int i);
@@ -338,6 +338,29 @@ void sinewave0()
     }
 }
 
+void sinewave1()
+{
+    if (!sinewave(activePT1)) {
+
+        IT0.end();
+        printWaveResultSummary(activePT1);
+
+        if (activePT1->mode[0] < 2) {
+            digitalWriteFast(LED0, LOW);
+            digitalWriteFast(GPIO_10, LOW);
+            if (trigOutput[0])
+                digitalWriteFast(IN0, LOW);
+        }
+
+        if (activePT1->mode[1] < 2) {
+            digitalWriteFast(LED1, LOW);
+            digitalWriteFast(GPIO_11, LOW);
+            if (trigOutput[1])
+                digitalWriteFast(IN1, LOW);
+        }
+    }
+}
+
 void pulse1()
 {
     if (!pulse(activePT1)) {
@@ -401,12 +424,12 @@ void startIT0(int ptIndex, int isWave)
     activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT0->trainStartTime = micros();
     if (isWave){
-      if (!IT0.begin(sinewave0, activePT0->period))
-        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+        if (!IT0.begin(sinewave0, activePT0->period))
+            Serial.println("startIT0: failure to initiate IntervalTimer IT0");
         Serial.print("\r\nStarted T wave with parameters of PulseTrain ");
     } else {
-    if (!IT0.begin(pulse0, activePT0->period))
-        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+        if (!IT0.begin(pulse0, activePT0->period))
+            Serial.println("startIT0: failure to initiate IntervalTimer IT0");
         Serial.print("\r\nStarted T train with parameters of PulseTrain ");
     }
     Serial.println(ptIndex);
@@ -479,7 +502,7 @@ void startSINE(int ptIndex)
     sinewave0(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
-void startIT1(int ptIndex)
+void startIT1(int ptIndex, int isWave)
 {
     if (ptIndex < 0) {
 
@@ -507,10 +530,16 @@ void startIT1(int ptIndex)
     activePT1 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT1->trainStartTime = micros();
 
-    if (!IT1.begin(pulse1, activePT1->period))
-        Serial.println("startIT1: failure to initiate IntervalTimer IT1");
-
-    Serial.print("\r\nStarted U train with parameters of PulseTrain "); Serial.println(ptIndex);
+    if (isWave) {
+        if (!IT1.begin(sinewave1, activePT1->period))
+            Serial.println("startIT1: failure to initiate IntervalTimer IT1");
+        Serial.print("\r\nStarted U wave with parameters of PulseTrain "); 
+    } else {
+        if (!IT1.begin(pulse1, activePT1->period))
+            Serial.println("startIT1: failure to initiate IntervalTimer IT1");
+        Serial.print("\r\nStarted U train with parameters of PulseTrain "); 
+    }
+    Serial.println(ptIndex);
 
     if (activePT1->mode[0] < 2) {
         digitalWriteFast(LED0, HIGH);
@@ -526,7 +555,10 @@ void startIT1(int ptIndex)
             digitalWriteFast(IN1, HIGH);
     }
 
-    pulse1(); //intervalTimer starts with delay - we want to start with pulse!
+    if (isWave)
+        sinewave1();
+    else
+        pulse1(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
 void printPulseTrainParameters(int i)
@@ -685,7 +717,7 @@ void loop()
                     startIT1(ptIndex);
             
 
-            } else if (comBuf[0] == 'Q') {
+            } else if (comBuf[0] == 'Q' || comBuf[0] == 'W') {
 
                 ptIndex = atoi(comBuf + 1);
                 if (ptIndex >= PT_ARRAY_LENGTH) {
@@ -693,11 +725,11 @@ void loop()
                     bytesRecvd = 0;
                     return;
                 }
-                Serial.println("Im here.");
 
                 if (comBuf[0] == 'Q')
-                    //startSINE(ptIndex);
                     startIT0(ptIndex, 1);
+                if (comBuf[0] == 'W')
+                    startIT1(ptIndex, 1);
                 
             } else if (comBuf[0] == 'B') {
 
