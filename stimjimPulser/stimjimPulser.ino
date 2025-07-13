@@ -58,6 +58,8 @@
 #define PT_ARRAY_LENGTH 100
 #define MAX_NUM_STAGES 10
 #define pi 3.141592653
+// TODO int approximation of macros MICROAMPS_PER_DAC, MICROAMPS_PER_ADC, MILLIVOLTS_PER_DAC
+// and MILLIVOLTS_PER_ADC for higher speed in sine wave
 
 // ------------- Serial setup ---------------------------------- //
 char comBuf[1000];
@@ -217,6 +219,7 @@ int sinewave(volatile PulseTrain* PT)
     
         //delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
 
+        // TODO start phase? offset phase?
         if (t < PT->stageDuration[0]) {
             dac0val = int(round(PT->amplitude[0][0]*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
             dac1val = int(round(PT->amplitude[1][0]*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
