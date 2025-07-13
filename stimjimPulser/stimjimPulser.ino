@@ -137,7 +137,7 @@ int pulse (volatile PulseTrain* PT)
     for (int i = 0; i < PT->nStages; i++) {
         delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
 
-        // read ADCs
+        // read ADCs  TODO measure both current and voltage, not only that corresponding to mode
         if (PT->mode[0] < 2)
             PT->measuredAmplitude[0][i] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
         if (PT->mode[1] < 2)
@@ -225,13 +225,15 @@ int sinewave(volatile PulseTrain* PT)
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
         }
         
-        // read ADCs, TODO measure both voltage and current for impedance estimation 
+        // read ADCs (this should be far from last DAC set, i.e., just before new DAC set)
         if (merendo0 && (meresido0 < t) && (PT->mode[0] < 2)) {
-            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, 0)-Stimjim.adcOffset10[0]) * MILLIVOLTS_PER_ADC;
+            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(0, 1)-Stimjim.adcOffset10[0]) * MICROAMPS_PER_ADC;
             merendo0 = 0;
         }
         if (merendo1 && (meresido1 < t) && (PT->mode[1] < 2)) {
-            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+            PT->measuredAmplitude[2][0] += (Stimjim.readAdc(1, 0)-Stimjim.adcOffset10[1]) * MILLIVOLTS_PER_ADC;
+            PT->measuredAmplitude[3][0] += (Stimjim.readAdc(1, 1)-Stimjim.adcOffset10[1]) * MICROAMPS_PER_ADC;
             merendo1 = 0;
         }
 
@@ -274,6 +276,22 @@ void printTrainResultSummary(volatile PulseTrain* PT)
     }
 }
 
+void printWaveResultSummary(volatile PulseTrain* PT)
+{
+    Serial.print("Train complete. Delivered "); Serial.print(PT->nPulses);
+    Serial.println(" waves.\r\nCurrent/Voltage by stage: ");
+    Serial.println("           Ch0                Ch1 ");
+    char str[200];
+    int i = 0;  // single stage
+    for (int mode = 0; mode < 2; mode++) {
+        Serial.print("Stage "); Serial.print(i);
+        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[mode + (0<<1)][i] / PT->nPulses, (mode) ? "uA" : "mV");
+        Serial.print(str);
+        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[mode + (1<<1)][i] / PT->nPulses, (mode) ? "uA" : "mV");
+        Serial.println(str);
+    }
+}
+
 void pulse0()
 {
     if (!pulse(activePT0)) {
@@ -302,7 +320,7 @@ void sinewave0()
     if (!sinewave(activePT0)) {
 
         IT0.end();
-        printTrainResultSummary(activePT0);
+        printWaveResultSummary(activePT0);
 
         if (activePT0->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
