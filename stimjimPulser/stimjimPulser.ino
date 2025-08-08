@@ -18,7 +18,7 @@
 
 // Valid serial commands:
 //    S - Set pulseTrain parameters. Example:
-//        S0,0,1,1000,100000; 100,-100,100; -50,50,20;
+//        S0,0,1,100000,300000; 100,-100,10000; -500,150,20000; 0,0,1000;
 //        1st argument (0) means set parameters for pulseTrain 0.
 //        2nd argument (0) - mode 0 (voltage) on output channel 0 (see modes below under M)
 //        3rd argument (1) - mode 1 (current) on output channel 1
@@ -33,6 +33,8 @@
 //        etc... for trios of arguments, up to 10 stages total.
 //
 //    T, U - T0 means start PulseTrain[0]. U0 also means start PulseTrain[0]. T and U can be
+//           used to run two pulse train simultaneously.
+//    Q, W - Q0 means start PulseTrain[0]. W0 also means start PulseTrain[0]. Q and W can be
 //           used to run two pulse train simultaneously.
 //    B - measure ADC offset value (by grounding output and measuring ADC value on output).
 //    C - measure current and voltage offsets by sweeping DAC values and reading output.
@@ -63,6 +65,7 @@
 
 // ------------- Serial setup ---------------------------------- //
 char comBuf[1000];
+int32_t train_count;
 int bytesRecvd;
 bool verbose = false;
 
@@ -90,7 +93,8 @@ struct PulseTrain {
 
     unsigned long trainStartTime;                 // usec
     int nPulses;
-    int measuredAmplitude[4][MAX_NUM_STAGES];     // Ch0_V, Ch0_I, Ch1_V, Ch1_I
+    int voltage[2][MAX_NUM_STAGES];     // Ch0_V, Ch1_V
+    int current[2][MAX_NUM_STAGES];     // Ch0_I, Ch1_I
 };
 
 float sinetable[8192];
@@ -132,7 +136,7 @@ int pulse (volatile PulseTrain* PT)
     int dac0val, dac1val;
     float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
     float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
-    float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
+    float totalDelayTime = dacWriteTime + adcReadTime + adcReadTime + 0.5;
     dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
     dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
@@ -152,10 +156,14 @@ int pulse (volatile PulseTrain* PT)
         delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
 
         // read ADCs  TODO measure both current and voltage, not only that corresponding to mode
-        if (PT->mode[0] < 2)
-            PT->measuredAmplitude[0][i] += (Stimjim.readAdc(0, PT->mode[0] > 0)-Stimjim.adcOffset10[0]) * ((PT->mode[0]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
-        if (PT->mode[1] < 2)
-            PT->measuredAmplitude[1][i] += (Stimjim.readAdc(1, PT->mode[1] > 0)-Stimjim.adcOffset10[1]) * ((PT->mode[1]) ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+        if (PT->mode[0] < 2) {
+            PT->voltage[0][i] += (Stimjim.readAdc(0, 0)-Stimjim.adcOffset10[0]) * MILLIVOLTS_PER_ADC;
+            PT->current[0][i] += (Stimjim.readAdc(0, 1)-Stimjim.adcOffset10[0]) * MICROAMPS_PER_ADC;
+        }
+        if (PT->mode[1] < 2) {
+            PT->voltage[1][i] += (Stimjim.readAdc(1, 0)-Stimjim.adcOffset10[1]) * MILLIVOLTS_PER_ADC;
+            PT->current[1][i] += (Stimjim.readAdc(1, 1)-Stimjim.adcOffset10[1]) * MICROAMPS_PER_ADC;
+        }
 
         if ( i + 1 < PT->nStages) {
             dac0val = PT->amplitude[0][i + 1] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
@@ -195,8 +203,6 @@ int sinewave(volatile PulseTrain* PT)
     uint32_t t0, t=0;
     t0 = micros();
 
-    Serial.printf("Q0start %ld\n", t0);
-    
     int dac0val, dac1val;
     //float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
     //float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
@@ -242,13 +248,13 @@ int sinewave(volatile PulseTrain* PT)
         
         // read ADCs (this should be far from last DAC set, i.e., just before new DAC set)
         if (merendo0 && (meresido0 < t) && (PT->mode[0] < 2)) {
-            PT->measuredAmplitude[0][0] += (Stimjim.readAdc(0, 0)-Stimjim.adcOffset10[0]) * MILLIVOLTS_PER_ADC;
-            PT->measuredAmplitude[1][0] += (Stimjim.readAdc(0, 1)-Stimjim.adcOffset10[0]) * MICROAMPS_PER_ADC;
+            PT->voltage[0][0] += (Stimjim.readAdc(0, 0)-Stimjim.adcOffset10[0]) * MILLIVOLTS_PER_ADC;
+            PT->current[0][0] += (Stimjim.readAdc(0, 1)-Stimjim.adcOffset10[0]) * MICROAMPS_PER_ADC;
             merendo0 = 0;
         }
         if (merendo1 && (meresido1 < t) && (PT->mode[1] < 2)) {
-            PT->measuredAmplitude[2][0] += (Stimjim.readAdc(1, 0)-Stimjim.adcOffset10[1]) * MILLIVOLTS_PER_ADC;
-            PT->measuredAmplitude[3][0] += (Stimjim.readAdc(1, 1)-Stimjim.adcOffset10[1]) * MICROAMPS_PER_ADC;
+            PT->voltage[1][0] += (Stimjim.readAdc(1, 0)-Stimjim.adcOffset10[1]) * MILLIVOLTS_PER_ADC;
+            PT->current[1][0] += (Stimjim.readAdc(1, 1)-Stimjim.adcOffset10[1]) * MICROAMPS_PER_ADC;
             merendo1 = 0;
         }
 
@@ -297,14 +303,19 @@ void printWaveResultSummary(volatile PulseTrain* PT)
     Serial.println(" waves.\r\nCurrent/Voltage by stage: ");
     Serial.println("           Ch0                Ch1 ");
     char str[200];
-    int i = 0;  // single stage
-    for (int mode = 0; mode < 2; mode++) {
-        Serial.print("Stage "); Serial.print(i);
-        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[mode + (0<<1)][i] / PT->nPulses, (mode) ? "uA" : "mV");
-        Serial.print(str);
-        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[mode + (1<<1)][i] / PT->nPulses, (mode) ? "uA" : "mV");
-        Serial.println(str);
-    }
+    const int i = 0;  // single stage
+    Serial.print("Stage "); Serial.print(i);
+    sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
+    Serial.print(str);
+    sprintf(str, "%6d%s,          ", PT->voltage[1][i] / PT->nPulses, "mV");
+    Serial.println(str);
+    Serial.print("       ");
+    sprintf(str, "%6d%s,          ", PT->current[0][i] / PT->nPulses, "uA");
+    Serial.print(str);
+    sprintf(str, "%6d%s,          ", PT->current[1][i] / PT->nPulses, "uA");
+    Serial.println(str);
+}
+
 }
 
 void pulse0()
@@ -661,7 +672,6 @@ void setup()
       Serial.println(str);
 
       Serial.println("Ready to go!\r\n\r\n");
-
 
 }
 
