@@ -66,6 +66,14 @@ char comBuf[1000];
 int bytesRecvd;
 bool verbose = false;
 
+struct Wave {
+    int amplitude;
+    int frequency;
+    int phase;
+    int _unused[MAX_NUM_STAGES-3];
+};
+
+
 // ------------- PulseTrain parameter setup -------------------- //
 struct PulseTrain {
     unsigned int mode[2];
@@ -73,7 +81,11 @@ struct PulseTrain {
     unsigned long duration;                       // usec
 
     int nStages;
+    union {
     int amplitude[2][MAX_NUM_STAGES];             // mV or uA, depending on mode
+    Wave wave[2];
+    };
+
     unsigned int stageDuration[MAX_NUM_STAGES];   // usec
 
     unsigned long trainStartTime;                 // usec
@@ -189,11 +201,11 @@ int sinewave(volatile PulseTrain* PT)
     //float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
     //float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
     //float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
-    dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-    dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+    dac0val = PT->wave[0].amplitude / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+    dac1val = PT->wave[1].amplitude / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
-    float f1 = 8192*(PT-> amplitude[1][1])/1000000.;
-    float f0 = 8192*(PT-> amplitude[0][1])/1000000.;
+    float f1 = 8192*(PT-> wave[1].frequency)/1000000.;
+    float f0 = 8192*(PT-> wave[0].frequency)/1000000.;
     float meresido0 = 0.25 / f0;
     float meresido1 = 0.25 / f1;
     int merendo0 = 1, merendo1 = 1;
@@ -221,8 +233,8 @@ int sinewave(volatile PulseTrain* PT)
 
         // TODO start phase? offset phase?
         if (t < PT->stageDuration[0]) {
-            dac0val = int(round(PT->amplitude[0][0]*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-            dac1val = int(round(PT->amplitude[1][0]*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+            dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+            dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
         } else { // we're in the last stage, set DACs back to zero
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
