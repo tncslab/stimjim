@@ -65,7 +65,7 @@
 
 // ------------- Serial setup ---------------------------------- //
 char comBuf[1000];
-int32_t train_count;
+int32_t train_count = 0;
 int bytesRecvd;
 bool verbose = false;
 
@@ -119,7 +119,7 @@ void startIT1(int ptIndex, int isWave=0);
 void startIT1ViaInputTrigger();
 
 void printPulseTrainParameters(int i);
-void printTrainResultSummary(volatile PulseTrain* PT);
+void printResultSummary(volatile PulseTrain* PT, int isWave=0);
 volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT);
 
 int pulse (volatile PulseTrain* PT)
@@ -281,40 +281,32 @@ int sinewave(volatile PulseTrain* PT)
     return 1;
 }
 
-
-void printTrainResultSummary(volatile PulseTrain* PT)
+void printResultSummary(volatile PulseTrain* PT, int isWave)
 {
-    Serial.print("Train complete. Delivered "); Serial.print(PT->nPulses);
-    Serial.println(" pulses.\r\nCurrent/Voltage by stage: ");
+    Serial.print("Train #"); Serial.print(train_count);
+    Serial.print(" complete. Delivered "); Serial.print(PT->nPulses);
+    if (isWave) {
+        Serial.println(" waves.");
+    } else {
+        Serial.println(" pulses.");
+    }
+    Serial.println("Current/Voltage by stage: ");
     Serial.println("           Ch0                Ch1 ");
     char str[200];
     for (int i = 0; i < PT->nStages; i++) {
         Serial.print("Stage "); Serial.print(i);
-        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[0][i] / PT->nPulses, (PT->mode[0]) ? "uA" : "mV");
+        sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
         Serial.print(str);
-        sprintf(str, "%6d%s,          ", PT->measuredAmplitude[1][i] / PT->nPulses, (PT->mode[1]) ? "uA" : "mV");
+        sprintf(str, "%6d%s,          ", PT->voltage[1][i] / PT->nPulses, "mV");
+        Serial.println(str);
+        Serial.print("       ");
+        sprintf(str, "%6d%s,          ", PT->current[0][i] / PT->nPulses, "uA");
+        Serial.print(str);
+        sprintf(str, "%6d%s,          ", PT->current[1][i] / PT->nPulses, "uA");
         Serial.println(str);
     }
 }
 
-void printWaveResultSummary(volatile PulseTrain* PT)
-{
-    Serial.print("Train complete. Delivered "); Serial.print(PT->nPulses);
-    Serial.println(" waves.\r\nCurrent/Voltage by stage: ");
-    Serial.println("           Ch0                Ch1 ");
-    char str[200];
-    const int i = 0;  // single stage
-    Serial.print("Stage "); Serial.print(i);
-    sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
-    Serial.print(str);
-    sprintf(str, "%6d%s,          ", PT->voltage[1][i] / PT->nPulses, "mV");
-    Serial.println(str);
-    Serial.print("       ");
-    sprintf(str, "%6d%s,          ", PT->current[0][i] / PT->nPulses, "uA");
-    Serial.print(str);
-    sprintf(str, "%6d%s,          ", PT->current[1][i] / PT->nPulses, "uA");
-    Serial.println(str);
-}
 
 }
 
@@ -323,7 +315,8 @@ void pulse0()
     if (!pulse(activePT0)) {
 
         IT0.end();
-        printTrainResultSummary(activePT0);
+        train_count++;
+        printResultSummary(activePT0);
 
         if (activePT0->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -346,7 +339,8 @@ void sinewave0()
     if (!sinewave(activePT0)) {
 
         IT0.end();
-        printWaveResultSummary(activePT0);
+        train_count++;
+        printResultSummary(activePT0, 1);
 
         if (activePT0->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -369,7 +363,8 @@ void sinewave1()
     if (!sinewave(activePT1)) {
 
         IT0.end();
-        printWaveResultSummary(activePT1);
+        train_count++;
+        printResultSummary(activePT1, 1);
 
         if (activePT1->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -392,7 +387,8 @@ void pulse1()
     if (!pulse(activePT1)) {
 
         IT1.end();
-        printTrainResultSummary(activePT1);
+        train_count++;
+        printResultSummary(activePT1);
 
         if (activePT1->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -618,7 +614,8 @@ void printPulseTrainParameters(int i)
 volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT)
 {
       PT->nPulses = 0;
-      memset((void *) PT->measuredAmplitude, 0, 4*MAX_NUM_STAGES*sizeof(int));
+      memset((void *) PT->current, 0, 2*MAX_NUM_STAGES*sizeof(int));
+      memset((void *) PT->voltage, 0, 2*MAX_NUM_STAGES*sizeof(int));
       return (PT);
 }
 
@@ -640,6 +637,8 @@ void setup()
     Serial.println("Booting StimJim on Teensy 3.5!");
 
     Stimjim.begin();
+
+    Serial.print("User definitions take "); Serial.print(sizeof(PTs)); Serial.println(" bytes");
 
     for (int i = 0; i < PT_ARRAY_LENGTH; i++) {
         PTs[i].mode[0] = 3;
