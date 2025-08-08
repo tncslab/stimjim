@@ -56,6 +56,20 @@
 
 #include <Stimjim.h>
 #include <math.h>
+#define USE_DISPLAY
+
+// For display based on https://github.com/adafruit/Adafruit_SSD1306/blob/master/examples/ssd1306_128x32_i2c/ssd1306_128x32_i2c.ino
+#ifdef USE_DISPLAY
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#endif
 
 #define PT_ARRAY_LENGTH 100
 #define MAX_NUM_STAGES 10
@@ -120,6 +134,7 @@ void startIT1ViaInputTrigger();
 
 void printPulseTrainParameters(int i);
 void printResultSummary(volatile PulseTrain* PT, int isWave=0);
+void displayResultSummary(volatile PulseTrain* PT, int isWave=0);
 volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT);
 
 int pulse (volatile PulseTrain* PT)
@@ -293,7 +308,8 @@ void printResultSummary(volatile PulseTrain* PT, int isWave)
     Serial.println("Current/Voltage by stage: ");
     Serial.println("           Ch0                Ch1 ");
     char str[200];
-    for (int i = 0; i < PT->nStages; i++) {
+    int n = (isWave ? 1 : PT->nStages);
+    for (int i = 0; i < n; i++) {
         Serial.print("Stage "); Serial.print(i);
         sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
         Serial.print(str);
@@ -308,7 +324,43 @@ void printResultSummary(volatile PulseTrain* PT, int isWave)
 }
 
 
+#ifdef USE_DISPLAY
+void displayResultSummary(volatile PulseTrain* PT, int isWave)
+{
+  display.clearDisplay();
+
+  display.setTextSize(1);             // Normal 1:1 pixel scale
+  display.setCursor(0,0);             // Start at top-left corner
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.print("#"); display.print(train_count);
+  
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);        // Draw white text
+  display.print(" > "); display.print(PT->nPulses);
+  if (isWave) {
+    display.println(" waves.");
+  } else {
+    display.println(" pulses.");
+  }
+  char str[200];
+  for (int i = 0; i < 1; i++) {  // single stage display
+    sprintf(str, "%-2d %6d%s %6d%s", i,
+        PT->voltage[0][i] / PT->nPulses, "mV",
+        PT->voltage[1][i] / PT->nPulses, "mV");
+    display.println(str);
+    sprintf(str, "%2s %6d%s %6d%s", "",
+        PT->current[0][i] / PT->nPulses, "uA",
+        PT->current[1][i] / PT->nPulses, "uA");
+    display.println(str);
+    sprintf(str, "%2s %6d%s %6d%s", "",
+        PT->voltage[0][i] / PT->current[0][i], "kO",
+        PT->voltage[1][i] / PT->current[1][i], "kO");
+    display.println(str);
+  }
+  display.display();
 }
+#else
+void displayResultSummary(volatile PulseTrain* PT) {}
+#endif
 
 void pulse0()
 {
@@ -317,6 +369,7 @@ void pulse0()
         IT0.end();
         train_count++;
         printResultSummary(activePT0);
+        displayResultSummary(activePT0);
 
         if (activePT0->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -341,6 +394,7 @@ void sinewave0()
         IT0.end();
         train_count++;
         printResultSummary(activePT0, 1);
+        displayResultSummary(activePT0, 1);
 
         if (activePT0->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -365,6 +419,7 @@ void sinewave1()
         IT0.end();
         train_count++;
         printResultSummary(activePT1, 1);
+        displayResultSummary(activePT1, 1);
 
         if (activePT1->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -389,6 +444,7 @@ void pulse1()
         IT1.end();
         train_count++;
         printResultSummary(activePT1);
+        displayResultSummary(activePT1);
 
         if (activePT1->mode[0] < 2) {
             digitalWriteFast(LED0, LOW);
@@ -621,6 +677,7 @@ volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT)
 
 void setup()
 {
+  
     Serial.begin(112500);
     bytesRecvd = 0;
     delay(1000);
@@ -634,6 +691,17 @@ void setup()
       sinetable[i] = sin(2*pi*i*reciprok);
     }
 
+    #ifdef USE_DISPLAY
+    // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+      Serial.println(F("SSD1306 allocation failed"));
+    }
+
+    // Show initial display buffer contents on the screen --
+    // the library initializes this with an Adafruit splash screen.
+    display.display();
+    #endif
+    
     Serial.println("Booting StimJim on Teensy 3.5!");
 
     Stimjim.begin();
