@@ -41,6 +41,7 @@
 //    D - Print current values of all offsets (ADC, current, voltage)
 //    R - R0,<n>,0 means that logic high on "input" 0 starts PulseTrain n.
 //        R0,0,1 means that "input" 0 is reprogrammed as an output that marks stimulus start time of whatever pulsetrain is being delivered
+//        TODO trigger sine waves as well
 //    M - M0,0 means set output mode for channel 0 to 0. output modes are as follows:
 //        0 - voltage
 //        1 - current
@@ -51,7 +52,6 @@
 //    E - E0,1 means read channel zero, line 1. Line 0 is voltage out, line 1 is current sense.
 //        Returns (prints over serial) value in raw adc units.
 //    V - V0 means default serial reporting, V1 means verbose
-//    Q - sine wave
 
 
 #include <Stimjim.h>
@@ -412,31 +412,6 @@ void sinewave0()
     }
 }
 
-void sinewave1()
-{
-    if (!sinewave(activePT1)) {
-
-        IT0.end();
-        train_count++;
-        printResultSummary(activePT1, 1);
-        displayResultSummary(activePT1, 1);
-
-        if (activePT1->mode[0] < 2) {
-            digitalWriteFast(LED0, LOW);
-            digitalWriteFast(GPIO_10, LOW);
-            if (trigOutput[0])
-                digitalWriteFast(IN0, LOW);
-        }
-
-        if (activePT1->mode[1] < 2) {
-            digitalWriteFast(LED1, LOW);
-            digitalWriteFast(GPIO_11, LOW);
-            if (trigOutput[1])
-                digitalWriteFast(IN1, LOW);
-        }
-    }
-}
-
 void pulse1()
 {
     if (!pulse(activePT1)) {
@@ -455,6 +430,31 @@ void pulse1()
 
         if (activePT1->mode[1] < 2)
         {
+            digitalWriteFast(LED1, LOW);
+            digitalWriteFast(GPIO_11, LOW);
+            if (trigOutput[1])
+                digitalWriteFast(IN1, LOW);
+        }
+    }
+}
+
+void sinewave1()
+{
+    if (!sinewave(activePT1)) {
+
+        IT0.end();
+        train_count++;
+        printResultSummary(activePT1, 1);
+        displayResultSummary(activePT1, 1);
+
+        if (activePT1->mode[0] < 2) {
+            digitalWriteFast(LED0, LOW);
+            digitalWriteFast(GPIO_10, LOW);
+            if (trigOutput[0])
+                digitalWriteFast(IN0, LOW);
+        }
+
+        if (activePT1->mode[1] < 2) {
             digitalWriteFast(LED1, LOW);
             digitalWriteFast(GPIO_11, LOW);
             if (trigOutput[1])
@@ -530,54 +530,6 @@ void startIT0(int ptIndex, int isWave)
         sinewave0();
     else
         pulse0(); //intervalTimer starts with delay - we want to start with pulse!
-}
-
-void startSINE(int ptIndex)
-{
-    if (ptIndex < 0) {
-
-        Serial.println("Forcing T train to stop");
-        IT0.end();
-
-        if (activePT0->mode[0] < 2) {
-            digitalWriteFast(LED0, LOW);
-            digitalWriteFast(GPIO_10, LOW);
-            if (trigOutput[0])
-              digitalWriteFast(IN0, LOW);
-        }
-
-        if (activePT0->mode[1] < 2) {
-            digitalWriteFast(LED1, LOW);
-            digitalWriteFast(GPIO_11, LOW);
-            if (trigOutput[1])
-                digitalWriteFast(IN1, LOW);
-        }
-
-        return;
-    }
-
-    activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
-    activePT0->trainStartTime = micros();
-    if (!IT0.begin(sinewave0, activePT0->period))
-        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
-
-    Serial.print("\r\nStarted T train with parameters of PulseTrain "); Serial.println(ptIndex);
-
-    if (activePT0->mode[0] < 2) {
-        digitalWriteFast(LED0, HIGH);
-        digitalWriteFast(GPIO_10, HIGH);
-        if (trigOutput[0])
-          digitalWriteFast(IN0, HIGH);
-    }
-
-    if (activePT0->mode[1] < 2){
-        digitalWriteFast(LED1, HIGH);
-        digitalWriteFast(GPIO_11, HIGH);
-        if (trigOutput[1])
-          digitalWriteFast(IN1, HIGH);
-    }
-
-    sinewave0(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
 void startIT1(int ptIndex, int isWave)
