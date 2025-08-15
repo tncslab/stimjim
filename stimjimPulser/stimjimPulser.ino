@@ -42,6 +42,7 @@
 //    R - R0,<n>,0 means that logic high on "input" 0 starts PulseTrain n.
 //        R0,0,1 means that "input" 0 is reprogrammed as an output that marks stimulus start time of whatever pulsetrain is being delivered
 //        TODO trigger sine waves as well
+//    P - save current definitions to EEPROM as defaults loaded on next boot
 //    M - M0,0 means set output mode for channel 0 to 0. output modes are as follows:
 //        0 - voltage
 //        1 - current
@@ -56,6 +57,7 @@
 
 #include <Stimjim.h>
 #include <math.h>
+#include <EEPROM.h>
 #define USE_DISPLAY
 
 // For display based on https://github.com/adafruit/Adafruit_SSD1306/blob/master/examples/ssd1306_128x32_i2c/ssd1306_128x32_i2c.ino
@@ -73,6 +75,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 #define PT_ARRAY_LENGTH 100
 #define MAX_NUM_STAGES 10
+#define PT_EEPROM_LENGTH 10
 #define pi 3.141592653
 // TODO int approximation of macros MICROAMPS_PER_DAC, MICROAMPS_PER_ADC, MILLIVOLTS_PER_DAC
 // and MILLIVOLTS_PER_ADC for higher speed in sine wave
@@ -136,6 +139,101 @@ void printPulseTrainParameters(int i);
 void printResultSummary(volatile PulseTrain* PT, int isWave=0);
 void displayResultSummary(volatile PulseTrain* PT, int isWave=0);
 volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT);
+
+
+struct myEEPROMdata {
+    struct checksum {
+        uint32_t xr, sm;
+    };
+    struct payload {
+        PulseTrain PTs[PT_EEPROM_LENGTH];
+        int triggerTargetPTs[2];
+        bool trigOutput[2];
+    };
+
+    checksum chk;
+    payload data;
+    uint32_t _padding;
+};
+
+static_assert(sizeof(myEEPROMdata) < 4096, "myEEPROMdata size exceeds EEPROM limit of 4096 bytes");
+
+myEEPROMdata::checksum do_checksum(const myEEPROMdata& my) {
+    int n = (sizeof(myEEPROMdata::payload) + 3) / 4;
+    uint32_t *ptr = (uint32_t*)(my.data.PTs);
+    myEEPROMdata::checksum chk;
+    for(int i = 0; i < n; i++) {
+        chk.xr ^= (*ptr);
+        chk.sm += (*ptr);
+    }
+    return chk;
+}
+
+void setTriggers(const int ptIndex, const int trigSrc, const bool output) {
+    if (ptIndex >= 0 && !output) {
+            Serial.print("Attaching interrupt to IN"); Serial.print(trigSrc);
+            Serial.print(" to run PulseTrain["); Serial.print(ptIndex); Serial.println("]");
+            pinMode((trigSrc) ? IN1 : IN0, INPUT);
+            triggerTargetPTs[trigSrc] = ptIndex;
+            attachInterrupt( (trigSrc) ? IN1 : IN0, (trigSrc) ? startIT1ViaInputTrigger : startIT0ViaInputTrigger, RISING);
+            trigOutput[trigSrc] = false;
+    } else {
+            Serial.print("Detaching interrupt to IN"); Serial.println(trigSrc);
+            Serial.print("Programming IN"); Serial.print(trigSrc); Serial.print(" as output that indicates activity on output ");Serial.println(trigSrc);
+            detachInterrupt( (trigSrc) ? IN1 : IN0);
+            triggerTargetPTs[trigSrc] = -1;
+            pinMode((trigSrc) ? IN1 : IN0, OUTPUT);
+            trigOutput[trigSrc] = true;
+    }
+}
+
+int loadTriggersEEPROM(){
+    int eeAddress = 0;   //Location we want the data to be put.
+    myEEPROMdata retrieved;
+    EEPROM.get(eeAddress, retrieved);
+    myEEPROMdata::checksum chk = do_checksum(retrieved);
+    if (memcmp(&retrieved.chk, &chk, sizeof(myEEPROMdata::chk))) {
+        Serial.print("Restored first "); Serial.print(PT_EEPROM_LENGTH);
+        Serial.println(" pulse train definitions and the triggers.");
+        memcpy((void*)(PTs), retrieved.data.PTs, PT_EEPROM_LENGTH * sizeof(PulseTrain));
+        for(int i=0; i < 2; i++) {
+            triggerTargetPTs[i] = retrieved.data.triggerTargetPTs[i];
+            trigOutput[i] = retrieved.data.trigOutput[i];
+        }
+        for(int i=0; i < 2; i++) {
+            if (triggerTargetPTs[i] < PT_EEPROM_LENGTH) {
+                setTriggers(triggerTargetPTs[i], 0, trigOutput[i]);
+            }
+        }
+        return 0;
+    } else {
+        Serial.println("Failed to restore train definitions due to checksum error.");
+        return 1;
+    }
+}
+
+int saveTriggersEEPROM(){
+    int eeAddress = 0;   //Location we want the data to be put.
+    myEEPROMdata captured;
+    memcpy(captured.data.PTs, (void*)(PTs), PT_EEPROM_LENGTH * sizeof(PulseTrain));
+    for(int i=0; i < 2; i++) {
+        captured.data.triggerTargetPTs[i] = triggerTargetPTs[i];
+        captured.data.trigOutput[i] = trigOutput[i];
+    }
+    for(int i=0; i < 2; i++) {
+        if (PT_EEPROM_LENGTH <= captured.data.triggerTargetPTs[i]) {
+            Serial.print("Trigger "); Serial.print(i);
+            Serial.print(" pointing to train "); Serial.print(captured.data.triggerTargetPTs[i]);
+            Serial.print(" will not be stored as the correspondin train is out of the first ");
+            Serial.print(PT_EEPROM_LENGTH); Serial.println(" saved to EEPROM");
+            captured.data.triggerTargetPTs[i] = -1;
+        }
+    }
+    captured.chk = do_checksum(captured);
+    EEPROM.put(eeAddress, captured);
+    Serial.print("First "); Serial.print(PT_EEPROM_LENGTH); Serial.println(" saved to EEPROM.");
+    return 0;
+}
 
 int pulse (volatile PulseTrain* PT)
 {
@@ -683,6 +781,8 @@ void setup()
       IT1.priority(64);
       Serial.flush();
 
+      loadTriggersEEPROM();
+
       // print offset values for user reference
       char str[200];
       sprintf(str, "ADC offsets (+-2.5V): %f, %f\r\nADC offsets (+-10V): %f, %f\r\ncurrent offsets: %d, %d\r\nvoltage offsets: %d, %d\r\n",
@@ -790,6 +890,9 @@ void loop()
                     Stimjim.adcOffset25[0],Stimjim.adcOffset25[1], Stimjim.adcOffset10[0],Stimjim.adcOffset10[1],
                     Stimjim.currentOffsets[0], Stimjim.currentOffsets[1], Stimjim.voltageOffsets[0], Stimjim.voltageOffsets[1] );
                 Serial.println(str);
+
+            } else if (comBuf[0] == 'P') {
+                saveTriggersEEPROM();
 
             } else if (comBuf[0] == 'R') {
 
