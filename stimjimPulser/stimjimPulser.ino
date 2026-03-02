@@ -23,8 +23,8 @@
 //
 
 // Valid serial commands:
-//    S - Set pulseTrain parameters. Example:
-//        S0,0,1,100000,300000; 100,-100,10000; -500,150,20000; 0,0,1000;
+//    S, W - Set pulseTrain parameters. Example:
+//        S0,0,1,2000,1000000; 100,0,150; -100,-100,200
 //        1st argument (0) means set parameters for pulseTrain 0.
 //        2nd argument (0) - mode 0 (voltage) on output channel 0 (see modes below under M)
 //        3rd argument (1) - mode 1 (current) on output channel 1
@@ -37,14 +37,20 @@
 //            amplitudes for both channels (in uA and mV, depending on mode), and duration in usec.
 //            In this case, sets amplitudes to 100uA, -100mV, for 100 microseconds
 //        etc... for trios of arguments, up to 10 stages total.
-//        Alternatively, for sine wave,
-//        the 6th and 7th and 8th arguments are amplitude (in uA or mV, depending on mode), 8th argument is duration,
-//        the 9th and 10th are frequency (in Hz), 11th argument omitted
-//        the 12th and 13th are phase (in degree), 14th argument omitted
+//        Alternatively, for sine wave, example:
+//        W0,1,1,100000,300000; 100,-100,10000; -500,150,20000; 0,0,1000
+//        6th, 7th and 8th arguments - sine amplitude
+//            amplitudes for both channels (in uA or mV, depending on mode), 8th argument is duration,
+//            In this case, sets amplitudes to 100uA, -100mV, for 10 seconds
+//        9th, 10th and 11th arguments - sine frequency
+//            frequencies for both channel (in Hz), 11th argument omitted
+//            In this case, sets frequencies to 500Hz and 150Hz
+//        12th, 13th and 14th arguments - phase offset
+//            phase offset for both channels (in degrees), 14th argument omitted
+//            In this case, sets no phase offset
+// 
 //
 //    T, U - T0 means start PulseTrain[0]. U0 also means start PulseTrain[0]. T and U can be
-//           used to run two pulse train simultaneously.
-//    Q, W - Q0 means start PulseTrain[0]. W0 also means start PulseTrain[0]. Q and W can be
 //           used to run two pulse train simultaneously.
 //    B - measure ADC offset value (by grounding output and measuring ADC value on output).
 //    C - measure current and voltage offsets by sweeping DAC values and reading output.
@@ -87,6 +93,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define MAX_NUM_STAGES 10
 #define PT_EEPROM_LENGTH 10
 #define pi 3.141592653
+#define VOLTAGE_LIMIT_MV 8000  // value for detecting voltage-limited stimulaion
 // TODO int approximation of macros MICROAMPS_PER_DAC, MICROAMPS_PER_ADC, MILLIVOLTS_PER_DAC
 // and MILLIVOLTS_PER_ADC for higher speed in sine wave
 
@@ -122,10 +129,13 @@ struct PulseTrain {
     int nPulses;
     int voltage[2][MAX_NUM_STAGES];     // Ch0_V, Ch1_V
     int current[2][MAX_NUM_STAGES];     // Ch0_I, Ch1_I
+
+    // Todo we could encode being a pulse into frequency being 0, and allow independent setup on both channels.
+    // For now, we use a single separate flag for simplicity.
+    unsigned int isWave;
 };
 
 float sinetable[8192];
-
 
 
 volatile PulseTrain PTs[PT_ARRAY_LENGTH];
@@ -140,14 +150,14 @@ bool trigOutput[2];
 int pulse (volatile PulseTrain* PT);
 void pulse0();
 void pulse1();
-void startIT0(int ptIndex, int isWave=0);
+void startIT0(int ptIndex);
 void startIT0ViaInputTrigger();
-void startIT1(int ptIndex, int isWave=0);
+void startIT1(int ptIndex);
 void startIT1ViaInputTrigger();
 
 void printPulseTrainParameters(int i);
-void printResultSummary(volatile PulseTrain* PT, int isWave=0);
-void displayResultSummary(volatile PulseTrain* PT, int isWave=0);
+void printResultSummary(volatile PulseTrain* PT);
+void displayResultSummary(volatile PulseTrain* PT);
 volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT);
 
 
@@ -161,6 +171,7 @@ struct myEEPROMdata {
         bool trigOutput[2];
     };
 
+    // todo add program version number to be able to detect incompatibilities in case of future changes in the structure
     checksum chk;
     payload data;
     uint32_t _padding;
@@ -171,7 +182,7 @@ static_assert(sizeof(myEEPROMdata) < 4096, "myEEPROMdata size exceeds EEPROM lim
 myEEPROMdata::checksum do_checksum(const myEEPROMdata& my) {
     int n = (sizeof(myEEPROMdata::payload) + 3) / 4;
     uint32_t *ptr = (uint32_t*)(my.data.PTs);
-    myEEPROMdata::checksum chk;
+    myEEPROMdata::checksum chk = {0xDEADBEEF, 0xFEEDBEEF};
     for(int i = 0; i < n; i++) {
         chk.xr ^= (*ptr);
         chk.sm += (*ptr);
@@ -202,7 +213,7 @@ int loadTriggersEEPROM(){
     myEEPROMdata retrieved;
     EEPROM.get(eeAddress, retrieved);
     myEEPROMdata::checksum chk = do_checksum(retrieved);
-    if (memcmp(&retrieved.chk, &chk, sizeof(myEEPROMdata::chk))) {
+    if (memcmp(&retrieved.chk, &chk, sizeof(myEEPROMdata::chk)) == 0) {
         Serial.print("Restored first "); Serial.print(PT_EEPROM_LENGTH);
         Serial.println(" pulse train definitions and the triggers.");
         memcpy((void*)(PTs), retrieved.data.PTs, PT_EEPROM_LENGTH * sizeof(PulseTrain));
@@ -234,7 +245,7 @@ int saveTriggersEEPROM(){
         if (PT_EEPROM_LENGTH <= captured.data.triggerTargetPTs[i]) {
             Serial.print("Trigger "); Serial.print(i);
             Serial.print(" pointing to train "); Serial.print(captured.data.triggerTargetPTs[i]);
-            Serial.print(" will not be stored as the correspondin train is out of the first ");
+            Serial.print(" will not be stored as the corresponding train is out of the first ");
             Serial.print(PT_EEPROM_LENGTH); Serial.println(" saved to EEPROM");
             captured.data.triggerTargetPTs[i] = -1;
         }
@@ -408,7 +419,7 @@ void printResultSummary(volatile PulseTrain* PT, int isWave)
 {
     Serial.print("Train #"); Serial.print(train_count);
     Serial.print(" complete. Delivered "); Serial.print(PT->nPulses);
-    if (isWave) {
+    if (PT->isWave) {
         Serial.println(" waves.");
     } else {
         Serial.println(" pulses.");
@@ -416,7 +427,8 @@ void printResultSummary(volatile PulseTrain* PT, int isWave)
     Serial.println("Current/Voltage by stage: ");
     Serial.println("           Ch0                Ch1 ");
     char str[200];
-    int n = (isWave ? 1 : PT->nStages);
+    int n = (PT->isWave ? 1 : PT->nStages);
+    ResistanceResult res[2];
     for (int i = 0; i < n; i++) {
         Serial.print("Stage "); Serial.print(i);
         sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
@@ -444,7 +456,7 @@ void displayResultSummary(volatile PulseTrain* PT, int isWave)
   
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);        // Draw white text
   display.print(" > "); display.print(PT->nPulses);
-  if (isWave) {
+  if (PT->isWave) {
     display.println(" waves.");
   } else {
     display.println(" pulses.");
@@ -472,7 +484,9 @@ void displayResultSummary(volatile PulseTrain* PT) {}
 
 void pulse0()
 {
-    if (!pulse(activePT0)) {
+    // todo: it is not a good idea to keep IT busy while generating signal
+    int ret = activePT0->isWave ? sinewave(activePT0) : pulse(activePT0);
+    if (!ret) {
 
         IT0.end();
         train_count++;
@@ -495,34 +509,11 @@ void pulse0()
     }
 }
 
-void sinewave0()
-{
-    if (!sinewave(activePT0)) {
-
-        IT0.end();
-        train_count++;
-        printResultSummary(activePT0, 1);
-        displayResultSummary(activePT0, 1);
-
-        if (activePT0->mode[0] < 2) {
-            digitalWriteFast(LED0, LOW);
-            digitalWriteFast(GPIO_10, LOW);
-            if (trigOutput[0])
-                digitalWriteFast(IN0, LOW);
-        }
-
-        if (activePT0->mode[1] < 2) {
-            digitalWriteFast(LED1, LOW);
-            digitalWriteFast(GPIO_11, LOW);
-            if (trigOutput[1])
-                digitalWriteFast(IN1, LOW);
-        }
-    }
-}
-
 void pulse1()
 {
-    if (!pulse(activePT1)) {
+    // todo: it is not a good idea to keep IT busy while generating signal
+    int ret = activePT1->isWave ? sinewave(activePT1) : pulse(activePT1);
+    if (!ret) {
 
         IT1.end();
         train_count++;
@@ -546,31 +537,6 @@ void pulse1()
     }
 }
 
-void sinewave1()
-{
-    if (!sinewave(activePT1)) {
-
-        IT0.end();
-        train_count++;
-        printResultSummary(activePT1, 1);
-        displayResultSummary(activePT1, 1);
-
-        if (activePT1->mode[0] < 2) {
-            digitalWriteFast(LED0, LOW);
-            digitalWriteFast(GPIO_10, LOW);
-            if (trigOutput[0])
-                digitalWriteFast(IN0, LOW);
-        }
-
-        if (activePT1->mode[1] < 2) {
-            digitalWriteFast(LED1, LOW);
-            digitalWriteFast(GPIO_11, LOW);
-            if (trigOutput[1])
-                digitalWriteFast(IN1, LOW);
-        }
-    }
-}
-
 void startIT0ViaInputTrigger()
 {
     if (triggerTargetPTs[0] >= 0)
@@ -583,7 +549,7 @@ void startIT1ViaInputTrigger()
         startIT1(triggerTargetPTs[1]);
 }
 
-void startIT0(int ptIndex, int isWave)
+void startIT0(int ptIndex)
 {
     if (ptIndex < 0) {
 
@@ -609,15 +575,10 @@ void startIT0(int ptIndex, int isWave)
 
     activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT0->trainStartTime = micros();
-    if (isWave){
-        if (!IT0.begin(sinewave0, activePT0->period))
-            Serial.println("startIT0: failure to initiate IntervalTimer IT0");
-        Serial.print("\r\nStarted T wave with parameters of PulseTrain ");
-    } else {
-        if (!IT0.begin(pulse0, activePT0->period))
-            Serial.println("startIT0: failure to initiate IntervalTimer IT0");
-        Serial.print("\r\nStarted T train with parameters of PulseTrain ");
-    }
+
+    if (!IT0.begin(pulse0, activePT0->period))
+        Serial.println("startIT0: failure to initiate IntervalTimer IT0");
+    Serial.print("\r\nStarted T train with parameters of PulseTrain ");
     Serial.println(ptIndex);
 
     if (activePT0->mode[0] < 2) {
@@ -634,13 +595,10 @@ void startIT0(int ptIndex, int isWave)
           digitalWriteFast(IN1, HIGH);
     }
 
-    if (isWave)
-        sinewave0();
-    else
-        pulse0(); //intervalTimer starts with delay - we want to start with pulse!
+    pulse0(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
-void startIT1(int ptIndex, int isWave)
+void startIT1(int ptIndex)
 {
     if (ptIndex < 0) {
 
@@ -668,15 +626,9 @@ void startIT1(int ptIndex, int isWave)
     activePT1 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT1->trainStartTime = micros();
 
-    if (isWave) {
-        if (!IT1.begin(sinewave1, activePT1->period))
-            Serial.println("startIT1: failure to initiate IntervalTimer IT1");
-        Serial.print("\r\nStarted U wave with parameters of PulseTrain "); 
-    } else {
-        if (!IT1.begin(pulse1, activePT1->period))
-            Serial.println("startIT1: failure to initiate IntervalTimer IT1");
-        Serial.print("\r\nStarted U train with parameters of PulseTrain "); 
-    }
+    if (!IT1.begin(pulse1, activePT1->period))
+        Serial.println("startIT1: failure to initiate IntervalTimer IT1");
+    Serial.print("\r\nStarted U train with parameters of PulseTrain "); 
     Serial.println(ptIndex);
 
     if (activePT1->mode[0] < 2) {
@@ -693,10 +645,7 @@ void startIT1(int ptIndex, int isWave)
             digitalWriteFast(IN1, HIGH);
     }
 
-    if (isWave)
-        sinewave1();
-    else
-        pulse1(); //intervalTimer starts with delay - we want to start with pulse!
+    pulse1(); //intervalTimer starts with delay - we want to start with pulse!
 }
 
 void printPulseTrainParameters(int i)
@@ -819,7 +768,8 @@ void loop()
             if (bytesRecvd >= 2 && comBuf[bytesRecvd - 2] == '\r')
                 comBuf[bytesRecvd - 2] = '\0';
 
-            if (comBuf[0] == 'S') {
+            if ((comBuf[0] == 'S') or (comBuf[0] == 'W')) {
+                // fixme, this overwrites part of parameters in case of corrupted input
                 sscanf(comBuf + 1, "%d,", &ptIndex);
                 if (ptIndex < 0 || ptIndex >= PT_ARRAY_LENGTH) {
                     Serial.println("Invalid PulseTrain index.");
@@ -827,6 +777,7 @@ void loop()
                     return;
                 }
 
+                PTs[ptIndex].isWave = (comBuf[0] == 'W');
                 int m = sscanf(comBuf + 1, "%*d,%u,%u,%lu,%lu;",
                     &(PTs[ptIndex].mode[0]),
                     &(PTs[ptIndex].mode[1]),
@@ -871,20 +822,6 @@ void loop()
                     startIT1(ptIndex);
             
 
-            } else if (comBuf[0] == 'Q' || comBuf[0] == 'W') {
-
-                ptIndex = atoi(comBuf + 1);
-                if (ptIndex >= PT_ARRAY_LENGTH) {
-                    Serial.println("Invalid PulseTrain index.");
-                    bytesRecvd = 0;
-                    return;
-                }
-
-                if (comBuf[0] == 'Q')
-                    startIT0(ptIndex, 1);
-                if (comBuf[0] == 'W')
-                    startIT1(ptIndex, 1);
-                
             } else if (comBuf[0] == 'B') {
 
                 Stimjim.getAdcOffsets();
