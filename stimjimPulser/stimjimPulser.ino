@@ -8,7 +8,7 @@
 //
 //    This file is part of stimjimPulser.
 //
-//    stimjimPulser is free software: you can redistribute it and/or modify
+//    stimjimWaver is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
 //    the Free Software Foundation, either version 3 of the License, or
 //    (at your option) any later version.
@@ -37,6 +37,10 @@
 //            amplitudes for both channels (in uA and mV, depending on mode), and duration in usec.
 //            In this case, sets amplitudes to 100uA, -100mV, for 100 microseconds
 //        etc... for trios of arguments, up to 10 stages total.
+//        Alternatively, for sine wave,
+//        the 6th and 7th and 8th arguments are amplitude (in uA or mV, depending on mode), 8th argument is duration,
+//        the 9th and 10th are frequency (in Hz), 11th argument omitted
+//        the 12th and 13th are phase (in degree), 14th argument omitted
 //
 //    T, U - T0 means start PulseTrain[0]. U0 also means start PulseTrain[0]. T and U can be
 //           used to run two pulse train simultaneously.
