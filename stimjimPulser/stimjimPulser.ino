@@ -1,4 +1,10 @@
-//    stimjimPulser (c) Nathan Cermak <cerman07 at protonmail.com>.
+//    stimjimWaver (c) 2025- TNCS, Dept of Comp Sci, HUN-REN Wigner RCP, Hungary
+//
+//    Authors:
+//      Gergely Gaal, Zsofia Tasnadi, Marcell Stippinger
+//    
+//    Developed during the Summer Student Week in 2025 and thereafter.
+//    Based on the work of Nathan Cermak and original authors.
 //
 //    This file is part of stimjimPulser.
 //
