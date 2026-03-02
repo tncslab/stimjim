@@ -179,6 +179,16 @@ struct myEEPROMdata {
 
 static_assert(sizeof(myEEPROMdata) < 4096, "myEEPROMdata size exceeds EEPROM limit of 4096 bytes");
 
+
+struct ResistanceResult{
+    int voltage;
+    int voltageLimited;
+    int current;
+    int currentLimited;
+    int resistance;
+    bool isKOhm;
+};
+
 myEEPROMdata::checksum do_checksum(const myEEPROMdata& my) {
     int n = (sizeof(myEEPROMdata::payload) + 3) / 4;
     uint32_t *ptr = (uint32_t*)(my.data.PTs);
@@ -401,8 +411,7 @@ int sinewave(volatile PulseTrain* PT)
             Stimjim.writeToDac(1, dac1val);
         }
     }
-    Serial.printf("Q0stop %ld %d\n", t, c);
-
+    
     // switch outputs to ground
     if (PT->mode[0] < 2)
         Stimjim.setOutputMode(0, 3);
@@ -415,7 +424,29 @@ int sinewave(volatile PulseTrain* PT)
     return 1;
 }
 
-void printResultSummary(volatile PulseTrain* PT, int isWave)
+inline int abs(int x) {
+    return (x < 0) ? -x : x;
+}
+
+void calculateResistance(volatile PulseTrain* PT, int stageIndex, int channelIndex, ResistanceResult& result) {
+    result.voltage = PT->voltage[channelIndex][stageIndex] / PT->nPulses; // assuming we're interested in channel 0 for resistance calculation
+    result.current = PT->current[channelIndex][stageIndex] / PT->nPulses;
+    result.voltageLimited = (abs(result.voltage) > VOLTAGE_LIMIT_MV) || ((PT->mode[channelIndex] == 0) && (abs(result.voltage) * 8 < abs(PT->amplitude[channelIndex][stageIndex]) * 7));
+    result.currentLimited = (PT->mode[channelIndex] == 1) && (abs(result.current) * 8 < abs(PT->amplitude[channelIndex][stageIndex]) * 7);
+    if (result.current == 0) {
+        result.resistance = -1; // indicate infinite resistance
+        result.isKOhm = false;
+    } else {
+        result.isKOhm = abs(result.voltage) >= 100 * abs(result.current);
+        if (result.isKOhm) {
+            result.resistance = result.voltage / result.current; // resistance in kilo-ohms
+        } else {
+            result.resistance = result.voltage * 1000 / result.current; // resistance in ohms
+        }
+    }
+}
+
+void printResultSummary(volatile PulseTrain* PT)
 {
     Serial.print("Train #"); Serial.print(train_count);
     Serial.print(" complete. Delivered "); Serial.print(PT->nPulses);
@@ -430,31 +461,42 @@ void printResultSummary(volatile PulseTrain* PT, int isWave)
     int n = (PT->isWave ? 1 : PT->nStages);
     ResistanceResult res[2];
     for (int i = 0; i < n; i++) {
-        Serial.print("Stage "); Serial.print(i);
-        sprintf(str, "%6d%s,          ", PT->voltage[0][i] / PT->nPulses, "mV");
-        Serial.print(str);
-        sprintf(str, "%6d%s,          ", PT->voltage[1][i] / PT->nPulses, "mV");
+        calculateResistance(PT, i, 0, res[0]);
+        calculateResistance(PT, i, 1, res[1]);
+        sprintf(str, "Stage %d%6dmV%s,          %6dmV%s", i,
+            res[0].voltage, res[0].voltageLimited ? "*" : " ",
+            res[1].voltage, res[1].voltageLimited ? "*" : " ");
         Serial.println(str);
-        Serial.print("       ");
-        sprintf(str, "%6d%s,          ", PT->current[0][i] / PT->nPulses, "uA");
-        Serial.print(str);
-        sprintf(str, "%6d%s,          ", PT->current[1][i] / PT->nPulses, "uA");
+        sprintf(str, "       %6duA%s,          %6duA%s",
+            res[0].current, res[0].currentLimited ? "*" : " ",
+            res[1].current, res[1].currentLimited ? "*" : " ");
+        Serial.println(str);
+        sprintf(str, "       %6d%sOhm,       %6d%sOhm",
+            res[0].resistance, res[0].isKOhm ? "k" : " ",
+            res[1].resistance, res[1].isKOhm ? "k" : " ");
         Serial.println(str);
     }
 }
 
-
 #ifdef USE_DISPLAY
-void displayResultSummary(volatile PulseTrain* PT, int isWave)
+inline void setTextColor(bool inverted) {
+    if (inverted) {
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+        display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+}
+
+void displayResultSummary(volatile PulseTrain* PT)
 {
   display.clearDisplay();
 
   display.setTextSize(1);             // Normal 1:1 pixel scale
   display.setCursor(0,0);             // Start at top-left corner
-  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  setTextColor(true);
   display.print("#"); display.print(train_count);
   
-  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);        // Draw white text
+  setTextColor(false);        // Draw white text
   display.print(" > "); display.print(PT->nPulses);
   if (PT->isWave) {
     display.println(" waves.");
@@ -462,18 +504,33 @@ void displayResultSummary(volatile PulseTrain* PT, int isWave)
     display.println(" pulses.");
   }
   char str[200];
+  ResistanceResult res[2];
   for (int i = 0; i < 1; i++) {  // single stage display
-    sprintf(str, "%-2d %6d%s %6d%s", i,
-        PT->voltage[0][i] / PT->nPulses, "mV",
-        PT->voltage[1][i] / PT->nPulses, "mV");
-    display.println(str);
-    sprintf(str, "%2s %6d%s %6d%s", "",
-        PT->current[0][i] / PT->nPulses, "uA",
-        PT->current[1][i] / PT->nPulses, "uA");
-    display.println(str);
-    sprintf(str, "%2s %6d%s %6d%s", "",
-        PT->voltage[0][i] / PT->current[0][i], "kO",
-        PT->voltage[1][i] / PT->current[1][i], "kO");
+    calculateResistance(PT, i, 0, res[0]);
+    calculateResistance(PT, i, 1, res[1]);
+    //sprintf(str, "%-2d %6d%s %6d%s", i,
+    //    PT->voltage[0][i] / PT->nPulses, "mV",
+    //    PT->voltage[1][i] / PT->nPulses, "mV");
+    sprintf(str, "%-2d", i); display.print(str);
+    sprintf(str, " %6dmV", res[0].voltage);
+    setTextColor(res[0].voltageLimited); display.print(str);
+    sprintf(str, " %6dmV", res[1].voltage);
+    setTextColor(res[1].voltageLimited); display.print(str);
+    setTextColor(false); display.println("");
+
+    //sprintf(str, "%2s %6d%s %6d%s", "",
+    //    PT->current[0][i] / PT->nPulses, "uA",
+    //    PT->current[1][i] / PT->nPulses, "uA");
+    //display.println(str);
+    sprintf(str, "   %6duA", res[0].current);
+    setTextColor(res[0].currentLimited); display.print(str);
+    sprintf(str, " %6duA", res[1].current);
+    setTextColor(res[1].currentLimited); display.print(str);
+    setTextColor(false); display.println("");
+
+    sprintf(str, "   %6d%sO %6d%sO",
+        res[0].resistance, res[0].isKOhm ? "k" : " ",
+        res[1].resistance, res[1].isKOhm ? "k" : " ");
     display.println(str);
   }
   display.display();
@@ -665,13 +722,24 @@ void printPulseTrainParameters(int i)
           PTs[i].period, 0.000001 * PTs[i].period, 1000000.0 / PTs[i].period, PTs[i].duration, 0.000001 * PTs[i].duration);
     Serial.print(str);
     Serial.println("\r\n  stage    duration     output0   output1");
-
+    if(PTs[i].isWave) {
+        sprintf(str, "   %2d  %7d usec %8d%s %8d%s\r\n", 0, PTs[i].stageDuration[0],
+            PTs[i].wave[0].amplitude, (PTs[i].mode[0] == 0) ? "mV" : "uA",
+            PTs[i].wave[1].amplitude, (PTs[i].mode[1] == 0) ? "mV" : "uA");
+        Serial.print(str);
+        sprintf(str, "   %2s  %7s      %8d%s %8d%s\r\n", "", "",
+            PTs[i].wave[0].frequency, "Hz", PTs[i].wave[1].frequency, "Hz");
+        Serial.print(str);
+        sprintf(str, "   %2s  %7s      %8d%s %8d%s\r\n", "", "",
+            PTs[i].wave[0].phase > 0, "° ", PTs[i].wave[1].phase, "° ");
+        Serial.print(str);
+    } else {
     for (int j = 0; j < PTs[i].nStages; j++) {
         sprintf(str, "   %2d  %7d usec %8d%s %8d%s\r\n", j, PTs[i].stageDuration[j],
             PTs[i].amplitude[0][j], (PTs[i].mode[0] == 0) ? "mV" : "uA",
             PTs[i].amplitude[1][j], (PTs[i].mode[1] == 0) ? "mV" : "uA");
         Serial.print(str);
-    }
+    }}
 
     Serial.println("----------------------------------\r\n");
 }
