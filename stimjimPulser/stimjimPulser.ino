@@ -96,6 +96,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define VOLTAGE_LIMIT_MV 8000  // value for detecting voltage-limited stimulaion
 // TODO int approximation of macros MICROAMPS_PER_DAC, MICROAMPS_PER_ADC, MILLIVOLTS_PER_DAC
 // and MILLIVOLTS_PER_ADC for higher speed in sine wave
+#define Btn0 17
+#define Btn1 39
+#define Btn2 16
 
 // ------------- Serial setup ---------------------------------- //
 char comBuf[1000];
@@ -752,6 +755,10 @@ volatile PulseTrain* clearPulseTrainHistory(volatile PulseTrain* PT)
       return (PT);
 }
 
+void sayHello() {
+    Serial.println("Hello!");
+}
+
 void setup()
 {
   
@@ -809,6 +816,15 @@ void setup()
       Serial.flush();
 
       loadTriggersEEPROM();
+
+      // TODO: protection against rolling buttons
+      // TODO: change hardware to switcheng logical low and use internal pullup
+      pinMode(Btn0, INPUT);
+      attachInterrupt(Btn0, sayHello, RISING);
+      pinMode(Btn1, INPUT);
+      attachInterrupt(Btn1, startIT0ViaInputTrigger, RISING);
+      pinMode(Btn2, INPUT);
+      attachInterrupt(Btn2, startIT1ViaInputTrigger, RISING);
 
       // print offset values for user reference
       char str[200];
