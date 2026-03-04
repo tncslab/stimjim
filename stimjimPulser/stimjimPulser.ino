@@ -236,7 +236,7 @@ int loadTriggersEEPROM(){
         }
         for(int i=0; i < 2; i++) {
             if (triggerTargetPTs[i] < PT_EEPROM_LENGTH) {
-                setTriggers(triggerTargetPTs[i], 0, trigOutput[i]);
+                setTriggers(triggerTargetPTs[i], i, trigOutput[i]);
             }
         }
         return 0;
