@@ -24,7 +24,7 @@
 
 // Valid serial commands:
 //    S, W - Set pulseTrain parameters. Example:
-//        S0,0,1,2000,1000000; 100,0,150; -100,-100,200
+//        S0,0,1,2000,1000000; 100,-100,150; -100,0,200
 //        1st argument (0) means set parameters for pulseTrain 0.
 //        2nd argument (0) - mode 0 (voltage) on output channel 0 (see modes below under M)
 //        3rd argument (1) - mode 1 (current) on output channel 1
@@ -32,13 +32,13 @@
 //        5th argument (100000) - duration of pulsetrain in microseconds. In example, duration is 100 ms.
 //        6th, 7th and 8th arguments - pulse stage 0 parameters
 //            amplitudes for both channels (in uA and mV, depending on mode), and duration in usec.
-//            In this case, sets amplitudes to 100uA, -100mV, for 100 microseconds
+//            In this case, sets amplitudes to 100mV, -100uA, for 150 microseconds
 //        9th, 10th and 11th arguments - pulse stage 1 parameters
 //            amplitudes for both channels (in uA and mV, depending on mode), and duration in usec.
-//            In this case, sets amplitudes to 100uA, -100mV, for 100 microseconds
+//            In this case, sets amplitudes to -100mV, 0uA, for 200 microseconds
 //        etc... for trios of arguments, up to 10 stages total.
 //        Alternatively, for sine wave, example:
-//        W0,1,1,100000,300000; 100,-100,10000; -500,150,20000; 0,0,1000
+//        W1,1,1,100000,300000; 100,-100,10000; -500,150,0; 0,0,0
 //        6th, 7th and 8th arguments - sine amplitude
 //            amplitudes for both channels (in uA or mV, depending on mode), 8th argument is duration,
 //            In this case, sets amplitudes to 100uA, -100mV, for 10 seconds
@@ -57,7 +57,6 @@
 //    D - Print current values of all offsets (ADC, current, voltage)
 //    R - R0,<n>,0 means that logic high on "input" 0 starts PulseTrain n.
 //        R0,0,1 means that "input" 0 is reprogrammed as an output that marks stimulus start time of whatever pulsetrain is being delivered
-//        TODO trigger sine waves as well
 //    P - save current definitions to EEPROM as defaults loaded on next boot
 //    M - M0,0 means set output mode for channel 0 to 0. output modes are as follows:
 //        0 - voltage
@@ -77,6 +76,7 @@
 #define USE_DISPLAY
 
 // For display based on https://github.com/adafruit/Adafruit_SSD1306/blob/master/examples/ssd1306_128x32_i2c/ssd1306_128x32_i2c.ino
+// Install Arduino library "Adafruit SSD1306" by Adafruit, make sure it is not the emulator.
 #ifdef USE_DISPLAY
 #include <SPI.h>
 #include <Wire.h>
@@ -215,7 +215,7 @@ void setTriggers(const int ptIndex, const int trigSrc, const bool output) {
             Serial.print("Detaching interrupt to IN"); Serial.println(trigSrc);
             Serial.print("Programming IN"); Serial.print(trigSrc); Serial.print(" as output that indicates activity on output ");Serial.println(trigSrc);
             detachInterrupt( (trigSrc) ? IN1 : IN0);
-            triggerTargetPTs[trigSrc] = -1;
+            triggerTargetPTs[trigSrc] = -1;  // todo requires value for buttons to work, is there any collision?
             pinMode((trigSrc) ? IN1 : IN0, OUTPUT);
             trigOutput[trigSrc] = true;
     }
@@ -861,7 +861,6 @@ void loop()
                     return;
                 }
 
-                PTs[ptIndex].isWave = (comBuf[0] == 'W');
                 int m = sscanf(comBuf + 1, "%*d,%u,%u,%lu,%lu;",
                     &(PTs[ptIndex].mode[0]),
                     &(PTs[ptIndex].mode[1]),
@@ -873,6 +872,8 @@ void loop()
                     PTs[ptIndex].mode[1] = 3;
 
                 if (m == 4) {
+                  // valid mode, period, and duration parameters were read, now read stage parameters
+                  PTs[ptIndex].isWave = (comBuf[0] == 'W');
                   PTs[ptIndex].nStages = 0;
                   char *token = strtok(comBuf + 1, ";");
                   token = strtok(NULL, ";"); //move to the 2nd segment delimited by ";"
@@ -936,21 +937,7 @@ void loop()
                     return;
                 }
 
-                if (ptIndex >= 0 && !output) {
-                      Serial.print("Attaching interrupt to IN"); Serial.print(trigSrc);
-                      Serial.print(" to run PulseTrain["); Serial.print(ptIndex); Serial.println("]");
-                      pinMode((trigSrc) ? IN1 : IN0, INPUT);
-                      triggerTargetPTs[trigSrc] = ptIndex;
-                      attachInterrupt( (trigSrc) ? IN1 : IN0, (trigSrc) ? startIT1ViaInputTrigger : startIT0ViaInputTrigger, RISING);
-                      trigOutput[trigSrc] = false;
-                } else {
-                      Serial.print("Detaching interrupt to IN"); Serial.println(trigSrc);
-                      Serial.print("Programming IN"); Serial.print(trigSrc); Serial.print(" as output that indicates activity on output ");Serial.println(trigSrc);
-                      detachInterrupt( (trigSrc) ? IN1 : IN0);
-                      triggerTargetPTs[trigSrc] = -1;
-                      pinMode((trigSrc) ? IN1 : IN0, OUTPUT);
-                      trigOutput[trigSrc] = true;
-                }
+                setTriggers(ptIndex, trigSrc, output);
 
             } else if (comBuf[0] == 'M') {
 
