@@ -21,6 +21,18 @@
 //    You should have received a copy of the GNU General Public License
 //    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
+//
+
+// WARNINGS!
+// Amplitudes over 3000 uA are converted on the DAC incorrectly.
+
+// Fonoff:
+// Measure S0,1,1,10000,1000000;800,3000,10;-800,-3000,10
+// Do S0,3,3,10000,1000000;800,3000,10;-800,-3000,10
+
+// iTBS:
+// Measure S1,1,1,200000,2000000;800,2000,280;0,0,19720;800,2000,280;0,0,19720;800,2000,280
+// Do S1,3,3,200000,2000000;800,2000,280;0,0,19720;800,2000,280;0,0,19720;800,2000,280
 
 // Valid serial commands:
 //    S, W - Set pulseTrain parameters. Example:
@@ -61,9 +73,10 @@
 //    M - M0,0 means set output mode for channel 0 to 0. output modes are as follows:
 //        0 - voltage
 //        1 - current
-//        2 - disconnected (hi-z)
-//        3 - grounded
-//    A - A0,1000 means set amplitude on channel 0 to 1000 (dac units; -32,768 to +32,767)
+//        2 - voltage (no measurement)
+//        3 - current (no measurement)
+//        4 - disconnected (hi-z)
+//        5 - grounded//    A - A0,1000 means set amplitude on channel 0 to 1000 (dac units; -32,768 to +32,767)
 //    V - V0,100 means set amplitude on channel 0 to 100mV
 //    E - E0,1 means read channel zero, line 1. Line 0 is voltage out, line 1 is current sense.
 //        Returns (prints over serial) value in raw adc units.
@@ -280,27 +293,39 @@ int pulse (volatile PulseTrain* PT)
         return 1;
     }
 
-    int dac0val, dac1val;
+    int16_t dac0val, dac1val;
     float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
-    float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
-    float totalDelayTime = dacWriteTime + adcReadTime + adcReadTime + 0.5;
-    dac0val = PT->amplitude[0][0] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-    dac1val = PT->amplitude[1][0] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+    float dacWriteTime = 2.75 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //24 bits at 30MHz, calibrated time is 2.75us
+    uint32_t totalDelayTime = (int32_t)(dacWriteTime + adcReadTime + adcReadTime + 0.5);
+    if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
+        dac0val = PT->amplitude[0][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0];
+    } else {
+        dac0val = PT->amplitude[0][0] / MICROAMPS_PER_DAC +  Stimjim.currentOffsets[0];
+    }
+    if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
+        dac1val = PT->amplitude[1][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1];
+    } else {
+        dac1val = PT->amplitude[1][0] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1];
+    }
+    //Serial.print(dac0val); Serial.print(","); Serial.println(dac1val);
+    
 
-    if (PT->mode[0] < 2 && PT->mode[1] < 2) {
+    if ((PT->mode[0] < 4) && (PT->mode[1] < 4)) {
         Stimjim.writeToDacs(dac0val, dac1val);
-    } else if (PT->mode[0] < 2) {
+    } else if (PT->mode[0] < 4) {
         Stimjim.writeToDac(0, dac0val);
-    } else if (PT->mode[1] < 2) {
+    } else if (PT->mode[1] < 4) {
         Stimjim.writeToDac(1, dac1val);
     }
-    if (PT->mode[0] < 2)
-        Stimjim.setOutputMode(0, PT->mode[0]);
+    if (PT->mode[0] < 4)
+        Stimjim.setOutputMode(0, PT->mode[0] & 1);
 
-    if (PT->mode[1] < 2)
-        Stimjim.setOutputMode(1, PT->mode[1]);
+    if (PT->mode[1] < 4)
+        Stimjim.setOutputMode(1, PT->mode[1] & 1);
+
     for (int i = 0; i < PT->nStages; i++) {
-        delayMicroseconds(PT->stageDuration[i] - totalDelayTime); // empirically calibrated!
+        if (PT->stageDuration[i] > totalDelayTime)
+            delayMicroseconds(PT->stageDuration[i] - totalDelayTime);
 
         // read ADCs  TODO measure both current and voltage, not only that corresponding to mode
         if (PT->mode[0] < 2) {
@@ -313,28 +338,36 @@ int pulse (volatile PulseTrain* PT)
         }
 
         if ( i + 1 < PT->nStages) {
-            dac0val = PT->amplitude[0][i + 1] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-            dac1val = PT->amplitude[1][i + 1] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+            if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
+                dac0val = PT->amplitude[0][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0];
+            } else {
+                dac0val = PT->amplitude[0][i + 1] / MICROAMPS_PER_DAC +  Stimjim.currentOffsets[0];
+            }
+            if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
+                dac1val = PT->amplitude[1][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1];
+            } else {
+                dac1val = PT->amplitude[1][i + 1] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1];
+            }
         } else { // we're in the last stage, set DACs back to zero
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
         }
 
         // write to dacs
-        if (PT->mode[0] < 2 && PT->mode[1] < 2) {
+        if ((PT->mode[0] < 4) && (PT->mode[1] < 4)) {
             Stimjim.writeToDacs(dac0val, dac1val);
-        } else if (PT->mode[0] < 2) {
+        } else if (PT->mode[0] < 4) {
             Stimjim.writeToDac(0, dac0val);
-        } else if (PT->mode[1] < 2) {
+        } else if (PT->mode[1] < 4) {
             Stimjim.writeToDac(1, dac1val);
         }
     }
 
     // switch outputs to ground
-    if (PT->mode[0] < 2)
+    if (PT->mode[0] < 4)
         Stimjim.setOutputMode(0, 3);
 
-    if (PT->mode[1] < 2)
+    if (PT->mode[1] < 4)
         Stimjim.setOutputMode(1, 3);
 
     PT->nPulses++;
@@ -351,32 +384,29 @@ int sinewave(volatile PulseTrain* PT)
     t0 = micros();
 
     int dac0val, dac1val;
-    //float adcReadTime =  4.50 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //16 bits at 10MHz, calibrated time is 4.5us
-    //float dacWriteTime = 2.75 * ((PT->mode[0] < 2) + (PT->mode[1] < 2));  //24 bits at 30MHz, calibrated time is 2.75us
+    //float adcReadTime =  4.50 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //16 bits at 10MHz, calibrated time is 4.5us
+    //float dacWriteTime = 2.75 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //24 bits at 30MHz, calibrated time is 2.75us
     //float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
-    dac0val = PT->wave[0].amplitude / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-    dac1val = PT->wave[1].amplitude / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
     float f1 = 8192*(PT-> wave[1].frequency)/1000000.;
     float f0 = 8192*(PT-> wave[0].frequency)/1000000.;
     float meresido0 = 0.25 / f0;
     float meresido1 = 0.25 / f1;
-    int merendo0 = 1, merendo1 = 1;
+    int merendo0=0, merendo1 = 0;
+    if (PT->mode[0] < 2) {
+        merendo0 = 1;
+    }
+    if (PT->mode[1] < 2) {
+        merendo1 = 1;
+    }
     //8192-tablazat hossza(periodus)
     // /1000000- us-> s
 
-    if (PT->mode[0] < 2 && PT->mode[1] < 2) {
-        Stimjim.writeToDacs(dac0val, dac1val);
-    } else if (PT->mode[0] < 2) {
-        Stimjim.writeToDac(0, dac0val);
-    } else if (PT->mode[1] < 2) {
-        Stimjim.writeToDac(1, dac1val);
-    }
-    if (PT->mode[0] < 2)
-        Stimjim.setOutputMode(0, PT->mode[0]);
+    if (PT->mode[0] < 4)
+        Stimjim.setOutputMode(0, PT->mode[0] & 1);
 
-    if (PT->mode[1] < 2)
-        Stimjim.setOutputMode(1, PT->mode[1]);
+    if (PT->mode[1] < 4)
+        Stimjim.setOutputMode(1, PT->mode[1] & 1);
 
     int c;
     for (c = 0; t < PT->stageDuration[0]; c++){
@@ -386,40 +416,48 @@ int sinewave(volatile PulseTrain* PT)
 
         // TODO start phase? offset phase?
         if (t < PT->stageDuration[0]) {
-            dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / ((!PT->mode[0]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-            dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / ((!PT->mode[1]) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC))) + ((PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+            if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
+                dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MILLIVOLTS_PER_DAC)) + Stimjim.voltageOffsets[0];
+            } else {
+                dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MICROAMPS_PER_DAC)) +  Stimjim.currentOffsets[0];
+            }
+            if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
+                dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MILLIVOLTS_PER_DAC)) + Stimjim.voltageOffsets[1];
+            } else {
+                dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MICROAMPS_PER_DAC)) + Stimjim.currentOffsets[1];
+            }
         } else { // we're in the last stage, set DACs back to zero
             dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
             dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
         }
         
         // read ADCs (this should be far from last DAC set, i.e., just before new DAC set)
-        if (merendo0 && (meresido0 < t) && (PT->mode[0] < 2)) {
+        if (merendo0 && (meresido0 < t)) {
             PT->voltage[0][0] += (Stimjim.readAdc(0, 0)-Stimjim.adcOffset10[0]) * MILLIVOLTS_PER_ADC;
             PT->current[0][0] += (Stimjim.readAdc(0, 1)-Stimjim.adcOffset10[0]) * MICROAMPS_PER_ADC;
             merendo0 = 0;
         }
-        if (merendo1 && (meresido1 < t) && (PT->mode[1] < 2)) {
+        if (merendo1 && (meresido1 < t)) {
             PT->voltage[1][0] += (Stimjim.readAdc(1, 0)-Stimjim.adcOffset10[1]) * MILLIVOLTS_PER_ADC;
             PT->current[1][0] += (Stimjim.readAdc(1, 1)-Stimjim.adcOffset10[1]) * MICROAMPS_PER_ADC;
             merendo1 = 0;
         }
 
         // write to dacs
-        if (PT->mode[0] < 2 && PT->mode[1] < 2) {
+        if (PT->mode[0] < 4 && PT->mode[1] < 4) {
             Stimjim.writeToDacs(dac0val, dac1val);
-        } else if (PT->mode[0] < 2) {
+        } else if (PT->mode[0] < 4) {
             Stimjim.writeToDac(0, dac0val);
-        } else if (PT->mode[1] < 2) {
+        } else if (PT->mode[1] < 4) {
             Stimjim.writeToDac(1, dac1val);
         }
     }
     
     // switch outputs to ground
-    if (PT->mode[0] < 2)
+    if (PT->mode[0] < 4)
         Stimjim.setOutputMode(0, 3);
 
-    if (PT->mode[1] < 2)
+    if (PT->mode[1] < 4)
         Stimjim.setOutputMode(1, 3);
 
     PT->nPulses++;
@@ -457,6 +495,10 @@ void printResultSummary(volatile PulseTrain* PT)
         Serial.println(" waves.");
     } else {
         Serial.println(" pulses.");
+    }
+    if ((PT->mode[0] > 2) || (PT->mode[1] > 2)) {
+        Serial.println("Note: no measurement carried out.");
+        return;
     }
     Serial.println("Current/Voltage by stage: ");
     Serial.println("           Ch0                Ch1 ");
@@ -506,6 +548,10 @@ void displayResultSummary(volatile PulseTrain* PT)
   } else {
     display.println(" pulses.");
   }
+  if ((PT->mode[0] > 2) || (PT->mode[1] > 2)) {
+    //Serial.println("Note: no measurement carried out.");
+    return;
+  }
   char str[200];
   ResistanceResult res[2];
   for (int i = 0; i < 1; i++) {  // single stage display
@@ -553,14 +599,14 @@ void pulse0()
         printResultSummary(activePT0);
         displayResultSummary(activePT0);
 
-        if (activePT0->mode[0] < 2) {
+        if (activePT0->mode[0] < 4) {
             digitalWriteFast(LED0, LOW);
             digitalWriteFast(GPIO_10, LOW);
             if (trigOutput[0])
                 digitalWriteFast(IN0, LOW);
         }
 
-        if (activePT0->mode[1] < 2) {
+        if (activePT0->mode[1] < 4) {
             digitalWriteFast(LED1, LOW);
             digitalWriteFast(GPIO_11, LOW);
             if (trigOutput[1])
@@ -580,14 +626,14 @@ void pulse1()
         printResultSummary(activePT1);
         displayResultSummary(activePT1);
 
-        if (activePT1->mode[0] < 2) {
+        if (activePT1->mode[0] < 4) {
             digitalWriteFast(LED0, LOW);
             digitalWriteFast(GPIO_10, LOW);
             if (trigOutput[0])
                digitalWriteFast(IN0, LOW);
         }
 
-        if (activePT1->mode[1] < 2)
+        if (activePT1->mode[1] < 4)
         {
             digitalWriteFast(LED1, LOW);
             digitalWriteFast(GPIO_11, LOW);
@@ -616,14 +662,14 @@ void startIT0(int ptIndex)
         Serial.println("Forcing T train to stop");
         IT0.end();
 
-        if (activePT0->mode[0] < 2) {
+        if (activePT0->mode[0] < 4) {
             digitalWriteFast(LED0, LOW);
             digitalWriteFast(GPIO_10, LOW);
             if (trigOutput[0])
               digitalWriteFast(IN0, LOW);
         }
 
-        if (activePT0->mode[1] < 2) {
+        if (activePT0->mode[1] < 4) {
             digitalWriteFast(LED1, LOW);
             digitalWriteFast(GPIO_11, LOW);
             if (trigOutput[1])
@@ -641,14 +687,14 @@ void startIT0(int ptIndex)
     Serial.print("\r\nStarted T train with parameters of PulseTrain ");
     Serial.println(ptIndex);
 
-    if (activePT0->mode[0] < 2) {
+    if (activePT0->mode[0] < 4) {
         digitalWriteFast(LED0, HIGH);
         digitalWriteFast(GPIO_10, HIGH);
         if (trigOutput[0])
           digitalWriteFast(IN0, HIGH);
     }
 
-    if (activePT0->mode[1] < 2){
+    if (activePT0->mode[1] < 4){
         digitalWriteFast(LED1, HIGH);
         digitalWriteFast(GPIO_11, HIGH);
         if (trigOutput[1])
@@ -664,7 +710,7 @@ void startIT1(int ptIndex)
 
         Serial.println("Forcing U train to stop");
 
-        if (activePT1->mode[0] < 2) {
+        if (activePT1->mode[0] < 4) {
             digitalWriteFast(LED0, LOW);
             digitalWriteFast(GPIO_10, LOW);
             if (trigOutput[0])
@@ -672,7 +718,7 @@ void startIT1(int ptIndex)
 
         }
 
-        if (activePT1->mode[1] < 2) {
+        if (activePT1->mode[1] < 4) {
             digitalWriteFast(LED1, LOW);
             digitalWriteFast(GPIO_11, LOW);
             if (trigOutput[1])
@@ -691,14 +737,14 @@ void startIT1(int ptIndex)
     Serial.print("\r\nStarted U train with parameters of PulseTrain "); 
     Serial.println(ptIndex);
 
-    if (activePT1->mode[0] < 2) {
+    if (activePT1->mode[0] < 4) {
         digitalWriteFast(LED0, HIGH);
         digitalWriteFast(GPIO_10, HIGH);
         if (trigOutput[0])
             digitalWriteFast(IN0, HIGH);
 
     }
-    if (activePT1->mode[1] < 2) {
+    if (activePT1->mode[1] < 4) {
         digitalWriteFast(LED1, HIGH);
         digitalWriteFast(GPIO_11, HIGH);
         if (trigOutput[1])
@@ -715,7 +761,7 @@ void printPulseTrainParameters(int i)
         return;
     }
 
-    const char modeStrings[4][40] = {"Voltage output", "Current output", "No output (high-Z)", "No output (grounded)"};
+    const char modeStrings[6][40] = {"Voltage output", "Current output", "Voltage output", "Current output", "No output (high-Z)", "No output (grounded)"};
     Serial.println("----------------------------------");
     char str[200];
     sprintf(str, "Parameters for PulseTrain[%d]\r\n  mode[ch0]: %d (%s)\r\n  mode[ch1]: %d (%s)\r\n",
@@ -727,8 +773,8 @@ void printPulseTrainParameters(int i)
     Serial.println("\r\n  stage    duration     output0   output1");
     if(PTs[i].isWave) {
         sprintf(str, "   %2d  %7d usec %8d%s %8d%s\r\n", 0, PTs[i].stageDuration[0],
-            PTs[i].wave[0].amplitude, (PTs[i].mode[0] == 0) ? "mV" : "uA",
-            PTs[i].wave[1].amplitude, (PTs[i].mode[1] == 0) ? "mV" : "uA");
+            PTs[i].wave[0].amplitude, ((PTs[i].mode[0] == 0) || (PTs[i].mode[0] == 2)) ? "mV" : "uA",
+            PTs[i].wave[1].amplitude, ((PTs[i].mode[1] == 0) || (PTs[i].mode[1] == 2)) ? "mV" : "uA");
         Serial.print(str);
         sprintf(str, "   %2s  %7s      %8d%s %8d%s\r\n", "", "",
             PTs[i].wave[0].frequency, "Hz", PTs[i].wave[1].frequency, "Hz");
@@ -739,8 +785,8 @@ void printPulseTrainParameters(int i)
     } else {
     for (int j = 0; j < PTs[i].nStages; j++) {
         sprintf(str, "   %2d  %7d usec %8d%s %8d%s\r\n", j, PTs[i].stageDuration[j],
-            PTs[i].amplitude[0][j], (PTs[i].mode[0] == 0) ? "mV" : "uA",
-            PTs[i].amplitude[1][j], (PTs[i].mode[1] == 0) ? "mV" : "uA");
+            PTs[i].amplitude[0][j], ((PTs[i].mode[0] == 0) || (PTs[i].mode[0] == 2)) ? "mV" : "uA",
+            PTs[i].amplitude[1][j], ((PTs[i].mode[1] == 0) || (PTs[i].mode[1] == 2)) ? "mV" : "uA");
         Serial.print(str);
     }}
 
@@ -793,8 +839,8 @@ void setup()
     Serial.print("User definitions take "); Serial.print(sizeof(PTs)); Serial.println(" bytes");
 
     for (int i = 0; i < PT_ARRAY_LENGTH; i++) {
-        PTs[i].mode[0] = 3;
-        PTs[i].mode[1] = 3;
+        PTs[i].mode[0] = 5;
+        PTs[i].mode[1] = 5;
         PTs[i].period = 10000;
         PTs[i].duration = 500000;
         PTs[i].nStages = 0;
@@ -866,10 +912,10 @@ void loop()
                     &(PTs[ptIndex].mode[1]),
                     &(PTs[ptIndex].period),
                     &(PTs[ptIndex].duration));
-                if (PTs[ptIndex].mode[0] < 0 || PTs[ptIndex].mode[0] > 3)
-                    PTs[ptIndex].mode[0] = 3;
-                if (PTs[ptIndex].mode[1] < 0 || PTs[ptIndex].mode[1] > 3)
-                    PTs[ptIndex].mode[1] = 3;
+                if (PTs[ptIndex].mode[0] < 0 || PTs[ptIndex].mode[0] > 5)
+                    PTs[ptIndex].mode[0] = 5;
+                if (PTs[ptIndex].mode[1] < 0 || PTs[ptIndex].mode[1] > 5)
+                    PTs[ptIndex].mode[1] = 5;
 
                 if (m == 4) {
                   // valid mode, period, and duration parameters were read, now read stage parameters
