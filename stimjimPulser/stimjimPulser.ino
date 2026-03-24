@@ -25,9 +25,13 @@
 
 // WARNINGS!
 // Amplitudes over 3000 uA are converted on the DAC incorrectly.
+// When measuring 1kOhm, then measurements at 10usec seem correct,
+// however at 10kOhm load the DAC converges more slowly and
+// in addition, the measurements interfere with the load,
+// so use at least 100us and expect an error of 10%.
 
 // Fonoff:
-// Measure S0,1,1,10000,1000000;800,3000,10;-800,-3000,10
+// Measure S0,1,1,10000,1000000;800,3000,100;-800,-3000,100
 // Do S0,3,3,10000,1000000;800,3000,10;-800,-3000,10
 
 // iTBS:
@@ -282,6 +286,16 @@ int saveTriggersEEPROM(){
     return 0;
 }
 
+inline int16_t convertFloatToInt16(float x) {
+    if (x > 32767) {
+        return 32767;
+    } else if (x < -32768) {
+        return -32768;
+    } else {
+        return (int16_t)x;
+    }
+}
+
 int pulse (volatile PulseTrain* PT)
 {
     //check if the pulseTrain is finished; if so, exit
@@ -298,16 +312,16 @@ int pulse (volatile PulseTrain* PT)
     float dacWriteTime = 2.75 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //24 bits at 30MHz, calibrated time is 2.75us
     uint32_t totalDelayTime = (int32_t)(dacWriteTime + adcReadTime + adcReadTime + 0.5);
     if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
-        dac0val = PT->amplitude[0][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0];
+        dac0val = convertFloatToInt16(PT->amplitude[0][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0]);
     } else {
-        dac0val = PT->amplitude[0][0] / MICROAMPS_PER_DAC +  Stimjim.currentOffsets[0];
+        dac0val = convertFloatToInt16(PT->amplitude[0][0] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[0]);
     }
     if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
-        dac1val = PT->amplitude[1][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1];
+        dac1val = convertFloatToInt16(PT->amplitude[1][0] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1]);
     } else {
-        dac1val = PT->amplitude[1][0] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1];
+        dac1val = convertFloatToInt16(PT->amplitude[1][0] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1]);
     }
-    //Serial.print(dac0val); Serial.print(","); Serial.println(dac1val);
+    // Serial.print(dac0val); Serial.print(","); Serial.println(dac1val);
     
 
     if ((PT->mode[0] < 4) && (PT->mode[1] < 4)) {
@@ -339,18 +353,18 @@ int pulse (volatile PulseTrain* PT)
 
         if ( i + 1 < PT->nStages) {
             if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
-                dac0val = PT->amplitude[0][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0];
+                dac0val = convertFloatToInt16(PT->amplitude[0][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0]);
             } else {
-                dac0val = PT->amplitude[0][i + 1] / MICROAMPS_PER_DAC +  Stimjim.currentOffsets[0];
+                dac0val = convertFloatToInt16(PT->amplitude[0][i + 1] / MICROAMPS_PER_DAC +  Stimjim.currentOffsets[0]);
             }
             if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
-                dac1val = PT->amplitude[1][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1];
+                dac1val = convertFloatToInt16(PT->amplitude[1][i + 1] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1]);
             } else {
-                dac1val = PT->amplitude[1][i + 1] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1];
+                dac1val = convertFloatToInt16(PT->amplitude[1][i + 1] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1]);
             }
         } else { // we're in the last stage, set DACs back to zero
-            dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
-            dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
+            dac0val = (PT->mode[0]) ? (Stimjim.currentOffsets[0]) : (Stimjim.voltageOffsets[0]);
+            dac1val = (PT->mode[1]) ? (Stimjim.currentOffsets[1]) : (Stimjim.voltageOffsets[1]);
         }
 
         // write to dacs
@@ -383,7 +397,7 @@ int sinewave(volatile PulseTrain* PT)
     uint32_t t0, t=0;
     t0 = micros();
 
-    int dac0val, dac1val;
+    int16_t dac0val, dac1val;
     //float adcReadTime =  4.50 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //16 bits at 10MHz, calibrated time is 4.5us
     //float dacWriteTime = 2.75 * ((PT->mode[0] < 4) + (PT->mode[1] < 4));  //24 bits at 30MHz, calibrated time is 2.75us
     //float totalDelayTime = dacWriteTime + adcReadTime + 0.5;
@@ -417,18 +431,18 @@ int sinewave(volatile PulseTrain* PT)
         // TODO start phase? offset phase?
         if (t < PT->stageDuration[0]) {
             if ((PT->mode[0] == 0) || (PT->mode[0] == 2)) {
-                dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MILLIVOLTS_PER_DAC)) + Stimjim.voltageOffsets[0];
+                dac0val = convertFloatToInt16(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[0]);
             } else {
-                dac0val = int(round(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MICROAMPS_PER_DAC)) +  Stimjim.currentOffsets[0];
+                dac0val = convertFloatToInt16(PT->wave[0].amplitude*sinetable[int(round(t*f0))&8191] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[0]);
             }
             if ((PT->mode[1] == 0) || (PT->mode[1] == 2)) {
-                dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MILLIVOLTS_PER_DAC)) + Stimjim.voltageOffsets[1];
+                dac1val = convertFloatToInt16(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[1]);
             } else {
-                dac1val = int(round(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MICROAMPS_PER_DAC)) + Stimjim.currentOffsets[1];
+                dac1val = convertFloatToInt16(PT->wave[1].amplitude*sinetable[int(round(t*f1))&8191] / MICROAMPS_PER_DAC + Stimjim.currentOffsets[1]);
             }
         } else { // we're in the last stage, set DACs back to zero
-            dac0val = (PT->mode[0]) ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0];
-            dac1val = (PT->mode[1]) ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1];
+            dac0val = (PT->mode[0]) ? (Stimjim.currentOffsets[0]) : (Stimjim.voltageOffsets[0]);
+            dac1val = (PT->mode[1]) ? (Stimjim.currentOffsets[1]) : (Stimjim.voltageOffsets[1]);
         }
         
         // read ADCs (this should be far from last DAC set, i.e., just before new DAC set)
