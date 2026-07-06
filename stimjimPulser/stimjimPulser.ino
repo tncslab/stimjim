@@ -160,6 +160,7 @@ float sinetable[8192];
 
 volatile PulseTrain PTs[PT_ARRAY_LENGTH];
 volatile PulseTrain *activePT0, *activePT1;
+volatile bool trainRunning = false;  // suspends input-trigger/button starts while a train is live
 IntervalTimer IT0, IT1;
 
 // ------------ Globals for trigger status -------------------- //
@@ -609,6 +610,7 @@ void pulse0()
     if (!ret) {
 
         IT0.end();
+        trainRunning = false;
         train_count++;
         printResultSummary(activePT0);
         displayResultSummary(activePT0);
@@ -631,11 +633,12 @@ void pulse0()
 
 void pulse1()
 {
-    // todo: it is not a good idea to keep IT busy while generating signal
+    // todo: it is not a good idea to keep interrupt busy while generating signal
     int ret = activePT1->isWave ? sinewave(activePT1) : pulse(activePT1);
     if (!ret) {
 
         IT1.end();
+        trainRunning = false;
         train_count++;
         printResultSummary(activePT1);
         displayResultSummary(activePT1);
@@ -659,12 +662,14 @@ void pulse1()
 
 void startIT0ViaInputTrigger()
 {
+    if (trainRunning) return;  // suspend triggers while a train is live
     if (triggerTargetPTs[0] >= 0)
         startIT0(triggerTargetPTs[0]);
 }
 
 void startIT1ViaInputTrigger()
 {
+    if (trainRunning) return;  // suspend triggers while a train is live
     if (triggerTargetPTs[1] >= 0)
         startIT1(triggerTargetPTs[1]);
 }
@@ -675,6 +680,7 @@ void startIT0(int ptIndex)
 
         Serial.println("Forcing T train to stop");
         IT0.end();
+        trainRunning = false;
 
         if (activePT0->mode[0] < 4) {
             digitalWriteFast(LED0, LOW);
@@ -693,6 +699,7 @@ void startIT0(int ptIndex)
         return;
     }
 
+    trainRunning = true;
     activePT0 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT0->trainStartTime = micros();
 
@@ -740,9 +747,11 @@ void startIT1(int ptIndex)
         }
 
         IT1.end();
+        trainRunning = false;
         return;
     }
 
+    trainRunning = true;
     activePT1 = clearPulseTrainHistory(&PTs[ptIndex]);
     activePT1->trainStartTime = micros();
 
