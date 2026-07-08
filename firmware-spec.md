@@ -1,0 +1,43 @@
+# Teensy 3.5-based arbitrary waveform generator
+
+We have the hardware called StimJim which is a dual-channel arbitrary waveform generator where each channel has:
+- reference-independent, isolated power supply
+- voltage or current-gernerator mode
+- capability to measure voltage and current
+
+The hardware-specific layer is implemented in @lib/stimjim/src however the current logic in @stimjimPulser/stimjimPulser.ino Arduino project has limitations.
+
+## Current Firmware
+
+The firmware is an extended version of the one shipped with the device:
+- the original firmware in the "master" git branch was capable of generating piecewise linear waveforms that repeated periodically for a given length
+- it was extended in the "Szinuszgenerator" git branch (still @stimjimPulser/stimjimPulser.ino file) by generating sinusoidal waveform based on partially precalculated tables all preserving the original Serial interface
+
+The original serial interface
+- allows setting parameters and querying waveform parameters
+- however for the other parameters mostly parameter setting is implemented lacking querying parameters
+- sometimes setting parameters substitute missing values by defaults that are not documented
+- was extended by a display and 3 buttons (that will eventually replaced by a module with taller screen, back/ok/click buttons where click is a function of the rotary encoder)
+
+The original timing scheme
+- executes first waveform from interrupt (may halt control for long periods)
+- executes subsequent repeating waveforms from an interrupt with higher priority, possibly interfering first instance if waveform is longer than repetition period
+- allows only the synchronized use of the two channels
+
+## Requested features
+
+- waveforms: piecewise linear, piecewise constant (same triplet notation is OK: amp_ch0, amp_ch1, duration, where user can set 0 duration for instantly changing voltage instead of ramping), sinusoidal (here the notation is less elaborated, let discuss it)
+- it may be interesting to allow ramping of the envelop, add this as a separate parameter and Serial command
+- waveforms to the near microsecond precision and duration
+- advanced trigger handling: allowing trigger input 0 and trigger input 1: either executing synchronized wavefor or waveform only for that channel; for each trigger it is programmable which waveform (or nothing) it executes on which channel
+- configurable whether voltage, current or both are measured and at which stages (first, all, sine peak); consider that output has transient so measure near the end of the stage but also that programming a measurement takse time; note that programming the D/A and command execution may be separated for better alignment of measurement
+- waveforms generated based on clock, (investigate possibility or necessity of DMA for fastest non blocking SPI transfer)
+- preparation for the more advanced screen-buttons-rotary interface: the button that says hello may allow setting the waveform, the rotary selecting it
+- fix the current serial limitations: allow querying, adjust docs to make default values evident
+
+## Suggestions
+
+- hardware description is in @datasheets but you might take notes of it in @docs instead loading it each time into the context window
+- if unsure of some feature or having multiple ideas ask the user
+- work in the "arbitrary_waveform" git branch, work the new folder @stimjimAWG
+- you may ignore folders like gui, images and PCB
