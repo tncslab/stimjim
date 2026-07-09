@@ -160,7 +160,25 @@ TRIG<t>?  → canonical line
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
 | `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS`, both `TRIG` lines, `OK`. Paste-back restores the configuration. |
 | `LOG` | SD logging: `LOG?` status (card present, open file, bytes); `LOG1[,name]` open new file; `LOG0` close/flush. |
-| `BENCH` | benchmark group (Phase 1+): jitter histograms, throughput sweep — documented separately once implemented. |
+| `BENCH` | benchmark group (implemented in Phase 1, see below). |
+
+**`BENCH` group** (Phase 1). Timing results are printed in CPU cycles (120/µs) and ns; multi-line
+output ends with `OK`. `BENCH?` lists the group. DAC benches program without latching (or re-latch
+the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive the DAC and print a
+`WARN` first — keep outputs grounded (boot state).
+
+| Cmd | Function |
+|---|---|
+| `BENCHDAC[,n]` / `BENCHDAC2[,n]` | `dacProgram` single / `dacProgramBoth` dual (no latch) |
+| `BENCHLATCH[,n]` | `dacLatch(0b11)` pulse |
+| `BENCHADC[,ch,line,n]` | `adcRead` with the line pre-selected |
+| `BENCHSW[,ch,n]` | alternating `adcSelectLine`+`adcRead` (line-switch cost, bench-verify item 1) |
+| `BENCHMISO[,n]` | alternating ch0/ch1 reads (MISO PORT-mux swap, bench-verify item 3) |
+| `BENCHCYC[,n]` | `cycles64()` overhead |
+| `BENCHK[,n]` | re-run the `K_RELOAD` self-calibration, print residual min/med/max (item 6) |
+| `BENCHPIT,period_us,n[,preload_us]` | PIT wake (preload 0) or post-spin latch jitter vs absolute deadline, histogram in 0.5 µs bins |
+| `BENCHSQ,ch,code,half_us,n` | square wave via FastIO program+latch — scope A/B vs |
+| `BENCHSQL,ch,code,half_us,n` | the same square wave via legacy `Stimjim.writeToDac` |
 
 ## 5. Defaults (authoritative table)
 
