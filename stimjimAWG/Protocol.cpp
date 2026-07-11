@@ -11,8 +11,8 @@ static uint16_t lineLen    = 0;
 static bool     discarding = false;   // overflow: swallow until next '\n'
 
 void begin() {
-  Serial.printf("# %s %s (Phase 2) — waveform definition + queries live; "
-                "HELP lists commands; T/U start arrives in Phase 3\n",
+  Serial.printf("# %s %s (Phase 3) — definitions, queries and T/U playback of "
+                "S trains live; HELP lists commands\n",
                 SJ_FW_NAME, SJ_FW_VERSION);
   Serial.printf("IDN,%s,%s,fw=%s,proto=%d\n",
                 SJ_FW_NAME, SJ_HW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);

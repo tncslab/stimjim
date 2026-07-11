@@ -12,6 +12,9 @@ void poll();    // drain Serial, assemble lines, dispatch complete ones
 namespace Commands {
 // Dispatch one complete, NUL-terminated line (no terminator, not blank/comment).
 void handleLine(const char* line);
+// Drain the engine completion ring and print result summaries (loop context —
+// the player ISRs never print; plan §3.3).
+void poll();
 }
 
 #endif // STIMJIMAWG_PROTOCOL_H

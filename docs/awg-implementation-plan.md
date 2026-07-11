@@ -158,21 +158,40 @@ issued during a train).
 
 ### 3.6 Measurement
 
-A per-train `MeasurePlan` is compiled at arm time. For each stage selected by `MeasureWhen`
-(first stage / all stages), a MEASURE event is scheduled at
+Measurement participation is decoupled from the output mode: train modes carry the original
+0–3 numbering (2/3 = channel not driven; the lab's 2/3-as-unmeasured renumbering is retired,
+see protocol §6.8), and *whether/what/when* to measure lives in the per-slot `MEAS` config
+(`what` per channel; 90/91 mode sugar in train definitions maps onto `what=0`). A per-train
+`MeasurePlan` is compiled at arm time from that config.
+
+For `S`/`L` slots, each stage selected by `stage` (−1 = all, n = that stage only) gets a
+MEASURE event near the stage end (`when=0`, transient settled), scheduled at
 
 ```
 t_meas = stageEnd − Σ(adcRead ≈ 2 µs per selected line) − lineSwitch(≈2 µs if needed) − GUARD(≈1 µs)
 ```
 
-so reads finish just before the next latch — "near the end of the stage, transient settled", with
-ADC programming time explicitly budgeted instead of silently eaten from the stage duration.
-`adcSelectLine` is pre-issued during earlier slack when the plan knows the next line. Stages too
-short for their plan get the measurement skipped and flagged in the result buffer.
-`SINE_PEAK` solves the phase accumulator for the first 90° crossing *after* envelope ramp-in
-completes (measuring mid-ramp would under-read); the derivative is zero at the peak, so ADC
-sample-instant uncertainty is second order. Results accumulate as int32 sums + counts per
-stage/line/channel (legacy averaging semantics preserved).
+so reads finish just before the next latch, with ADC programming time explicitly budgeted
+instead of silently eaten from the stage duration. `adcSelectLine` is pre-issued during earlier
+slack when the plan knows the next line. Stages too short for their plan get the measurement
+skipped and flagged in the summary.
+
+For `W` slots, `when` selects the positive peak (1), negative peak (2) or both (3, default);
+the plan solves the phase accumulator for the 90°/270° crossings within **one period per
+burst** — the first full period after envelope ramp-in completes (mid-ramp peaks would
+under-read, and the V+I ADC budget of ~9–11 µs rules out per-sample measurement at generation
+rates). The derivative is zero at a peak, so ADC sample-instant uncertainty is second order.
+
+Results accumulate per point/line/channel as `n`, Σv (int32) and Σv² (int64) — the legacy
+mean is `Σv/n`, and the summary additionally reports the sample standard deviation
+`sqrt((Σv² − (Σv)²/n)/(n−1))`. The single-pass estimator is deliberately simple; with 13-bit
+ADC codes and realistic repetition counts the precision loss is irrelevant, and it makes a
+spread estimate available even for waveforms defined from very many repetitions. Summary
+lines use the frozen `MSUM` record (protocol §4); per-repetition values use `MDATA`.
+
+Manual (out-of-train) measurement is the `READ` command (protocol §4): n averaged calibrated
+V+I reads with mean and sd, loop-context only, refused while a train runs. `E` stays the
+single raw BIST-frozen read.
 
 ### 3.7 SD logging (new requirement)
 
@@ -238,15 +257,17 @@ Per project convention (CLAUDE.md): commit at each phase end and append a handof
   Scope-verify `dacProgram`+`dacLatch` ≡ `Stimjim.writeToDac`.
 - **Phase 2 — TrainStore + protocol core.** Legacy commands with atomic staging, `?` queries,
   round-trip serializers. Verify against StimJimBIST and the README/header example command lines.
-- **Phase 3 — Scheduler + single-channel HOLD trains.** `T`/`U` live; jitter histograms vs
-  acceptance (latch < 200 ns; ≤ 1 µs cumulative over a 10 s train; trigger latency =
-  `START_LATENCY` ± 1 µs); A/B against old firmware on the scope.
+- **Phase 3 — Scheduler + HOLD trains.** `T`/`U` live for `S` slots (copy-on-arm, completion
+  ring, `STAT`); `READ` manual measurement; jitter histograms vs acceptance (latch < 200 ns;
+  ≤ 1 µs cumulative over a 10 s train; trigger latency = `START_LATENCY` ± 1 µs); A/B against
+  old firmware on the scope.
 - **Phase 4 — RAMP (`L`), 0-duration chains, drift-free repeats, envelope (`ENV`).**
 - **Phase 5 — Sine (`W`).** int16 table, applied phase, per-train Fs; confirm ~30 KB RAM saved.
 - **Phase 6 — Dual channel.** dualSync + two independent players; collision-jitter benchmark;
   publish the measured FsMax table into `Config.h` with ~30 % margin.
-- **Phase 7 — Measurement engine + SD.** `MEAS`, `MeasurePlan`, `SINE_PEAK`, summaries; `SdLog` +
-  `LOG`; MDATA ring (record format final; live streaming optional).
+- **Phase 7 — Measurement engine + SD.** `MeasurePlan` execution (stage-end / sine-peak events,
+  per-stage selection, Σv/Σv² accumulation), `MSUM` summaries; `SdLog` + `LOG`; MDATA ring
+  (record format final; live streaming optional).
 - **Phase 8 — Triggers, UI, persistence, final protocol.** `TRIG`/`R`, button/menu UI, EEPROM v2,
   `STAT`/`IDN`/`HELP`/`DUMP` final; full verification battery (Rigol DG800 Pro → IN0
   trigger-latency measured on the TDS 2004B; long-run drift).

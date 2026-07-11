@@ -6,10 +6,11 @@
 //    docs/awg-implementation-plan.md, docs/serial-protocol.md,
 //    docs/hardware-notes.md; progress log: docs/PROGRESS.md.
 //
-//    Phase 1 scaffold: all modules compile; FastIO (register-level split-phase
-//    DAC/ADC, cycles64, busLock) and the BENCH harness are functional; the
-//    engine reserves its PIT channels and self-calibrates K_RELOAD at boot.
-//    Waveform generation arrives in Phases 3-6 — use stimjimPulser meanwhile.
+//    Phase 3 state: FastIO + BENCH harness (Phase 1); full waveform-definition
+//    protocol with atomic staging, queries, EEPROM (Phase 2); PIT deadline
+//    scheduler playing rectangular (`S`) trains via T/U with copy-on-arm and
+//    the completion ring, plus READ manual measurement (Phase 3). L/W playback
+//    arrives in Phases 4-5, the measurement engine + SD in Phase 7.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -69,7 +70,8 @@ void setup() {
 
 void loop() {
   Protocol::poll();          // serial in -> command dispatch (all printing here)
-  Engine::poll();            // cycles64 keep-alive; Phase 3: completion ring drain
+  Engine::poll();            // cycles64 keep-alive
+  Commands::poll();          // completion-ring drain: train result summaries
   Triggers::poll();          // Phase 8: deferred trigger-reject WARNs
   Measure::poll();           // Phase 7: MDATA ring drain
   SdLog::poll();             // Phase 7: SD row writer

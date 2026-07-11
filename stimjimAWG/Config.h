@@ -23,7 +23,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.2.0"        // Phase 2: TrainStore + protocol core
+#define SJ_FW_VERSION    "0.3.0"        // Phase 3: scheduler + HOLD trains + READ
 #define SJ_PROTO_VERSION 1
 #define SJ_HW_NAME       "Teensy3.5"
 
@@ -54,6 +54,8 @@
 
 // ------------------------------------------------- engine knobs (plan §3.1)
 #define SJ_PRELOAD_US        4         // ISR wakes this early, spins on CYCCNT, latches on deadline
+#define SJ_DAC_PROG1_US      3         // budgeted dacProgram cost, single channel (calibrated 2.75 —
+#define SJ_DAC_PROG2_US      5         //   re-measure with BENCHDAC/BENCHDAC2); wake preload adds this
 #define SJ_MIN_SCHEDULE_US   3         // events closer than this are run inline in the same ISR pass
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
 #define SJ_START_LATENCY_US  20        // fixed arm->first-latch latency: trigger latency is deterministic

@@ -60,9 +60,37 @@ int main() {
   // Fonoff: exactly 3000 uA in current mode — at the limit, no warning
   CHECK(parse('S', ",1,1,10000,1000000;800,3000,100;-800,-3000,100", t, err, warn));
   CHECK(warn[0] == '\0');
-  // iTBS: 5 stages
+  // iTBS: 5 stages. NOTE: the lab header used modes 3,3 meaning "current, no
+  // measurement" — under the restored original numbering 3 = not driven
+  // (protocol §6.3); the line still parses, the 90/91 replay is below.
   CHECK(parse('S', ",3,3,200000,2000000;800,2000,280;0,0,19720;800,2000,280;0,0,19720;800,2000,280", t, err, warn));
   CHECK(t.nStages == 5);
+  CHECK(t.mode0 == 3 && t.mode1 == 3);
+
+  // ------------------------------------------- 90/91: V/I without measurement
+  // iTBS as the lab intended it: current output, measurement off
+  CHECK(parse('S', ",91,91,200000,2000000;800,2000,280;0,0,19720;800,2000,280;0,0,19720;800,2000,280", t, err, warn));
+  CHECK(t.mode0 == 1 && t.mode1 == 1);                 // stored as plain current mode
+  CHECK(t.meas.what0 == 0 && t.meas.what1 == 0);        // measurement disabled
+  TrainStore::serializeTrain(3, t, line, sizeof line);  // ... and rendered back as 91
+  CHECK(strncmp(line, "S3,91,91,", 9) == 0);
+  CHECK(parse('S', line + 2, t, err, warn));            // canonical form round-trips
+  TrainStore::serializeTrain(3, t, line2, sizeof line2);
+  CHECK_STREQ(line, line2);
+  // plain 0/1 re-enables measurement: a stored what=0 promotes back to 3 ...
+  TrainDef noMeas = t;
+  CHECK(parse('S', ",0,1,10000,500000;100,100,50", t, err, warn, &noMeas));
+  CHECK(t.meas.what0 == 3 && t.meas.what1 == 3);
+  // ... but an explicit MEAS refinement (what=1/2) is preserved
+  noMeas.meas.what0 = 2;
+  CHECK(parse('S', ",0,1,10000,500000;100,100,50", t, err, warn, &noMeas));
+  CHECK(t.meas.what0 == 2 && t.meas.what1 == 3);
+  // mixed: ch0 measured voltage, ch1 unmeasured current
+  CHECK(parse('S', ",0,91,10000,500000;100,100,50", t, err, warn));
+  CHECK(t.mode0 == 0 && t.mode1 == 1);
+  CHECK(t.meas.what0 == 3 && t.meas.what1 == 0);
+  TrainStore::serializeTrain(4, t, line, sizeof line);
+  CHECK(strncmp(line, "S4,0,91,", 8) == 0);
 
   // legacy W line — but with the header's negative-frequency typo: rejected
   CHECK(!parse('W', ",1,1,100000,300000; 100,-100,10000; -500,150,0; 0,0,0", t, err, warn));
@@ -98,8 +126,10 @@ int main() {
   CHECK(!parse('W', ",0,0,1000,10000;1,1,10;1.0001,0,0;0,0,0", t, err, warn));
 
   // ------------------------------------------------------- rejected inputs
-  CHECK(!parse('S', ",6,0,1000,10000;1,1,10", t, err, warn));          // mode > 5
+  CHECK(!parse('S', ",6,0,1000,10000;1,1,10", t, err, warn));          // mode outside {0-3,90,91}
   CHECK(strstr(err, "mode") != nullptr);
+  CHECK(!parse('S', ",4,0,1000,10000;1,1,10", t, err, warn));          // lab firmware's old hi-Z code
+  CHECK(!parse('S', ",92,0,1000,10000;1,1,10", t, err, warn));
   CHECK(!parse('S', ",0,0,0,10000;1,1,10", t, err, warn));             // period 0
   CHECK(!parse('S', ",0,0,1000", t, err, warn));                       // missing duration
   CHECK(!parse('S', ",0,0,1000,10000;1,1", t, err, warn));             // incomplete triplet
@@ -114,7 +144,7 @@ int main() {
   CHECK(!parse('S', ",0,0,1000,-5;1,1,10", t, err, warn));             // negative duration
 
   // 0 stages stays legal (legacy "empty train" semantics + boot default)
-  CHECK(parse('S', ",5,5,10000,500000", t, err, warn));
+  CHECK(parse('S', ",3,3,10000,500000", t, err, warn));
   CHECK(t.nStages == 0);
   CHECK(TrainStore::isDefaultTrain(t));
   // trailing semicolon tolerated like the legacy strtok parser
@@ -135,19 +165,32 @@ int main() {
   TrainDef cur;
   TrainStore::slotDefault(cur);
   cur.env = {100, 100, 0};
-  cur.meas = {1, 2, 0, 2};   // what0=V, what1=I, when=first stage, report=SD
+  cur.meas = {1, 2, 0, 0, 2};   // what0=V, what1=I, when=stage end, stage 0 only, report=SD
   CHECK(parse('L', ",0,0,1000,10000;500,500,400", t, err, warn, &cur));
   CHECK(t.type == PIECEWISE_RAMP);
   CHECK(t.env.rampIn_us == 100 && t.env.rampOut_us == 100);            // ENV preserved for S/L
-  CHECK(t.meas.what0 == 1 && t.meas.what1 == 2 && t.meas.when == 0 && t.meas.report == 2);
-  // type change to sine: when auto-coerces to 2, W line resets the envelope
+  CHECK(t.meas.what0 == 1 && t.meas.what1 == 2 && t.meas.when == 0);
+  CHECK(t.meas.stage == 0 && t.meas.report == 2);
+  // type change to sine: when auto-coerces to 3 (both peaks), stage to -1,
+  // and the W line resets the envelope
   CHECK(parse('W', ",0,0,1000,10000;1,1,500;5,5,0;0,0,0", t, err, warn, &cur));
-  CHECK(t.meas.when == 2);
+  CHECK(t.meas.when == 3 && t.meas.stage == -1);
   CHECK(t.env.rampIn_us == 0 && t.env.rampOut_us == 0);
-  // back to S: when 2 is invalid for S/L, auto-coerces to 1
+  // an explicit peak choice survives a same-family redefinition ...
   TrainDef curW = t;
+  curW.meas.when = 2;                                    // -peak only
+  CHECK(parse('W', ",0,0,1000,10000;1,1,500;5,5,0;0,0,0", t, err, warn, &curW));
+  CHECK(t.meas.when == 2);
+  // ... and back to S: sine-peak codes are invalid for S/L, auto-coerces to 0
   CHECK(parse('S', ",0,0,1000,10000;1,1,10", t, err, warn, &curW));
-  CHECK(t.meas.when == 1);
+  CHECK(t.meas.when == 0);
+  // preserved per-stage selection must fit a shortened stage list
+  cur.meas.stage = 1;
+  CHECK(parse('S', ",0,0,1000,10000;1,1,10;2,2,10", t, err, warn, &cur));   // 2 stages: fits
+  CHECK(t.meas.stage == 1);
+  CHECK(!parse('S', ",0,0,1000,10000;1,1,10", t, err, warn, &cur));         // 1 stage: stage 1 gone
+  CHECK(strstr(err, "MEAS stage") != nullptr);
+  cur.meas.stage = -1;
   // preserved ENV no longer fitting a shortened duration fails loudly
   cur.env = {400, 400, 0};
   CHECK(!parse('S', ",0,0,1000,500;1,1,10", t, err, warn, &cur));
@@ -159,34 +202,42 @@ int main() {
   CHECK(TrainStore::validateEnv(cur, {250001, 250000, 0}) != nullptr);
   CHECK(TrainStore::validateEnv(cur, {0, 0, 1}) != nullptr);           // shape reserved
 
-  cur.mode0 = cur.mode1 = 0;              // measuring modes (the default 5/5 has nothing to measure)
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, 0}, warn, sizeof warn) == nullptr);
+  cur.mode0 = cur.mode1 = 0;              // driven modes (the default 3/3 has nothing to measure)
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0}, warn, sizeof warn) == nullptr);
   CHECK(warn[0] == '\0');
-  CHECK(TrainStore::validateMeas(cur, {4, 3, 1, 0}, warn, sizeof warn) != nullptr);  // what > 3
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 2, 0}, warn, sizeof warn) != nullptr);  // sine-peak on S slot
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, 4}, warn, sizeof warn) != nullptr);  // report > 3
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, 1}, warn, sizeof warn) == nullptr);  // streaming: warn
+  CHECK(TrainStore::validateMeas(cur, {4, 3, 0, -1, 0}, warn, sizeof warn) != nullptr);  // what > 3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, -1, 0}, warn, sizeof warn) != nullptr);  // sine-peak code on S slot
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 4}, warn, sizeof warn) != nullptr);  // report > 3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  0, 0}, warn, sizeof warn) != nullptr);  // stage 0 on a 0-stage slot
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1}, warn, sizeof warn) == nullptr);  // streaming: warn
   CHECK(strstr(warn, "stream") != nullptr);
-  cur.mode0 = 4;                                                       // hi-Z: nothing to measure
-  CHECK(TrainStore::validateMeas(cur, {3, 0, 1, 0}, warn, sizeof warn) == nullptr);
+  cur.nStages = 2;                                                     // per-stage selection in range
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  1, 0}, warn, sizeof warn) == nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  2, 0}, warn, sizeof warn) != nullptr);
+  cur.nStages = 0;
+  cur.mode0 = 2;                                                       // hi-Z: not driven
+  CHECK(TrainStore::validateMeas(cur, {3, 0, 0, -1, 0}, warn, sizeof warn) == nullptr);
   CHECK(strstr(warn, "nothing to measure") != nullptr);
+  cur.mode0 = 0;
   cur.type = SINE;
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, 0}, warn, sizeof warn) != nullptr);  // sine needs when=2
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0}, warn, sizeof warn) != nullptr);  // sine needs when 1-3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 2, -1, 0}, warn, sizeof warn) == nullptr);  // -peak only: fine
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 3,  0, 0}, warn, sizeof warn) != nullptr);  // sine has no stages
 
   // ------------------------------------------------- ENV/MEAS serializers
   TrainStore::serializeEnv(7, {1000, 2000, 0}, line, sizeof line);
   CHECK_STREQ(line, "ENV7,1000,2000,0");
-  TrainStore::serializeMeas(7, {3, 3, 2, 1}, line, sizeof line);
-  CHECK_STREQ(line, "MEAS7,3,3,2,1");
+  TrainStore::serializeMeas(7, {3, 3, 3, -1, 1}, line, sizeof line);
+  CHECK_STREQ(line, "MEAS7,3,3,3,-1,1");
 
   // ------------------------------------------------------- default helpers
   TrainStore::slotDefault(cur);
   CHECK(TrainStore::isDefaultTrain(cur) && TrainStore::isDefaultEnv(cur.env));
   CHECK(TrainStore::isDefaultMeas(cur));
-  cur.type = SINE;                        // auto-when: default MEAS on a W slot is when=2
-  cur.meas.when = 2;
+  cur.type = SINE;                        // auto-when: default MEAS on a W slot is when=3
+  cur.meas.when = 3;
   CHECK(TrainStore::isDefaultMeas(cur));
-  CHECK(TrainStore::defaultWhen(SINE) == 2 && TrainStore::defaultWhen(PIECEWISE_HOLD) == 1);
+  CHECK(TrainStore::defaultWhen(SINE) == 3 && TrainStore::defaultWhen(PIECEWISE_HOLD) == 0);
 
   if (failures == 0) printf("all checks passed\n");
   else               printf("%d check(s) FAILED\n", failures);

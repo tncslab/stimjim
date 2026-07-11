@@ -1,7 +1,9 @@
 //    stimjimAWG — command handlers. Phase 2: S/L/W with atomic staging, `?`
 //    queries + round-trip serializers, byte-exact M/V/A/E (BIST contract),
-//    B/C/D/P, ENV/MEAS, DUMP; plus the Phase-1 BENCH group. T/U arrive in
-//    Phase 3, TRIG/R setters in Phase 8, LOG in Phase 7. GPL-3.0-or-later.
+//    B/C/D/P, ENV/MEAS, DUMP; plus the Phase-1 BENCH group. Phase 3: T/U
+//    start/stop (legacy reply lines), completion-ring drain + result summary,
+//    READ manual measurement, live STAT. TRIG/R setters arrive in Phase 8,
+//    LOG in Phase 7. GPL-3.0-or-later.
 
 #include "Protocol.h"
 #include "Config.h"
@@ -98,32 +100,35 @@ static void ok()                                   { Serial.println("OK"); }
 static void err(const char* cmd, const char* msg)  { Serial.printf("ERR %s: %s\n", cmd, msg); }
 static void warn(const char* cmd, const char* msg) { Serial.printf("WARN %s: %s\n", cmd, msg); }
 
-// Last mode commanded per channel (`M` shadow state, protocol §3). Boot state
-// is grounded: Stimjim.begin() ends inside getCurrentOffsets with
-// setOutputMode(ch,3) == command mode 5.
-static uint8_t modeShadow[2] = {5, 5};
+// Last mode commanded per channel (`M` shadow state, protocol §3; original
+// numbering 0-3). Boot state is grounded: Stimjim.begin() ends inside
+// getCurrentOffsets with setOutputMode(ch,3). Trains switch the OE pins
+// autonomously and leave driven channels grounded — kept in sync at start/
+// stop/completion below.
+static uint8_t modeShadow[2] = {3, 3};
 
 // -------------------------------------------------- S / L / W (slots 0-99)
 
 static void dumpSlot(uint8_t idx) {
   const TrainDef& t = TrainStore::slotConst(idx);
-  static const char* modeStr[6] = {
+  static const char* modeStr[4] = {
     "Voltage output", "Current output",
-    "Voltage output (no measurement)", "Current output (no measurement)",
-    "No output (high-Z)", "No output (grounded)"
+    "Not driven (hi-Z)", "Not driven (grounded)"
   };
   static const char* typeStr[3] = {"piecewise-constant (S)", "piecewise-ramp (L)", "sine (W)"};
 
   Serial.println("----------------------------------");
   Serial.printf("Parameters for PulseTrain[%u] — %s\r\n", idx, typeStr[t.type]);
-  Serial.printf("  mode[ch0]: %u (%s)\r\n  mode[ch1]: %u (%s)\r\n",
-                t.mode0, modeStr[t.mode0], t.mode1, modeStr[t.mode1]);
+  const char* nm0 = (t.mode0 <= 1 && t.meas.what0 == 0) ? " (no measurement)" : "";
+  const char* nm1 = (t.mode1 <= 1 && t.meas.what1 == 0) ? " (no measurement)" : "";
+  Serial.printf("  mode[ch0]: %u (%s%s)\r\n  mode[ch1]: %u (%s%s)\r\n",
+                t.mode0, modeStr[t.mode0], nm0, t.mode1, modeStr[t.mode1], nm1);
   Serial.printf("  period:    %lu usec (%0.3f sec, %0.3f Hz)\r\n",
                 (unsigned long)t.period_us, 0.000001 * t.period_us, 1000000.0 / t.period_us);
   Serial.printf("  duration:  %lu usec (%0.3f sec)\r\n",
                 (unsigned long)t.duration_us, 0.000001 * t.duration_us);
-  const char* u0 = (t.mode0 == 0 || t.mode0 == 2) ? "mV" : "uA";
-  const char* u1 = (t.mode1 == 0 || t.mode1 == 2) ? "mV" : "uA";
+  const char* u0 = (t.mode0 == 1) ? "uA" : "mV";
+  const char* u1 = (t.mode1 == 1) ? "uA" : "mV";
   if (t.type == SINE) {
     char f0[16], f1[16], p0[16], p1[16];
     TrainStore::milliToStr(t.sine.freq0_mHz, f0);
@@ -145,8 +150,8 @@ static void dumpSlot(uint8_t idx) {
   }
   Serial.printf("  env:  rampIn %lu usec, rampOut %lu usec, shape %u\r\n",
                 (unsigned long)t.env.rampIn_us, (unsigned long)t.env.rampOut_us, t.env.shape);
-  Serial.printf("  meas: what0 %u, what1 %u, when %u, report %u\r\n",
-                t.meas.what0, t.meas.what1, t.meas.when, t.meas.report);
+  Serial.printf("  meas: what0 %u, what1 %u, when %u, stage %d, report %u\r\n",
+                t.meas.what0, t.meas.what1, t.meas.when, t.meas.stage, t.meas.report);
   Serial.println("----------------------------------");
   ok();
 }
@@ -249,12 +254,20 @@ static void handleMeas(const char* args) {
     Serial.println(line);
     return;
   }
-  if (*p != ',') { err("MEAS", "need MEAS<idx>,<what0>,<what1>,<when>[,<report>] or MEAS<idx>?"); return; }
+  if (*p != ',') { err("MEAS", "need MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>] or MEAS<idx>?"); return; }
 
-  long v[4];
-  int8_t n = parseFields(p + 1, v, 4);
-  if (n < 3) { err("MEAS", "need <what0>,<what1>,<when>[,<report>]"); return; }
-  if (v[0] < 0 || v[1] < 0 || v[2] < 0 || (n == 4 && v[3] < 0)) { err("MEAS", "fields must be non-negative"); return; }
+  long v[5];
+  int8_t n = parseFields(p + 1, v, 5);
+  if (n < 4) { err("MEAS", "need <what0>,<what1>,<when>,<stage>[,<report>]"); return; }
+  if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < -1 || (n == 5 && v[4] < 0)) {
+    err("MEAS", "fields must be non-negative (stage may be -1 = all)");
+    return;
+  }
+  // keep the narrow casts below honest (detailed validation in validateMeas)
+  if (v[0] > 3 || v[1] > 3 || v[2] > 3 || v[3] >= SJ_MAX_STAGES || (n == 5 && v[4] > 3)) {
+    err("MEAS", "field out of range");
+    return;
+  }
 
   if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
     err("MEAS", "slot is attached to a running train — stop first (T-1 / U-1)");
@@ -265,7 +278,8 @@ static void handleMeas(const char* args) {
   m.what0  = (uint8_t)v[0];
   m.what1  = (uint8_t)v[1];
   m.when   = (uint8_t)v[2];
-  m.report = (n == 4) ? (uint8_t)v[3] : 0;
+  m.stage  = (int8_t)v[3];
+  m.report = (n == 5) ? (uint8_t)v[4] : 0;
   char warnbuf[SJ_MSG_MAX];
   const char* msg = TrainStore::validateMeas(TrainStore::slotConst(idx), m, warnbuf, sizeof warnbuf);
   if (msg) { err("MEAS", msg); return; }
@@ -276,6 +290,102 @@ static void handleMeas(const char* args) {
   TrainStore::commit(idx, staged);
   TrainStore::serializeMeas(idx, m, line, sizeof line);
   Serial.println(line);
+}
+
+// ------------------------------------------------- T / U (start/stop, Phase 3)
+
+// Completed trains per boot — the legacy `Train #<n> complete.` counter.
+static uint32_t trainCount = 0;
+
+static void handleStart(char letter, const char* args) {
+  const char cmd[2] = {letter, '\0'};
+  uint8_t eng = (letter == 'U') ? 1 : 0;
+
+  long v;
+  if (parseFields(args, &v, 1) != 1) {   // strict: legacy atoi turned "Tfoo" into "T0"
+    err(cmd, "need a slot index (or -1 to stop)");
+    return;
+  }
+  if (v < 0) {
+    uint8_t mask = Engine::claimedMask(eng);
+    Engine::stopTrain(eng);
+    if (mask & 1) modeShadow[0] = 3;
+    if (mask & 2) modeShadow[1] = 3;
+    Serial.print("Forcing "); Serial.print(letter); Serial.println(" train to stop");
+    return;
+  }
+  if (v >= SJ_NUM_SLOTS) {
+    Serial.println("Invalid PulseTrain index.");   // legacy byte-exact
+    return;
+  }
+
+  char errbuf[SJ_MSG_MAX];
+  if (!Engine::startTrain(eng, (uint8_t)v, TrainStore::slotConst((uint8_t)v),
+                          errbuf, sizeof errbuf)) {
+    warn(cmd, errbuf);                   // ignore-and-warn policy (plan §2.5)
+    return;
+  }
+  uint8_t mask = Engine::claimedMask(eng);
+  if (mask & 1) modeShadow[0] = 3;       // trains leave driven channels grounded
+  if (mask & 2) modeShadow[1] = 3;
+  // legacy byte-exact start line (leading blank line included)
+  Serial.print("\r\nStarted "); Serial.print(letter);
+  Serial.print(" train with parameters of PulseTrain "); Serial.println((int)v);
+}
+
+// Drain the completion ring — called from loop() (.ino); all result printing
+// happens here, never in ISR context (plan §3.3).
+void poll() {
+  Engine::Completion c;
+  while (Engine::popCompletion(c)) {
+    trainCount++;
+    Serial.print("Train #"); Serial.print(trainCount);
+    Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
+    Serial.println(" pulses.");
+    // Phase 7 replaces this note with MSUM summary lines (protocol §4)
+    Serial.println("Note: no measurement carried out.");
+    if (c.chMask & 1) modeShadow[0] = 3;
+    if (c.chMask & 2) modeShadow[1] = 3;
+  }
+}
+
+// ------------------------------------------ READ (manual averaged measurement)
+
+static void handleRead(const char* args) {
+  long v[2];
+  int8_t n = parseFields(args, v, 2);
+  if (n < 1) { err("READ", "need READ<ch>[,<n>]"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("READ", "channel must be 0 or 1"); return; }
+  long navg = (n == 2) ? v[1] : 16;
+  if (navg < 1 || navg > 10000) { err("READ", "n must be 1-10000"); return; }
+  if (Engine::anyActive()) {
+    err("READ", "engine busy — READ would stall the players; use MEAS for in-train measurement");
+    return;
+  }
+
+  uint8_t ch = (uint8_t)v[0];
+  // Same calibrated path as `E` (legacy readAdc + offset + *_PER_ADC), n
+  // samples per line; single-pass sums -> mean and sample std dev.
+  double sum[2] = {0, 0}, sq[2] = {0, 0};
+  for (uint8_t line = 0; line < 2; line++) {
+    FastIO::busLock();
+    for (long i = 0; i < navg; i++) {
+      double u = (Stimjim.readAdc(ch, line) - Stimjim.adcOffset10[ch])
+               * (line ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+      sum[line] += u;
+      sq[line]  += u * u;
+    }
+    FastIO::acquireBus();               // legacy SPI transactions clobber the CTARs
+    FastIO::busUnlock();
+  }
+  double mean[2], sd[2];
+  for (uint8_t line = 0; line < 2; line++) {
+    mean[line] = sum[line] / navg;
+    double var = (navg > 1) ? (sq[line] - sum[line] * sum[line] / navg) / (navg - 1) : 0.0;
+    sd[line]   = (var > 0) ? sqrt(var) : 0.0;
+  }
+  Serial.printf("READ,%u,%ld,%.2f,%.2f,%.2f,%.2f\n",
+                ch, navg, mean[0], sd[0], mean[1], sd[1]);
 }
 
 // ------------------------------- M / V / A / E (byte-exact replies — BIST)
@@ -298,14 +408,12 @@ static void handleM(const char* args) {
   long v[2];
   if (parseFields(args, v, 2) != 2) { err("M", "need <ch>,<mode>"); return; }
   if (v[0] < 0 || v[0] > 1) { err("M", "channel must be 0 or 1"); return; }
-  if (v[1] < 0 || v[1] > 5) { err("M", "mode must be 0-5"); return; }
+  if (v[1] < 0 || v[1] > 3) { err("M", "mode must be 0-3 (90/91 exist in train definitions only)"); return; }
 
-  // Map command mode (0-5) onto the OE-decoder mode (0-3: voltage, current,
-  // hi-Z, ground). The legacy firmware passed the command mode through raw,
-  // so M2/M3 actually produced hi-Z/ground and M4/M5 connected the voltage/
-  // current source(!) — documented correction, see protocol §6.
-  uint8_t libMode = (v[1] < 4) ? (uint8_t)(v[1] & 1) : (uint8_t)(v[1] - 2);
-  Stimjim.setOutputMode((byte)v[0], libMode);   // two GPIO writes — ISR-safe, no bus lock needed
+  // Original numbering 0-3 maps 1:1 onto the OE decoder — same as the upstream
+  // open-ephys firmware. (The lab firmware's documented 2-5 renumbering never
+  // matched its own decoder; see protocol §6.8.)
+  Stimjim.setOutputMode((byte)v[0], (byte)v[1]);   // two GPIO writes — ISR-safe, no bus lock needed
   modeShadow[v[0]] = (uint8_t)v[1];
 
   Serial.print("Set channel "); Serial.print((int)v[0]);
@@ -378,7 +486,7 @@ static void handleB() {
   if (Engine::anyActive()) { err("B", "calibration needs an idle engine — stop trains first"); return; }
   Stimjim.getAdcOffsets();         // grounds the outputs, ~2000 ADC reads
   FastIO::acquireBus();
-  modeShadow[0] = modeShadow[1] = 5;
+  modeShadow[0] = modeShadow[1] = 3;
   ok();                            // legacy printed nothing — see protocol §6
 }
 
@@ -388,7 +496,7 @@ static void handleC() {
   Stimjim.getCurrentOffsets();
   Stimjim.getVoltageOffsets();
   FastIO::acquireBus();
-  modeShadow[0] = modeShadow[1] = 5;
+  modeShadow[0] = modeShadow[1] = 3;
   ok();
 }
 
@@ -570,9 +678,12 @@ static void benchSquare(const char* args, bool legacyPath) {
 
 // sub = command word after "BENCH", args = rest of line
 static void benchDispatch(const char* sub, const char* args) {
-  FastIO::acquireBus();   // benches assume our CTAR config regardless of history
-
   if (!*sub) { benchList(); return; }   // "BENCH" and "BENCH?" both list
+  if (Engine::anyActive()) {
+    err("BENCH", "benchmarks need an idle engine — stop trains first (T-1 / U-1)");
+    return;
+  }
+  FastIO::acquireBus();   // benches assume our CTAR config regardless of history
 
   long v[4];
   if (!strcmp(sub, "DAC")) {
@@ -645,13 +756,16 @@ static void benchDispatch(const char* sub, const char* args) {
 // --------------------------------------------------------------------- HELP
 
 static void help() {
-  Serial.println("# stimjimAWG commands (Phase 2) — details: docs/serial-protocol.md");
+  Serial.println("# stimjimAWG commands (Phase 3) — details: docs/serial-protocol.md");
   Serial.println("#   S<i>,m0,m1,per,dur;a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
   Serial.println("#   L<i>,...                        same syntax, linear ramps (0-dur stage = jump)");
   Serial.println("#   W<i>,m0,m1,per,dur;amp;freq;phase[;env]  sine train (triplets, decimals in Hz ok)");
+  Serial.println("#   modes: 0 V, 1 I, 2/3 channel not driven; 90/91 V/I without measurement");
   Serial.println("#   S<i> / L<i> / W<i>              human parameter dump; append ? for the canonical line");
+  Serial.println("#   T<i> / T-1, U<i> / U-1          start/stop engine 0 / 1 (S slots; L Phase 4, W Phase 5)");
   Serial.println("#   ENV<i>,in,out[,shape]           amplitude envelope; ENV<i>?");
-  Serial.println("#   MEAS<i>,w0,w1,when[,rep]        measurement config; MEAS<i>?");
+  Serial.println("#   MEAS<i>,w0,w1,when,stage[,rep]  measurement config; MEAS<i>?");
+  Serial.println("#   READ<ch>[,n]                    manual averaged V+I read (mean and std dev)");
   Serial.println("#   M<ch>,<mode>  V<ch>,<mV>  A<ch>,<dac>  E<ch>,<line>   immediate (legacy replies)");
   Serial.println("#   B / C                           recalibrate ADC / current+voltage offsets");
   Serial.println("#   D / D?                          print offsets (human / CSV)");
@@ -659,7 +773,7 @@ static void help() {
   Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
   Serial.println("#   TRIG<t>? / R<t>?                trigger routing queries (setters in Phase 8)");
   Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("# Not yet available: T/U start-stop (Phase 3), TRIG/R setters (Phase 8), LOG (Phase 7)");
+  Serial.println("# Not yet available: L/W playback (Phases 4-5), MEAS execution + LOG (Phase 7), TRIG/R setters (Phase 8)");
   ok();
 }
 
@@ -685,9 +799,7 @@ void handleLine(const char* line) {
       case 'D': handleD(args); return;
       case 'P': handleP(); return;
       case 'R': handleR(args); return;
-      case 'T': case 'U':
-        Serial.printf("ERR %c: train start/stop arrives in Phase 3\n", line[0]);
-        return;
+      case 'T': case 'U': handleStart(line[0], args); return;
       default:
         Serial.printf("ERR %c: unknown command\n", line[0]);
         return;
@@ -705,9 +817,16 @@ void handleLine(const char* line) {
   } else if (!strcmp(word, "HELP")) {
     help();
   } else if (!strcmp(word, "STAT")) {
-    // idle engines until Phase 3: slot -1, zeros (protocol §4)
-    Serial.printf("STAT,%d,0,0,0,%d,0,0,0\n",
-                  Engine::activeSlot(0), Engine::activeSlot(1));
+    Engine::EngineStatus s[2];
+    Engine::status(0, s[0]);
+    Engine::status(1, s[1]);
+    Serial.printf("STAT,%d,%lu,%lu,%lu,%d,%lu,%lu,%lu\n",
+                  s[0].slot, (unsigned long)s[0].nPulses,
+                  (unsigned long)s[0].elapsed_us, (unsigned long)s[0].duration_us,
+                  s[1].slot, (unsigned long)s[1].nPulses,
+                  (unsigned long)s[1].elapsed_us, (unsigned long)s[1].duration_us);
+  } else if (!strcmp(word, "READ")) {
+    handleRead(args);
   } else if (!strcmp(word, "ENV")) {
     handleEnv(args);
   } else if (!strcmp(word, "MEAS")) {

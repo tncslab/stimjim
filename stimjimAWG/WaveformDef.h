@@ -36,15 +36,22 @@ struct EnvDef {
   uint8_t  shape;
 };
 
-// `MEAS` — what: 0 none, 1 V, 2 I, 3 both; when: 0 first stage, 1 all stages,
-// 2 sine peak; report bitmask: +1 stream MDATA, +2 log to SD (summary always kept).
+// `MEAS` — what: 0 none, 1 V, 2 I, 3 both (mode 90/91 sugar in train lines maps
+// onto what=0); when: type-specific — S/L: 0 = near stage end; W: 1 = +peak,
+// 2 = -peak, 3 = both peaks (one period per burst); stage: -1 = all stages,
+// 0..nStages-1 = that stage only (S/L; W requires -1);
+// report bitmask: +1 stream MDATA, +2 log to SD (summary always kept).
 struct MeasDef {
-  uint8_t what0, what1, when, report;
+  uint8_t what0, what1, when;
+  int8_t  stage;
+  uint8_t report;
 };
 
 struct TrainDef {
   uint8_t  type;          // TrainType
-  uint8_t  mode0, mode1;  // command modes 0-5 (see `M`)
+  uint8_t  mode0, mode1;  // original numbering 0-3 (see `M`); 2/3 = channel not
+                          // driven. 90/91 are normalized to 0/1 + meas.what=0 at
+                          // parse time and re-rendered on serialization.
   uint32_t period_us;     // interval between pulse/burst starts
   uint32_t duration_us;   // total train length
   uint8_t  nStages;       // used by PIECEWISE_* only
@@ -64,16 +71,18 @@ struct TriggerRoute {
   uint8_t edge;
 };
 
-// EEPROM image v2 (written by `P`, Phase 2/8): versioned + checksummed so a
-// layout change can never mis-restore silently.
-struct EepromImageV2 {
-  uint32_t     magic;    // 'S''J''A''2' = 0x534A4132
-  uint16_t     version;  // 2
+// EEPROM image (written by `P`, Phase 2/8): versioned + checksummed so a
+// layout change can never mis-restore silently. v3: MeasDef gained the stage
+// field and modes returned to the original 0-3 numbering — v2 images are
+// rejected and boot defaults apply.
+struct EepromImage {
+  uint32_t     magic;    // 'S''J''A''W' = 0x534A4157
+  uint16_t     version;  // SJ_EEPROM_VERSION
   uint16_t     crc;      // CRC-16/CCITT over everything after this field
   TrainDef     slots[SJ_EEPROM_SLOTS];
   TriggerRoute trig[2];
 };
-#define SJ_EEPROM_MAGIC   0x534A4132u
-#define SJ_EEPROM_VERSION 2
+#define SJ_EEPROM_MAGIC   0x534A4157u
+#define SJ_EEPROM_VERSION 3
 
 #endif // STIMJIMAWG_WAVEFORMDEF_H

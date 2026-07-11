@@ -1,6 +1,6 @@
 //    stimjimAWG — TrainStore implementation: slot storage, S/L/W body parser
 //    with staging (atomic), ENV/MEAS validation, round-trip serializers,
-//    EEPROM v2. Host-testable except the #ifdef ARDUINO block at the end.
+//    versioned EEPROM. Host-testable except the #ifdef ARDUINO block at the end.
 //    GPL-3.0-or-later; see Config.h header.
 
 #include "TrainStore.h"
@@ -26,14 +26,15 @@ static const long WARN_LIMIT_UA    = 3000;
 void slotDefault(TrainDef& t) {
   memset(&t, 0, sizeof(t));   // also zeroes union padding => deterministic EEPROM images
   t.type        = PIECEWISE_HOLD;
-  t.mode0       = 5;          // grounded
-  t.mode1       = 5;
+  t.mode0       = 3;          // grounded = not driven (original numbering)
+  t.mode1       = 3;
   t.period_us   = 10000;
   t.duration_us = 500000;
   t.nStages     = 0;
   t.meas.what0  = 3;          // both V and I
   t.meas.what1  = 3;
-  t.meas.when   = 1;          // auto default for S/L (2 for SINE), see defaultWhen()
+  t.meas.when   = 0;          // auto default for S/L (3 = both peaks for SINE), see defaultWhen()
+  t.meas.stage  = -1;         // all stages
   t.meas.report = 0;          // end-of-train summary only
 }
 
@@ -46,10 +47,10 @@ const TrainDef& slotConst(uint8_t idx) { return slots[idx]; }
 
 void commit(uint8_t idx, const TrainDef& staged) { slots[idx] = staged; }
 
-uint8_t defaultWhen(uint8_t type) { return type == SINE ? 2 : 1; }
+uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 
 bool isDefaultTrain(const TrainDef& t) {
-  return t.type == PIECEWISE_HOLD && t.mode0 == 5 && t.mode1 == 5 &&
+  return t.type == PIECEWISE_HOLD && t.mode0 == 3 && t.mode1 == 3 &&
          t.period_us == 10000 && t.duration_us == 500000 && t.nStages == 0;
 }
 bool isDefaultEnv(const EnvDef& e) {
@@ -57,7 +58,8 @@ bool isDefaultEnv(const EnvDef& e) {
 }
 bool isDefaultMeas(const TrainDef& t) {
   return t.meas.what0 == 3 && t.meas.what1 == 3 &&
-         t.meas.when == defaultWhen(t.type) && t.meas.report == 0;
+         t.meas.when == defaultWhen(t.type) && t.meas.stage == -1 &&
+         t.meas.report == 0;
 }
 
 // -------------------------------------------------------------- scan helpers
@@ -148,14 +150,26 @@ static void addWarn(char* warn, size_t n, const char* msg) {
 // -------------------------------------------------------------- train parser
 
 // Warn about amplitudes the DAC cannot faithfully produce in the channel's
-// mode (per-channel modes; a0 belongs to mode0, a1 to mode1).
+// mode (per-channel modes, already normalized to 0-3; a0 belongs to mode0,
+// a1 to mode1). Undriven channels (2/3) carry no output — nothing to check.
 static void checkAmplitude(long a, uint8_t mode, char* warn, size_t warnsz) {
   long mag = a < 0 ? -a : a;
-  bool current = (mode == 1 || mode == 3);
-  if (current && mag > WARN_LIMIT_UA)
+  if (mode == 1 && mag > WARN_LIMIT_UA)
     addWarn(warn, warnsz, "amplitudes above 3000 uA convert incorrectly on the DAC");
-  if (!current && mode != 4 && mode != 5 && mag > DAC_FULLSCALE_MV)
+  if (mode == 0 && mag > DAC_FULLSCALE_MV)
     addWarn(warn, warnsz, "voltage amplitude exceeds DAC full scale (~14988 mV), will clip");
+}
+
+// Normalize one train-line mode field (protocol §2): 0-3 pass through, 90/91
+// mean "voltage/current, measurement disabled" and are stored as 0/1 with the
+// channel's meas.what forced to 0; a plain 0/1 promotes a stored what of 0
+// back to the default 3 (explicit 1/2 refinements are preserved).
+static bool normalizeMode(long m, uint8_t& mode, uint8_t& what) {
+  if (m == 90 || m == 91) { mode = (uint8_t)(m - 90); what = 0; return true; }
+  if (m < 0 || m > 3) return false;
+  mode = (uint8_t)m;
+  if (m <= 1 && what == 0) what = 3;
+  return true;
 }
 
 bool parseTrainBody(char letter, const char* body, const TrainDef& current,
@@ -178,12 +192,14 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
   unsigned long period, duration;
   if (!expect(p, ',') || !scanLong(p, m0)) { setMsg(err, errsz, "bad or missing mode0"); return false; }
   if (!expect(p, ',') || !scanLong(p, m1)) { setMsg(err, errsz, "bad or missing mode1"); return false; }
-  if (m0 < 0 || m0 > 5 || m1 < 0 || m1 > 5) { setMsg(err, errsz, "mode out of range 0-5"); return false; }
+  if (!normalizeMode(m0, staged.mode0, staged.meas.what0) ||
+      !normalizeMode(m1, staged.mode1, staged.meas.what1)) {
+    setMsg(err, errsz, "mode must be 0-3 or 90/91 (V/I without measurement)");
+    return false;
+  }
   if (!expect(p, ',') || !scanULong(p, period))   { setMsg(err, errsz, "bad or missing period_us"); return false; }
   if (!expect(p, ',') || !scanULong(p, duration)) { setMsg(err, errsz, "bad or missing duration_us"); return false; }
   if (period == 0) { setMsg(err, errsz, "period_us must be > 0"); return false; }
-  staged.mode0       = (uint8_t)m0;
-  staged.mode1       = (uint8_t)m1;
   staged.period_us   = (uint32_t)period;
   staged.duration_us = (uint32_t)duration;
 
@@ -285,12 +301,19 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
     return false;
   }
 
-  // MEAS `when` follows the waveform family on a type change (protocol §5
-  // auto-when); an explicit first-stage-only choice (0) stays valid for S/L.
-  if (staged.type == SINE && staged.meas.when != 2)
-    staged.meas.when = 2;
-  else if (staged.type != SINE && staged.meas.when == 2)
-    staged.meas.when = 1;
+  // MEAS `when`/`stage` follow the waveform family on a type change (protocol
+  // §4 auto-coercion); a same-family redefinition keeps explicit choices.
+  if (staged.type == SINE) {
+    if (staged.meas.when < 1 || staged.meas.when > 3) staged.meas.when = 3;
+    staged.meas.stage = -1;
+  } else {
+    staged.meas.when = 0;
+    // a preserved per-stage selection must fit the (possibly shorter) new train
+    if (staged.meas.stage >= (int8_t)staged.nStages) {
+      setMsg(err, errsz, "stored MEAS stage exceeds the new stage count (reset MEAS first)");
+      return false;
+    }
+  }
 
   return true;
 }
@@ -308,14 +331,19 @@ const char* validateEnv(const TrainDef& t, const EnvDef& e) {
 const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t warnsz) {
   if (warn && warnsz) warn[0] = '\0';
   if (m.what0 > 3 || m.what1 > 3) return "what must be 0-3";
-  if (m.when > 2)                 return "when must be 0-2";
   if (m.report > 3)               return "report must be 0-3 (+1 stream, +2 SD)";
-  if (t.type == SINE && m.when != 2) return "sine slots require when=2 (sine peak)";
-  if (t.type != SINE && m.when == 2) return "when=2 (sine peak) requires a W slot";
-  // Modes 2/3 suppress measurement at plan-compile time (documented); 4/5 make
-  // the request meaningless — accepted with WARN per protocol §4.
-  if ((t.mode0 >= 4 && m.what0 != 0) || (t.mode1 >= 4 && m.what1 != 0))
-    addWarn(warn, warnsz, "channel mode 4/5 delivers nothing to measure");
+  if (t.type == SINE) {
+    if (m.when < 1 || m.when > 3) return "sine slots require when 1 (+peak), 2 (-peak) or 3 (both)";
+    if (m.stage != -1)            return "sine slots have no stages — stage must be -1";
+  } else {
+    if (m.when != 0)              return "S/L slots require when=0 (near stage end)";
+    if (m.stage < -1 || m.stage >= (int8_t)t.nStages)
+      return "stage must be -1 (all) or a valid stage index";
+  }
+  // Channels the train does not drive (mode 2/3) are never measured — a
+  // non-zero what there is meaningless: accepted with WARN per protocol §4.
+  if ((t.mode0 >= 2 && m.what0 != 0) || (t.mode1 >= 2 && m.what1 != 0))
+    addWarn(warn, warnsz, "channel not driven (mode 2/3) — nothing to measure");
   if (m.report & 1)
     addWarn(warn, warnsz, "MDATA streaming is deferred (format frozen); summary/SD only in v1");
   return nullptr;
@@ -339,9 +367,16 @@ void milliToStr(long long milli, char* buf) {
   }
 }
 
+// Canonical mode rendering (protocol §2): a driven channel with measurement
+// disabled round-trips as 90/91 so the flag survives S<idx>?/DUMP replay.
+static unsigned modeOut(uint8_t mode, uint8_t what) {
+  return (mode <= 1 && what == 0) ? 90u + mode : mode;
+}
+
 void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n) {
   char letter = (t.type == SINE) ? 'W' : (t.type == PIECEWISE_RAMP) ? 'L' : 'S';
-  size_t o = snprintf(buf, n, "%c%u,%u,%u,%lu,%lu", letter, idx, t.mode0, t.mode1,
+  size_t o = snprintf(buf, n, "%c%u,%u,%u,%lu,%lu", letter, idx,
+                      modeOut(t.mode0, t.meas.what0), modeOut(t.mode1, t.meas.what1),
                       (unsigned long)t.period_us, (unsigned long)t.duration_us);
   if (t.type == SINE) {
     char f0[16], f1[16], p0[16], p1[16];
@@ -369,13 +404,13 @@ void serializeEnv(uint8_t idx, const EnvDef& e, char* buf, size_t n) {
 }
 
 void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n) {
-  snprintf(buf, n, "MEAS%u,%u,%u,%u,%u", idx, m.what0, m.what1, m.when, m.report);
+  snprintf(buf, n, "MEAS%u,%u,%u,%u,%d,%u", idx, m.what0, m.what1, m.when, m.stage, m.report);
 }
 
 // --------------------------------------------------------------------- EEPROM
 
 #ifdef ARDUINO
-static_assert(sizeof(EepromImageV2) <= 4096, "EepromImageV2 exceeds Teensy 3.5 EEPROM");
+static_assert(sizeof(EepromImage) <= 4096, "EepromImage exceeds Teensy 3.5 EEPROM");
 
 // CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over everything after the
 // header's crc field, i.e. slots + trig (WaveformDef.h contract).
@@ -391,8 +426,8 @@ static uint16_t crc16(const uint8_t* d, size_t n) {
 
 // One static image buffer (~1.6 KB) shared by save/restore — both run from
 // command/boot context only, never concurrently.
-static EepromImageV2 eeImg;
-static const size_t EE_CRC_SPAN = sizeof(EepromImageV2) - offsetof(EepromImageV2, slots);
+static EepromImage eeImg;
+static const size_t EE_CRC_SPAN = sizeof(EepromImage) - offsetof(EepromImage, slots);
 
 void eepromSave(const TriggerRoute trig[2]) {
   eeImg.magic   = SJ_EEPROM_MAGIC;
@@ -400,7 +435,7 @@ void eepromSave(const TriggerRoute trig[2]) {
   memcpy(eeImg.slots, slots, sizeof(eeImg.slots));
   eeImg.trig[0] = trig[0];
   eeImg.trig[1] = trig[1];
-  eeImg.crc = crc16((const uint8_t*)&eeImg + offsetof(EepromImageV2, slots), EE_CRC_SPAN);
+  eeImg.crc = crc16((const uint8_t*)&eeImg + offsetof(EepromImage, slots), EE_CRC_SPAN);
   EEPROM.put(0, eeImg);
 }
 
@@ -408,7 +443,7 @@ bool eepromRestore(TriggerRoute trigOut[2]) {
   EEPROM.get(0, eeImg);
   if (eeImg.magic != SJ_EEPROM_MAGIC || eeImg.version != SJ_EEPROM_VERSION)
     return false;
-  if (eeImg.crc != crc16((const uint8_t*)&eeImg + offsetof(EepromImageV2, slots), EE_CRC_SPAN))
+  if (eeImg.crc != crc16((const uint8_t*)&eeImg + offsetof(EepromImage, slots), EE_CRC_SPAN))
     return false;
   memcpy(slots, eeImg.slots, sizeof(eeImg.slots));
   trigOut[0] = eeImg.trig[0];

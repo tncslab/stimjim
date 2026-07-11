@@ -1,9 +1,11 @@
 # stimjimAWG serial protocol reference (draft)
 
 Status: protocol version 1. Waveform definition, queries, immediate commands and persistence
-(`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as of
-Phase 2; `T`/`U` execution arrives in Phase 3, `LOG` in Phase 7, `TRIG`/`R` setters in Phase 8
-(queries already answer) — see [awg-implementation-plan.md](awg-implementation-plan.md). The
+(`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as
+of Phase 2/3; `T`/`U` execution runs `S` slots as of Phase 3 (`L` playback arrives in Phase 4,
+`W` in Phase 5), the measurement engine (`MEAS` execution, `MSUM`/`MDATA` output) in Phase 7,
+`LOG` in Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
+[awg-implementation-plan.md](awg-implementation-plan.md). The
 legacy sections below double as documentation of the old `stimjimPulser` behavior; the
 "hardened" notes describe what stimjimAWG changes.
 
@@ -36,8 +38,24 @@ one `ReadLine()` per command and parses `E`'s `(<value><unit>)` group.
 ## 2. Waveform definition commands
 
 Common header for `S`/`L`/`W`:
-`<idx>` 0–99 (slot), `<mode0>,<mode1>` per physical channel (see `M`), `<period_us>` interval
+`<idx>` 0–99 (slot), `<mode0>,<mode1>` per physical channel (below), `<period_us>` interval
 between pulse/burst starts, `<duration_us>` total train length.
+
+**Mode field** — the original stimjim numbering (same as `M`): 0 voltage, 1 current,
+2 disconnected (hi-Z), 3 grounded. In a train definition 2 and 3 both mean *this channel is not
+driven by this train* (its output pins are left untouched, exactly like the original open-ephys
+firmware; the channel is never measured). Two additional values are accepted **in train
+definitions only**: `90` = voltage and `91` = current **with measurement disabled** on that
+channel. They are parse-time sugar: the slot stores mode 0/1 and the `MEAS` `what` for that
+channel is forced to 0; conversely a plain 0/1 re-enables measurement (a stored `what` of 1/2 —
+a deliberate `MEAS` refinement — is preserved, a stored 0 is promoted back to the default 3).
+Queries render 90/91 whenever the stored `what` is 0, so the flag round-trips through
+`S<idx>?`/`DUMP`. Any other mode value → `ERR`.
+
+> Lab-firmware migration note: the previous lab firmware re-documented 2/3 as
+> voltage/current-without-measurement and 4/5 as hi-Z/ground. That numbering is retired
+> (see §6.8): scripts using modes 2/3 for unmeasured stimulation must switch to 90/91 —
+> under this firmware 2/3 mean an *inactive* channel again.
 
 ### `S` — piecewise-constant (rectangular step) train — legacy semantics, bit-exact
 
@@ -54,7 +72,7 @@ holds for `dur_us`. After the last stage the DAC returns to offset (0) and outpu
 
 Hardened vs stimjimPulser: parse into staging buffer, validate, commit — a malformed line leaves
 the slot untouched (old firmware half-updates, see fixme at `stimjimPulser.ino:925`); modes
-outside 0–5 → `ERR` (old: silently forced to 5).
+outside {0–3, 90, 91} → `ERR` (old: silently coerced out-of-range values).
 
 ### `L` — piecewise-linear (ramp) train — NEW
 
@@ -94,10 +112,10 @@ convert incorrectly on the DAC → `WARN` on set.
 
 | Cmd | Syntax | Reply / notes |
 |---|---|---|
-| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy start/stop lines; busy channel → drop + `WARN` (decision: ignore-and-warn) |
-| `U` | `U<idx>` / `U-1` | same, engine 1 |
+| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy reply lines kept: `\r\nStarted T train with parameters of PulseTrain <idx>` / `Forcing T train to stop` / `Invalid PulseTrain index.`. Busy engine or channel conflict with the other engine → drop + `WARN` (decision: ignore-and-warn). Strict index parse: `Tfoo` → `ERR` (legacy `atoi` silently started train 0). Train completion prints `Train #<n> complete. Delivered <p> pulses.` from `loop()` (Phase 7 appends `MSUM` lines). |
+| `U` | `U<idx>` / `U-1` | same, engine 1 (players are per-engine; a train drives the channels its modes activate) |
 | `R` | `R<trig>,<idx>[,<output>]` | **legacy alias** writing the `TRIG` table: `output≠0` → marker mode (`TRIG<t>,3,-1,-1,0`); else joint start of `idx` on rising edge (`TRIG<t>,1,<idx>,-1,0`). `R<t>?` renders the legacy view. NOTE: the old README documented the 3rd arg as an edge selector — the code's actual meaning is the output-marker flag; edge selection lives in `TRIG`. |
-| `M` | `M<ch>,<mode>` | exactly 1 line: `Set channel <ch> to mode <mode>`. Modes: 0 voltage, 1 current, 2 voltage (no measurement), 3 current (no measurement), 4 hi-Z, 5 grounded. `M<ch>?` returns shadow state (new). |
+| `M` | `M<ch>,<mode>` | exactly 1 line: `Set channel <ch> to mode <mode>`. Modes: 0 voltage, 1 current, 2 disconnected (hi-Z), 3 grounded — original numbering, mapping 1:1 onto the OE decoder (§6.8). 90/91 are train-definition sugar and are rejected here. `M<ch>?` returns shadow state (new); running trains switch the OE pins autonomously (driven channels end grounded, shadow tracks that). |
 | `V` | `V<ch>,<mV>` immediate voltage | exactly 1 line: `Set channel <ch> to amplitude <mV> mV (dac value <dac>).` or `<dac> is out of range.` During a running train: executed under bus lock + `WARN`. |
 | `A` | `A<ch>,<dac>` immediate raw DAC (−32768…32767) | exactly 1 line: `Set channel <ch> to amplitude <dac>` |
 | `E` | `E<ch>,<line>` read ADC; line 0 = output voltage, 1 = current sense | exactly 1 line: `Read value: <raw> (<value>mV)` / `(<value>uA)` — format frozen for BIST |
@@ -121,25 +139,63 @@ waveform types. Validation: `rampIn + rampOut ≤ duration` else `ERR`. Default 
 ### `MEAS` — per-train measurement configuration
 
 ```
-MEAS<idx>,<what0>,<what1>,<when>[,<report>]
-MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<report>
+MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>]
+MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>
 ```
 
-- `what<ch>`: 0 none, 1 voltage, 2 current, 3 both. Channel modes 2/3 force none (documented);
-  modes 4/5 → `WARN` (meaningless).
-- `when`: 0 first stage only, 1 all stages (pulse/ramp trains), 2 sine peak (first 90° crossing
-  after envelope ramp-in). Type mismatch → `ERR`.
+- `what<ch>`: 0 none, 1 voltage, 2 current, 3 both. Coupled to the train-definition mode field
+  (§2): mode 90/91 forces 0; a plain 0/1 promotes a stored 0 back to 3 (an explicit 1/2 is
+  preserved). Channels the train does not drive (mode 2/3) are never measured; setting a
+  non-zero `what` on one is accepted with `WARN` (meaningless until the mode changes).
+- `when` — the measurement instant inside the selected stage/period; codes are type-specific
+  and a mismatch → `ERR` (changing a slot's type auto-coerces `when` and `stage` to the new
+  type's defaults):
+  - `S`/`L` slots: **0** = near stage end — transient settled, ADC programming time budgeted
+    (plan §3.6). The only v1 code; a reserved `<offset_us>` extension field is documented for
+    future manual placement.
+  - `W` slots: **1** = positive peak, **2** = negative peak, **3** = both peaks. One period per
+    burst is measured (the first full period after envelope ramp-in completes): at generation
+    rates the V+I ADC budget (~9–11 µs) rules out per-sample measurement, and mid-ramp peaks
+    would under-read.
+- `stage`: −1 = every stage (default), 0…nStages−1 = only that stage (`S`/`L`; subsumes the
+  earlier first-stage-only mode). `W` slots require −1. An `S`/`L` redefinition that shrinks
+  the stage count below a stored selection → `ERR` (reset `MEAS` first) — same policy as a
+  preserved `ENV` that no longer fits.
 - `report` bitmask: 0 end-of-train summary (always kept), +1 stream `MDATA` lines, +2 log to SD.
   v1 implements summary + SD; streaming format is fixed now, implementation deferred.
-- Defaults (reproduce legacy behavior): `what0=what1=3`, `when=1` for `S`/`L` slots, `2` for `W`
-  slots, `report=0`.
-- Sampling instant: near stage end, transient settled, ADC programming time budgeted (see plan
-  §3.6). A reserved 5th field `<offset_us>` is documented for future manual placement.
+- Repetitions (one measurement point per pulse/burst) accumulate `n`, Σv and Σv² per point,
+  line and channel; the summary reports the mean **and the sample standard deviation** derived
+  from those sums. This is the single-pass estimator — numerically simplified by design
+  (documented trade-off; adequate for 13-bit ADC data at the repetition counts a train can
+  reach), chosen so a waveform averaged over many repetitions also yields a spread estimate.
+- Defaults: `what0=what1=3`, `when=0` for `S`/`L` slots / `3` for `W` slots, `stage=-1`,
+  `report=0` — measure everything, summary only (reproduces legacy averaging behavior).
 - Stages too short to fit their measurement get it skipped and flagged in the summary.
 
-**MDATA record** (stream and SD CSV, format frozen in v1):
-`MDATA,<slot>,<pulse>,<stage>,<V0_mV>,<I0_uA>,<V1_mV>,<I1_uA>` — empty field where not measured.
+**MDATA record** (per-repetition stream and SD CSV, format frozen in v1):
+`MDATA,<slot>,<pulse>,<point>,<V0_mV>,<I0_uA>,<V1_mV>,<I1_uA>` — empty field where not measured.
 SD rows are prefixed with `<timestamp_us>` (µs since boot) instead of the `MDATA` word.
+
+**MSUM record** (end-of-train summary, format frozen in v1, emitted from `loop()` after the
+legacy `Train #<n> complete…` line):
+`MSUM,<slot>,<n>,<point>,<V0_mV>,<V0_sd>,<I0_uA>,<I0_sd>,<V1_mV>,<V1_sd>,<I1_uA>,<I1_sd>`
+— one line per measured point; means and sd in mV/µA. `<point>` is the stage index for `S`/`L`
+and the peak phase in degrees (`90` / `270`) for `W`. `<n>` = repetitions accumulated; sd is
+empty when `n < 2`; fields are empty where not measured.
+
+### `READ` — manual averaged measurement (immediate)
+
+```
+READ<ch>[,<n>]        n = samples per line, default 16, max 10000
+→  READ,<ch>,<n>,<V_mV>,<V_sd>,<I_uA>,<I_sd>
+```
+
+Reads the channel's output-voltage and current-sense lines `n` times each through the same
+calibrated path as `E` (offset-corrected, `*_PER_ADC` conversion) and reports mean and sample
+standard deviation in mV/µA with two decimals (sub-LSB resolution is meaningful once averaged).
+Complements `E`, which stays the single raw read with the BIST-frozen reply. Refused with `ERR`
+while any train runs — a long averaging burst under the bus lock would stall the players;
+in-train measurement is `MEAS`'s job.
 
 ### `TRIG` — trigger routing (per input 0/1)
 
@@ -189,9 +245,10 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 
 | Item | Default |
 |---|---|
-| Slot (boot, all 100) | mode0=mode1=5 (grounded), period=10000 µs, duration=500000 µs, 0 stages, type=S |
+| Slot (boot, all 100) | mode0=mode1=3 (grounded = not driven), period=10000 µs, duration=500000 µs, 0 stages, type=S |
 | `ENV` | 0,0,0 (no ramp) |
-| `MEAS` | 3,3,auto-when (1 for S/L, 2 for W),0 (summary only) |
+| `MEAS` | 3,3,auto-when (0 for S/L, 3 for W),-1 (all stages),0 (summary only) |
+| `READ` sample count | 16 |
 | Triggers | both `TRIG<t>,3,-1,-1,0` (output marker) |
 | `R` third argument | 0 (trigger-input mode) |
 | Ramp sample interval | 20 µs (`TARGET_DT_US`) |
@@ -205,21 +262,32 @@ Preserved byte-exact (BIST contract): the `M`/`V`/`A`/`E` single-line replies qu
 
 Deliberate behavior changes (documented compat risk, all fail-loudly):
 
-1. Omitted required fields in `M`/`V`/`A`/`E`/`R` → one-line `ERR` instead of silently assuming 0.
+1. Omitted required fields in `M`/`V`/`A`/`E`/`R` → one-line `ERR` instead of silently assuming 0,
+   and `T`/`U` parse their index strictly (legacy `atoi` turned `Tfoo` into "start train 0").
    (BIST always sends full fields — unaffected.)
 2. Malformed `S`/`W` lines no longer half-update a slot (atomic staging).
-3. Out-of-range modes → `ERR` instead of silent coercion to 5.
+3. Train modes return to the **original open-ephys numbering 0–3** (0 V, 1 I, 2 hi-Z,
+   3 ground; 2/3 in a train = channel not driven), extended by 90/91 = V/I without
+   measurement (§2). The lab firmware's renumbering (2/3 = unmeasured V/I, 4/5 = hi-Z/ground)
+   is retired: **lab scripts that used modes 2/3 for unmeasured stimulation must switch to
+   90/91** — replayed unchanged they now define an inactive channel (fails safe: no output
+   rather than unexpected output). Out-of-range modes → `ERR` instead of silent coercion.
 4. `W` phase is now applied; old firmware ignored it (and printed it via a `>0` boolean bug at
    `stimjimPulser.ino:806`).
 5. `C` prints a `WARN` line about the output ramp before calibrating.
 6. Editing a slot attached to a running engine is refused (`ERR … stop first (T-1)`).
 7. Buttons no longer directly start trigger-mapped trains — they navigate the menu (Btn0 = OK,
    Btn1/Btn2 = prev/next; see plan §5).
-8. `M` now maps command modes onto the OE decoder as documented. The legacy handler passed the
-   command mode (0–5) *raw* into the 2-bit decoder (`Stimjim::setOutputMode`, modes 0–3), so
-   **legacy `M2`/`M3` actually produced hi-Z/ground, and `M4`/`M5` connected the voltage/current
-   source** — the opposite of their documentation. BIST is unaffected (it only uses modes 0/1,
-   which map identically).
+8. `M` accepts modes 0–3 with the original semantics, mapping 1:1 onto the 2-bit OE decoder
+   (`Stimjim::setOutputMode`) — **identical to the upstream open-ephys firmware, which was
+   never confused about this**. The confusion was introduced by the lab modification
+   ("Added measure/stim modes"): it renumbered only the *documentation and mode strings*
+   (2/3 → unmeasured V/I, 4/5 → hi-Z/ground) while the `M` handler kept passing the mode raw
+   into the decoder, so under the lab's documented numbering `M2`/`M3` really produced
+   hi-Z/ground and `M4`/`M5` **connected the voltage/current source**. (The lab's pulse-train
+   paths were correct — they masked with `mode & 1` under a `mode < 4` guard; only direct `M`
+   diverged.) Reverting to the original numbering makes documentation and decoder agree again.
+   BIST is unaffected (it only uses modes 0/1, identical in every numbering).
 9. Negative `W` frequencies → `ERR`. The legacy firmware accepted them (producing a time-reversed
    sine through table-index wraparound); scripts relying on that should use the equivalent
    positive-frequency + phase form.

@@ -1,6 +1,6 @@
 //    stimjimAWG — TrainStore: 100 waveform slots with staging/validate/commit
 //    (atomic — a malformed line never half-updates a slot), round-trip
-//    serializers, defaults per protocol §5, EEPROM v2 persistence.
+//    serializers, defaults per protocol §5, versioned EEPROM persistence.
 //
 //    Everything except the EEPROM block is host-testable (no Arduino deps) —
 //    see tests/host/. Parsing/validation lives here so the protocol grammar
@@ -22,8 +22,8 @@ namespace TrainStore {
 
 void begin();   // initialize all slots to defaults (EEPROM restore is separate)
 
-// Boot default (protocol §5): grounded modes, period 10 ms, duration 500 ms,
-// 0 stages, type S; ENV 0,0,0; MEAS 3,3,auto-when,0.
+// Boot default (protocol §5): grounded (not-driven) modes, period 10 ms,
+// duration 500 ms, 0 stages, type S; ENV 0,0,0; MEAS 3,3,auto-when,-1,0.
 void slotDefault(TrainDef& t);
 
 TrainDef&       slot(uint8_t idx);         // idx asserted < SJ_NUM_SLOTS by caller
@@ -66,7 +66,7 @@ bool isDefaultMeas(const TrainDef& t);        // auto-when aware
 
 // ------------------------------------------------------------------- EEPROM
 #ifdef ARDUINO
-// `P`: persist slots 0-9 + the trigger table as EepromImageV2 (versioned,
+// `P`: persist slots 0-9 + the trigger table as EepromImage (versioned,
 // CRC-16/CCITT). eepromRestore returns false (and touches nothing) unless
 // magic, version and CRC all match.
 void eepromSave(const TriggerRoute trig[2]);
