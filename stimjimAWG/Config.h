@@ -23,7 +23,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.3.0"        // Phase 3: scheduler + HOLD trains + READ
+#define SJ_FW_VERSION    "0.4.0"        // Phase 4: RAMP playback + envelope
 #define SJ_PROTO_VERSION 1
 #define SJ_HW_NAME       "Teensy3.5"
 

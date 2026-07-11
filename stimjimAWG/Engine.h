@@ -5,7 +5,9 @@
 //    their vectors at SJ_PLAYER_PRIO, self-calibrate K_RELOAD, BENCH services.
 //    Phase 3: ChannelPlayer — copy-on-arm start/stop, absolute-deadline HOLD
 //    (`S`) playback with program-early/latch-on-deadline, seqlock status,
-//    completion ring. RAMP/SINE synthesis arrive in Phases 4/5.
+//    completion ring.
+//    Phase 4: RAMP (`L`) playback (SampleGen Bresenham samples, 0-duration
+//    jump chains) and the ENV envelope on S/L. SINE arrives in Phase 5.
 
 #ifndef STIMJIMAWG_ENGINE_H
 #define STIMJIMAWG_ENGINE_H
@@ -31,10 +33,10 @@ uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU 
 //
 // Start `def` (copied — copy-on-arm, live serial editing stays safe) on engine
 // 0 (`T`) or 1 (`U`). The first latch happens at now + SJ_START_LATENCY_US in
-// PIT-ISR context (never in the caller's). Only PIECEWISE_HOLD plays in
-// Phase 3. Returns false with a short reason in err (busy engine, channel
-// conflict with the other engine, unsupported type) — caller prints the
-// WARN/ERR (ignore-and-warn policy, plan §2.5).
+// PIT-ISR context (never in the caller's). S and L slots play as of Phase 4
+// (SINE arrives in Phase 5). Returns false with a short reason in err (busy
+// engine, channel conflict with the other engine, unsupported type) — caller
+// prints the WARN/ERR (ignore-and-warn policy, plan §2.5).
 bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
                 char* err, size_t errsz);
 

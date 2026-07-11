@@ -140,21 +140,62 @@ issued during a train).
 
 ### 3.5 Sample synthesis
 
-- **RAMP stages (`L`)**: at stage entry `N = max(1, round(dur / TARGET_DT_US))` (default 20 µs,
-  per-train overridable); Bresenham-style incremental division on both the time axis
-  (`t0s + (k·D_cyc)/N`) and the DAC-code axis, so sample `k = N` lands exactly on the stage
-  boundary and end value. HOLD stages (`S`) emit one sample; 0-duration stages chain inline.
-- **Sine (`W`)**: Q32 phase accumulator per channel, `phaseInc = f_mHz·2³²/(1000·Fs)`; start phase
-  is applied as `phaseAcc0 = phase·2³²/360°` (fixes the ignored-phase bug). The 8192-entry float
-  table (32 KB RAM) is replaced by a **1025-entry int16 Q15 quarter-wave-free full table + linear
-  interpolation** (2 KB; worst-case error ≈2.4·10⁻⁶ FS ≪ 1 DAC LSB). All unit conversions
-  (`MILLIVOLTS_PER_DAC` etc.) are folded into arm-time fixed-point coefficients — the ISR does
-  integer math only (resolves the old float-speed TODO). Per-train sample rate
-  `Fs = clamp(64·f_max, 1 kHz, FsMax)`; train end is enforced by deadline comparison, not sample
-  count.
+Decided numerics (Phase 4; the pure math lives in `SampleGen`, host-tested by
+`tests/host/test_samplegen.cpp`):
+
+**Timebase and integer/float policy.** All event *times* are 64-bit CPU-cycle counts on the
+`cycles64()` timebase (§3.1): 8.33 ns resolution, exact µs↔cycle conversion (×120), wraps after
+~4 900 years — no overflow in any realistic run (the 32-bit hardware counter wraps every 35.8 s;
+the software extension is kept alive by `loop()` and the ≤10 s `MAX_SLICE` chunking). Floats are
+unusable here: FP32's 24-bit mantissa loses cycle exactness beyond 2²⁴ cycles (0.14 s), and FP64
+is software-emulated on the M4F (hundreds of cycles, banned from ISRs). *Amplitudes* are integer
+Q15 multiplies of DAC-code **deltas relative to the channel's calibration offset** (so scaling
+never moves the parked baseline). The single place a division appears — the envelope's
+`t/rampLength` — is replaced by an arm-time FP32 reciprocal, leaving one hardware-FPU multiply
+per event (~20 cycles incl. lazy stacking; FP32 error ~2⁻²⁴ ≪ the 1/32768 Q15 quantum). Arm-time
+coefficient computation (loop context, not time-critical) may use `double`.
+
+**Drift-free repeats** means errors never *accumulate*: pulse k latches at the absolute deadline
+`t0 + k·periodCyc` (exact integers), so each event is off by only its own ISR latency (and the
+spin-latch bounds that to <200 ns), never by the sum of its predecessors' — unlike the legacy
+`delayMicroseconds` chain, which accumulated per-stage calibration error over the whole train.
+The same holds inside a ramp stage (exact Bresenham, below) and across bursts (per-burst phase
+restart, below).
+
+- **RAMP stages (`L`)**: at arm time `N = max(1, round(dur / TARGET_DT_US))` (default 20 µs);
+  sample `k = 1..N` lands at `stageStart + ⌊k·D_cyc/N⌋` with value
+  `start + ⌊(k·Δcode + N/2)/N⌋` — both realized as Bresenham-style incremental divisions
+  (quotient step + remainder accumulator with carry, all constants precomputed per stage at arm
+  time), so the ISR does ~3 adds per axis and sample `k = N` lands *exactly* on the stage
+  boundary and end value; direct evaluation of `k·D_cyc` would overflow uint64 for long stages.
+  Stage `i` ramps from stage `i−1`'s exact end (the offset at pulse start); a 0-duration stage
+  degenerates to one sample at its start time — the instant jump — and chains inline through the
+  `MIN_SCHEDULE` path. Each pulse begins with an offset latch at `pulseStart` (anchors OE
+  connect) and ends with the off event at the last stage boundary: the final ramp value is
+  latched exactly there and immediately parked (hold it by appending a same-value stage).
+- **Sine (`W`)**: Q32 integer phase accumulator per channel — 2³² = one turn, so the natural
+  wrap *is* the 360° wrap: exact modular arithmetic, no drift. The only rounding is the one-time
+  quantization of `phaseInc` (≤0.5/2³² turn/sample — a deterministic relative frequency offset
+  <10⁻⁷, not an accumulating error). Start phase `phaseAcc0 = mdeg·2³²/360000` (exact integer)
+  fixes the ignored-phase bug; **phase restarts at each burst** so every burst is identical
+  (legacy-consistent, and required by the peaks-per-burst measurement plan §3.6).
+  Synthesis is **on the fly**: a shared 1025-entry int16 Q15 full-wave table (2 KB, filled once
+  at boot) + linear interpolation (max error ≈1 LSB), then two Q15 multiplies (amplitude,
+  envelope) — ~25 cycles/sample, negligible against the ~2.75 µs SPI programming cost, and
+  *constant*, so it adds no jitter. Precomputing amplitude-baked per-train tables was rejected:
+  it saves only the 1-cycle amplitude multiply, costs RAM and arm-time latency, cannot absorb
+  the time-varying envelope anyway, and would force integer samples-per-period. Per-train sample
+  rate `Fs = clamp(64·f_max, 1 kHz, FsMax)` realized as an exact integer cycle count per sample
+  (`phaseInc` is computed from the actual sample period, so frequency exactness never depends on
+  Fs rounding); `f_max > Fs/2` is refused at start (unrepresentable). Train end is enforced by
+  deadline comparison, not sample count.
 - **Envelope (`ENV`)**: scalar env(t) ramps 0→1 over `rampIn_us` from train start and 1→0 ending
-  exactly at `duration_us`; evaluated per event as a Q15 multiply; applies to all waveform types
-  (linear shape in v1; `shape` field reserved for raised-cosine).
+  exactly at `duration_us`; evaluated per latch event against the event's absolute deadline and
+  applied as a Q15 multiply on the code delta. Applies to all waveform types: L/W follow it per
+  sample; S trains sample it at each stage latch (stair-step — use L for smooth ramps). Events
+  overrunning `duration_us` (legacy stages run to completion) clamp to 0 when a ramp-out exists;
+  with `rampOut = 0` the envelope is flat through the end. Linear shape in v1; `shape` reserved
+  for raised-cosine.
 
 ### 3.6 Measurement
 

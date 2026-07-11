@@ -1,9 +1,11 @@
 //    stimjimAWG — Engine implementation: Phase 1 scheduling core + BENCH,
-//    Phase 3 ChannelPlayer (HOLD trains). GPL-3.0-or-later.
+//    Phase 3 ChannelPlayer (HOLD trains), Phase 4 RAMP playback + envelope.
+//    GPL-3.0-or-later.
 
 #include "Engine.h"
 #include "Config.h"
 #include "FastIO.h"
+#include "SampleGen.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -45,32 +47,49 @@ static inline void pitStop(uint8_t p) {
 
 // ------------------------------------------------------------------ players
 //
-// Copy-on-arm state (plan §3.3). Stage amplitudes are pre-converted to DAC
-// codes and stage boundaries to cumulative cycle offsets, so the ISR does no
-// unit math. Event e in [0..nStages] latches code[e] at pulseStart + cum[e];
-// event nStages is the "off" event returning the DAC to its offset. A train
-// whose modes drive no channel (or with 0 stages) degenerates to per-period
-// bookkeeping (nStages = 0, chMask = 0) — the legacy "empty train".
+// Copy-on-arm state (plan §3.3/§3.5). Stage amplitudes are pre-converted to
+// DAC-code *deltas relative to the channel offset* (so the envelope scales
+// them without moving the baseline) and stage boundaries to cumulative cycle
+// offsets — the ISR does no unit math. A train whose modes drive no channel
+// (or an S/L train with 0 stages) degenerates to per-period bookkeeping
+// (type HOLD, nStages = 0, chMask = 0) — the legacy "empty train".
+//
+// Per-pulse event sequences (all deadlines absolute, cycles):
+//   HOLD  event e in [0..nStages] latches offset+d[e] at pulseStart + cum[e];
+//         e = nStages is the "off" event parking the DAC on the offset.
+//   RAMP  EV_INIT latches the offset at pulseStart (OE connect anchor), then
+//         each stage emits its Bresenham samples (SampleGen::RampCursor, the
+//         last one exactly on the stage boundary/end value), then EV_OFF
+//         parks + grounds at pulseStart + cum[nStages]. A 0-duration stage is
+//         one sample at its start time — the instant jump.
 struct Player {
   // arm-time constants (ISR-private while active)
   uint8_t  slot;
   uint8_t  chMask;                     // bit0/bit1 = channel driven
   uint8_t  outMode0, outMode1;         // OE code while a pulse is on (0 = V, 1 = I)
+  uint8_t  type;                       // TrainType (HOLD also covers empty trains)
   uint8_t  nStages;
-  int16_t  code0[SJ_MAX_STAGES + 1];   // [nStages] = offset (off) code
-  int16_t  code1[SJ_MAX_STAGES + 1];
-  uint64_t cum[SJ_MAX_STAGES + 1];     // latch-event offsets from pulse start, cycles
+  int16_t  off0, off1;                 // park codes (mode's calibration offset)
+  int32_t  d0[SJ_MAX_STAGES];          // HOLD levels / RAMP stage-end values,
+  int32_t  d1[SJ_MAX_STAGES];          //   DAC-code deltas rel. offset
+  uint64_t cum[SJ_MAX_STAGES + 1];     // stage boundaries from pulse start, cycles
+  SampleGen::RampStage rst[SJ_MAX_STAGES];
+  SampleGen::EnvCoef   env;
   uint64_t periodCyc, durationCyc;
   uint32_t preloadCyc;                 // DAC programming budget + CYCCNT spin margin
   uint64_t t0;
   // live state
   uint64_t pulseStart;                 // current pulse's absolute start
   volatile uint32_t nPulses;
-  uint8_t  evIdx;
+  uint8_t  evIdx;                      // HOLD: event index; RAMP: current stage
+  uint8_t  evPhase;                    // RAMP: EV_INIT / EV_SAMP / EV_OFF
+  SampleGen::RampCursor rc;
   volatile bool active;
   volatile uint32_t seq;               // seqlock: odd while the ISR updates
 };
 static Player player[2];
+
+enum : uint8_t { EV_INIT = 0, EV_SAMP = 1, EV_OFF = 2 };
 
 // Completion ring — SPSC: player ISRs produce, Commands::poll() consumes.
 static Completion   compRing[8];
@@ -98,10 +117,40 @@ static inline void groundClaimed(uint8_t chMask) {
   if (chMask & 2) { Stimjim.setOutputMode(1, 3); digitalWriteFast(LED1, LOW); }
 }
 
+// Program during the preload window, spin, latch exactly on the deadline.
+static inline void progLatch(const Player& pl, uint64_t dl, int16_t c0, int16_t c1) {
+  if (pl.chMask == 0b11)  FastIO::dacProgramBoth(c0, c1);
+  else if (pl.chMask & 1) FastIO::dacProgram(0, c0);
+  else                    FastIO::dacProgram(1, c1);
+  while ((int64_t)(FastIO::cycles64() - dl) < 0) ;
+  FastIO::dacLatch(pl.chMask);
+}
+
+// OE toggles per pulse like the legacy firmware: connect right after the
+// pulse's first latch, back to ground right after the off latch.
+static inline void oeConnect(const Player& pl) {
+  if (pl.chMask & 1) Stimjim.setOutputMode(0, pl.outMode0);
+  if (pl.chMask & 2) Stimjim.setOutputMode(1, pl.outMode1);
+}
+static inline void oeGround(const Player& pl) {
+  if (pl.chMask & 1) Stimjim.setOutputMode(0, 3);
+  if (pl.chMask & 2) Stimjim.setOutputMode(1, 3);
+}
+
+// offset + envelope-scaled delta, saturated to the DAC range. envq = 32768
+// (identity) reproduces the Phase 3 codes bit-exactly (scaleQ15 is exact
+// there and the saturation already happened in ampToCode).
+static inline int16_t mkCode(int16_t off, int32_t delta, int32_t envq) {
+  int32_t v = off + ((envq == 32768) ? delta : SampleGen::scaleQ15(delta, envq));
+  if (v >  32767) v =  32767;
+  if (v < -32768) v = -32768;
+  return (int16_t)v;
+}
+
 // The player event loop, entered from the PIT ISR. Future events are scheduled
 // preload-early (program-early/latch-on-deadline); events within
 // preload + MIN_SCHEDULE of now are processed inline in the same pass so
-// 0-duration stage chains and overlong pulses never re-enter through the NVIC.
+// 0-duration jump chains and overlong pulses never re-enter through the NVIC.
 static void playerRun(uint8_t p) {
   Player& pl = player[p];
   pitStop(p);
@@ -117,7 +166,16 @@ static void playerRun(uint8_t p) {
       return;
     }
 
-    uint64_t dl  = pl.pulseStart + pl.cum[pl.evIdx];
+    // ---- deadline of the next latch event (per type)
+    uint64_t dl;
+    if (pl.type == PIECEWISE_RAMP) {
+      dl = (pl.evPhase == EV_INIT) ? pl.pulseStart
+         : (pl.evPhase == EV_OFF)  ? pl.pulseStart + pl.cum[pl.nStages]
+                                   : pl.rc.t;
+    } else {                           // HOLD (also empty-train bookkeeping)
+      dl = pl.pulseStart + pl.cum[pl.evIdx];
+    }
+
     uint64_t now = FastIO::cycles64();
     if ((int64_t)(dl - now) > (int64_t)(pl.preloadCyc + SJ_US_TO_CYC(SJ_MIN_SCHEDULE_US))) {
       // genuinely future: wake preload-early; chunk long gaps (keeps the
@@ -129,30 +187,51 @@ static void playerRun(uint8_t p) {
       return;
     }
 
-    if (pl.chMask) {
-      // program during the preload window, spin, latch exactly on the deadline
-      if (pl.chMask == 0b11)  FastIO::dacProgramBoth(pl.code0[pl.evIdx], pl.code1[pl.evIdx]);
-      else if (pl.chMask & 1) FastIO::dacProgram(0, pl.code0[pl.evIdx]);
-      else                    FastIO::dacProgram(1, pl.code1[pl.evIdx]);
-      while ((int64_t)(FastIO::cycles64() - dl) < 0) ;
-      FastIO::dacLatch(pl.chMask);
-      // OE toggles per pulse like the legacy firmware: connect right after the
-      // stage-0 latch, back to ground right after the off latch.
-      if (pl.evIdx == 0) {
-        if (pl.chMask & 1) Stimjim.setOutputMode(0, pl.outMode0);
-        if (pl.chMask & 2) Stimjim.setOutputMode(1, pl.outMode1);
-      } else if (pl.evIdx == pl.nStages) {
-        if (pl.chMask & 1) Stimjim.setOutputMode(0, 3);
-        if (pl.chMask & 2) Stimjim.setOutputMode(1, 3);
+    // ---- emit the event, advance per-type state
+    if (pl.type == PIECEWISE_RAMP) {   // chMask != 0 guaranteed (see startTrain)
+      if (pl.evPhase == EV_INIT) {
+        // pulse starts from the parked offsets; this latch anchors OE connect
+        progLatch(pl, dl, pl.off0, pl.off1);
+        oeConnect(pl);
+        pl.evIdx = 0;
+        SampleGen::rampEnter(pl.rc, pl.rst[0], pl.pulseStart, 0, 0);
+        pl.evPhase = EV_SAMP;
+        continue;
       }
+      if (pl.evPhase == EV_SAMP) {
+        int32_t q = pl.env.on ? SampleGen::envQ15(pl.env, dl) : 32768;
+        progLatch(pl, dl, mkCode(pl.off0, pl.rc.c0, q), mkCode(pl.off1, pl.rc.c1, q));
+        if (pl.rc.k < pl.rst[pl.evIdx].N) {
+          SampleGen::rampStep(pl.rc, pl.rst[pl.evIdx]);
+          continue;
+        }
+        pl.evIdx++;                    // stage done — its last sample was exact
+        if (pl.evIdx < pl.nStages) {
+          const SampleGen::RampStage& prev = pl.rst[pl.evIdx - 1];
+          SampleGen::rampEnter(pl.rc, pl.rst[pl.evIdx],
+                               pl.pulseStart + pl.cum[pl.evIdx], prev.end0, prev.end1);
+        } else {
+          pl.evPhase = EV_OFF;         // park+ground at the same boundary deadline
+        }
+        continue;
+      }
+      progLatch(pl, dl, pl.off0, pl.off1);   // EV_OFF
+      oeGround(pl);
+    } else if (pl.chMask) {            // HOLD
+      int32_t q   = pl.env.on ? SampleGen::envQ15(pl.env, dl) : 32768;
+      bool    off = (pl.evIdx == pl.nStages);
+      progLatch(pl, dl, mkCode(pl.off0, off ? 0 : pl.d0[pl.evIdx], q),
+                        mkCode(pl.off1, off ? 0 : pl.d1[pl.evIdx], q));
+      if (pl.evIdx == 0)    oeConnect(pl);
+      else if (off)         oeGround(pl);
+      if (!off) { pl.evIdx++; continue; }
     }
-
-    if (pl.evIdx < pl.nStages) { pl.evIdx++; continue; }
 
     // off event done (or bookkeeping tick of an empty train): pulse complete
     pl.seq++;                          // odd: update in progress
     pl.nPulses = pl.nPulses + 1;
     pl.evIdx = 0;
+    pl.evPhase = EV_INIT;
     pl.pulseStart += pl.periodCyc;
     pl.seq++;                          // even again
   }
@@ -179,8 +258,8 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
              pl.slot, eng ? 'U' : 'T');
     return false;
   }
-  if (def.type != PIECEWISE_HOLD) {
-    snprintf(err, errsz, "only S (rectangular) slots play in Phase 3 — L arrives in Phase 4, W in Phase 5");
+  if (def.type == SINE) {
+    snprintf(err, errsz, "W (sine) playback arrives in Phase 5");
     return false;
   }
 
@@ -197,18 +276,31 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.chMask   = mask;
   pl.outMode0 = def.mode0 & 1;
   pl.outMode1 = def.mode1 & 1;
+  // undriven/empty trains degenerate to HOLD bookkeeping (0 stages, no events)
+  pl.type     = mask ? def.type : (uint8_t)PIECEWISE_HOLD;
   pl.nStages  = mask ? def.nStages : 0;
+  // inter-pulse park level = the mode's calibration offset (legacy state);
+  // stage amplitudes become deltas from it so the envelope can scale them
+  pl.off0 = (int16_t)(pl.outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+  pl.off1 = (int16_t)(pl.outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+
   uint64_t acc = 0;
   pl.cum[0] = 0;
   for (uint8_t i = 0; i < pl.nStages; i++) {
-    pl.code0[i] = (mask & 1) ? ampToCode(def.stages[i].a0, pl.outMode0, 0) : 0;
-    pl.code1[i] = (mask & 2) ? ampToCode(def.stages[i].a1, pl.outMode1, 1) : 0;
+    pl.d0[i] = (mask & 1) ? ampToCode(def.stages[i].a0, pl.outMode0, 0) - pl.off0 : 0;
+    pl.d1[i] = (mask & 2) ? ampToCode(def.stages[i].a1, pl.outMode1, 1) - pl.off1 : 0;
     acc += SJ_US_TO_CYC(def.stages[i].dur_us);
     pl.cum[i + 1] = acc;
   }
-  // the off event parks the DAC on the mode's offset (legacy inter-pulse state)
-  pl.code0[pl.nStages] = (int16_t)(pl.outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
-  pl.code1[pl.nStages] = (int16_t)(pl.outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+  if (pl.type == PIECEWISE_RAMP) {
+    // per-stage Bresenham constants; stage i ramps from stage i-1's end (0 =
+    // the offset at pulse start) to its own programmed value (plan §3.5)
+    for (uint8_t i = 0; i < pl.nStages; i++)
+      SampleGen::rampStageInit(pl.rst[i], def.stages[i].dur_us, SJ_CYC_PER_US,
+                               SJ_TARGET_DT_US,
+                               i ? pl.d0[i - 1] : 0, pl.d0[i],
+                               i ? pl.d1[i - 1] : 0, pl.d1[i]);
+  }
 
   pl.periodCyc   = SJ_US_TO_CYC(def.period_us);
   pl.durationCyc = SJ_US_TO_CYC(def.duration_us);
@@ -216,8 +308,14 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
                      (mask == 0b11 ? SJ_DAC_PROG2_US : SJ_DAC_PROG1_US));
   pl.nPulses     = 0;
   pl.evIdx       = 0;
+  pl.evPhase     = EV_INIT;
+  // t0 is taken *after* all precomputation so the arm->first-latch latency
+  // stays the fixed START_LATENCY regardless of train complexity
   pl.t0          = FastIO::cycles64() + SJ_US_TO_CYC(SJ_START_LATENCY_US);
   pl.pulseStart  = pl.t0;
+  SampleGen::envInit(pl.env, pl.t0, pl.durationCyc,
+                     SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
+  if (!mask) pl.env.on = false;
 
   if (mask & 1) digitalWriteFast(LED0, HIGH);
   if (mask & 2) digitalWriteFast(LED1, HIGH);
@@ -234,9 +332,9 @@ void stopTrain(uint8_t eng) {
   pitStop(eng);
   if (wasActive && pl.chMask) {
     // park like a finished pulse: offsets latched, OE grounded, LEDs off
-    if (pl.chMask == 0b11)  FastIO::dacProgramBoth(pl.code0[pl.nStages], pl.code1[pl.nStages]);
-    else if (pl.chMask & 1) FastIO::dacProgram(0, pl.code0[pl.nStages]);
-    else                    FastIO::dacProgram(1, pl.code1[pl.nStages]);
+    if (pl.chMask == 0b11)  FastIO::dacProgramBoth(pl.off0, pl.off1);
+    else if (pl.chMask & 1) FastIO::dacProgram(0, pl.off0);
+    else                    FastIO::dacProgram(1, pl.off1);
     FastIO::dacLatch(pl.chMask);
     groundClaimed(pl.chMask);
   }

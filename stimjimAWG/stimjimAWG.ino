@@ -6,11 +6,13 @@
 //    docs/awg-implementation-plan.md, docs/serial-protocol.md,
 //    docs/hardware-notes.md; progress log: docs/PROGRESS.md.
 //
-//    Phase 3 state: FastIO + BENCH harness (Phase 1); full waveform-definition
+//    Phase 4 state: FastIO + BENCH harness (Phase 1); full waveform-definition
 //    protocol with atomic staging, queries, EEPROM (Phase 2); PIT deadline
 //    scheduler playing rectangular (`S`) trains via T/U with copy-on-arm and
-//    the completion ring, plus READ manual measurement (Phase 3). L/W playback
-//    arrives in Phases 4-5, the measurement engine + SD in Phase 7.
+//    the completion ring, plus READ manual measurement (Phase 3); linear-ramp
+//    (`L`) playback with 0-duration jump chains and the ENV envelope
+//    (Phase 4). W playback arrives in Phase 5, the measurement engine + SD
+//    in Phase 7.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by

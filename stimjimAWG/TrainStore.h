@@ -59,7 +59,7 @@ void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n);
 void milliToStr(long long milli, char* buf);
 
 // ------------------------------------------------------------------ defaults
-uint8_t defaultWhen(uint8_t type);            // 1 for S/L, 2 for W (protocol §5)
+uint8_t defaultWhen(uint8_t type);            // 0 for S/L, 3 for W (protocol §5)
 bool isDefaultTrain(const TrainDef& t);       // ignores env/meas
 bool isDefaultEnv(const EnvDef& e);
 bool isDefaultMeas(const TrainDef& t);        // auto-when aware

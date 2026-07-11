@@ -2,9 +2,9 @@
 
 Status: protocol version 1. Waveform definition, queries, immediate commands and persistence
 (`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as
-of Phase 2/3; `T`/`U` execution runs `S` slots as of Phase 3 (`L` playback arrives in Phase 4,
-`W` in Phase 5), the measurement engine (`MEAS` execution, `MSUM`/`MDATA` output) in Phase 7,
-`LOG` in Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
+of Phase 2/3; `T`/`U` execution runs `S` and `L` slots with the `ENV` envelope as of Phase 4
+(`W` playback arrives in Phase 5), the measurement engine (`MEAS` execution, `MSUM`/`MDATA`
+output) in Phase 7, `LOG` in Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
 [awg-implementation-plan.md](awg-implementation-plan.md). The
 legacy sections below double as documentation of the old `stimjimPulser` behavior; the
 "hardened" notes describe what stimjimAWG changes.
@@ -90,7 +90,10 @@ L0,...;1000,0,0;1000,0,500 # jump to 1000, hold 500 µs (ramp from 1000 to 1000)
 ```
 
 Ramp sample interval defaults to 20 µs (engine `TARGET_DT_US`); last sample lands exactly on the
-stage boundary and end value.
+stage boundary and end value (integer Bresenham, plan §3.5 — no rounding accumulates across
+samples or stages). Each pulse ramps from the parked offset (0) and, after the last stage
+boundary, parks and grounds like `S`: the final stage's end value is latched exactly at the
+boundary and immediately parked — append a same-value stage to hold it.
 
 ### `W` — sine train — explicit fields, phase fixed
 
@@ -134,7 +137,10 @@ ENV<idx>?  →  ENV<idx>,<in>,<out>,<shape>
 ```
 
 Envelope 0→1 over `rampIn` from train start, 1→0 ending exactly at `duration_us`. Applies to all
-waveform types. Validation: `rampIn + rampOut ≤ duration` else `ERR`. Default `0,0,0`.
+waveform types, evaluated at each latch event (plan §3.5): `L`/`W` trains follow it per sample,
+`S` trains sample it at each stage latch (stair-step over a long stage — use `L` for smooth
+ramps). It scales amplitudes relative to the channel's calibration offset (the parked baseline
+does not move). Validation: `rampIn + rampOut ≤ duration` else `ERR`. Default `0,0,0`.
 
 ### `MEAS` — per-train measurement configuration
 
