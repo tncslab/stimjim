@@ -756,13 +756,13 @@ static void benchDispatch(const char* sub, const char* args) {
 // --------------------------------------------------------------------- HELP
 
 static void help() {
-  Serial.println("# stimjimAWG commands (Phase 4) — details: docs/serial-protocol.md");
+  Serial.println("# stimjimAWG commands (Phase 5) — details: docs/serial-protocol.md");
   Serial.println("#   S<i>,m0,m1,per,dur;a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
   Serial.println("#   L<i>,...                        same syntax, linear ramps (0-dur stage = jump)");
   Serial.println("#   W<i>,m0,m1,per,dur;amp;freq;phase[;env]  sine train (triplets, decimals in Hz ok)");
   Serial.println("#   modes: 0 V, 1 I, 2/3 channel not driven; 90/91 V/I without measurement");
   Serial.println("#   S<i> / L<i> / W<i>              human parameter dump; append ? for the canonical line");
-  Serial.println("#   T<i> / T-1, U<i> / U-1          start/stop engine 0 / 1 (S/L slots; W in Phase 5)");
+  Serial.println("#   T<i> / T-1, U<i> / U-1          start/stop engine 0 / 1");
   Serial.println("#   ENV<i>,in,out[,shape]           amplitude envelope; ENV<i>?");
   Serial.println("#   MEAS<i>,w0,w1,when,stage[,rep]  measurement config; MEAS<i>?");
   Serial.println("#   READ<ch>[,n]                    manual averaged V+I read (mean and std dev)");
@@ -773,7 +773,7 @@ static void help() {
   Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
   Serial.println("#   TRIG<t>? / R<t>?                trigger routing queries (setters in Phase 8)");
   Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("# Not yet available: W playback (Phase 5), MEAS execution + LOG (Phase 7), TRIG/R setters (Phase 8)");
+  Serial.println("# Not yet available: MEAS execution + LOG (Phase 7), TRIG/R setters (Phase 8)");
   ok();
 }
 

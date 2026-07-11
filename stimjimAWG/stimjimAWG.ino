@@ -6,13 +6,14 @@
 //    docs/awg-implementation-plan.md, docs/serial-protocol.md,
 //    docs/hardware-notes.md; progress log: docs/PROGRESS.md.
 //
-//    Phase 4 state: FastIO + BENCH harness (Phase 1); full waveform-definition
+//    Phase 5 state: FastIO + BENCH harness (Phase 1); full waveform-definition
 //    protocol with atomic staging, queries, EEPROM (Phase 2); PIT deadline
 //    scheduler playing rectangular (`S`) trains via T/U with copy-on-arm and
 //    the completion ring, plus READ manual measurement (Phase 3); linear-ramp
 //    (`L`) playback with 0-duration jump chains and the ENV envelope
-//    (Phase 4). W playback arrives in Phase 5, the measurement engine + SD
-//    in Phase 7.
+//    (Phase 4); sine (`W`) playback with applied start phase, per-burst
+//    restart and per-train Fs (Phase 5). Dual-channel benchmarking arrives in
+//    Phase 6, the measurement engine + SD in Phase 7.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -29,6 +30,7 @@
 #include "FastIO.h"
 #include "Engine.h"
 #include "Protocol.h"
+#include "SampleGen.h"
 #include "TrainStore.h"
 #include "Triggers.h"
 #include "Measure.h"
@@ -48,6 +50,7 @@ void setup() {
   FastIO::begin();
 
   Engine::begin();           // reserve 2 PIT channels + K_RELOAD self-calibration
+  SampleGen::sineTabInit();  // 2 KB Q15 sine table (double sin, boot only)
   TrainStore::begin();
   Triggers::begin();
 

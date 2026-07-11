@@ -2,9 +2,9 @@
 
 Status: protocol version 1. Waveform definition, queries, immediate commands and persistence
 (`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as
-of Phase 2/3; `T`/`U` execution runs `S` and `L` slots with the `ENV` envelope as of Phase 4
-(`W` playback arrives in Phase 5), the measurement engine (`MEAS` execution, `MSUM`/`MDATA`
-output) in Phase 7, `LOG` in Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
+of Phase 2/3; `T`/`U` execution runs all slot types with the `ENV` envelope as of Phase 5;
+the measurement engine (`MEAS` execution, `MSUM`/`MDATA` output) arrives in Phase 7, `LOG` in
+Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
 [awg-implementation-plan.md](awg-implementation-plan.md). The
 legacy sections below double as documentation of the old `stimjimPulser` behavior; the
 "hardened" notes describe what stimjimAWG changes.
@@ -107,6 +107,14 @@ W<idx>,<mode0>,<mode1>,<period_us>,<duration_us>;
 
 Omitting the 5th triplet resets the envelope to `0,0,0` — a full `W` line fully defines the slot,
 keeping query output round-trip exact. Legacy `W` lines (4 triplets, integer Hz) parse unchanged.
+
+Playback (Phase 5, plan §3.5): each period runs one burst of `burst_us`; the **phase restarts at
+`phase` every burst** (bursts are identical and drift-free; legacy-consistent), and the output
+parks at offset + grounds between bursts. `burst_us = period_us` is continuous sine except for a
+few-µs park at each period boundary (same as legacy; a gapless mode may suppress the off event
+later). Sample rate per train: `Fs = clamp(64·f_max, 1 kHz, 50 kHz)` on an exact CPU-cycle grid
+(the 50 kHz ceiling is provisional until the Phase 6 bench). Frequencies above `Fs/2 = 25 kHz`
+are accepted at parse time but **refused at start** with a `WARN` (Nyquist).
 
 Known hardware limit (see [hardware-notes.md](hardware-notes.md)): amplitudes above 3000 µA
 convert incorrectly on the DAC → `WARN` on set.

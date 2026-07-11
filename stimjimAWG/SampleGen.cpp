@@ -1,8 +1,9 @@
 //    stimjimAWG — SampleGen implementation. Phase 4: ramp Bresenham +
-//    envelope (sine follows in Phase 5). Pure math, host-testable.
-//    GPL-3.0-or-later; see Config.h header.
+//    envelope; Phase 5: sine table + phase-accumulator coefficients.
+//    Pure math, host-testable. GPL-3.0-or-later; see Config.h header.
 
 #include "SampleGen.h"
+#include <math.h>
 
 namespace SampleGen {
 
@@ -81,6 +82,41 @@ int32_t envQ15(const EnvCoef& e, uint64_t t) {
     return (int32_t)((float)(e.tEnd - t) * e.invOut * 32768.0f + 0.5f);
   }
   return 32768;                                 // plateau (identity)
+}
+
+// --------------------------------------------------------------------- sine
+
+int16_t SINE_TAB[1025];
+
+void sineTabInit() {
+  // double sin() once at boot (loop context — FP64 is fine there). [1024]
+  // duplicates [0] so the interpolation never needs an index wrap.
+  for (int i = 0; i <= 1024; i++)
+    SINE_TAB[i] = (int16_t)lround(32767.0 * sin(6.283185307179586 * i / 1024.0));
+}
+
+int32_t sineQ15(uint32_t phase) {
+  // top 10 bits: table interval; next 16 bits: Q16 interpolation fraction
+  // (the bottom 6 phase bits are below the table's resolution — dropped)
+  uint32_t idx  = phase >> 22;
+  int32_t  frac = (int32_t)((phase >> 6) & 0xFFFF);
+  int32_t  a = SINE_TAB[idx];
+  return a + (((SINE_TAB[idx + 1] - a) * frac + 0x8000) >> 16);
+}
+
+uint32_t sinePhaseInc(uint32_t f_mHz, uint32_t sampleCyc, uint32_t cycPerUs) {
+  // turns/sample = (f_mHz/1000) * sampleCyc / (cycPerUs*1e6); double keeps
+  // 53-bit precision — the final integer rounding dominates (<= 0.5/2^32
+  // turn/sample: a deterministic sub-1e-7 relative frequency offset, not an
+  // accumulating error). Caller guarantees f < Fs/2 so the result fits.
+  double turns = (double)f_mHz * (double)sampleCyc / ((double)cycPerUs * 1e9);
+  return (uint32_t)(turns * 4294967296.0 + 0.5);
+}
+
+uint32_t sinePhaseInit(int32_t mdeg) {
+  int32_t m = mdeg % 360000;
+  if (m < 0) m += 360000;
+  return (uint32_t)(((uint64_t)m << 32) / 360000u);
 }
 
 } // namespace SampleGen

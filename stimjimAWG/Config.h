@@ -23,7 +23,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.4.0"        // Phase 4: RAMP playback + envelope
+#define SJ_FW_VERSION    "0.5.0"        // Phase 5: sine playback
 #define SJ_PROTO_VERSION 1
 #define SJ_HW_NAME       "Teensy3.5"
 
@@ -60,6 +60,15 @@
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
 #define SJ_START_LATENCY_US  20        // fixed arm->first-latch latency: trigger latency is deterministic
 #define SJ_TARGET_DT_US      20        // default ramp sample interval (per-train overridable later)
+
+// Sine sample-rate policy (plan §3.5): Fs = clamp(SAMPLES_PER_CYC * f_max,
+// FS_MIN, FS_MAX), realized as an exact integer number of CPU cycles per
+// sample. FS_MAX is provisional pre-bench (min sample period 20 us >> the
+// preload+program budget); Phase 6 publishes the measured dual-channel
+// ceiling with ~30 % margin. f_max above FS_MAX/2 is refused at start.
+#define SJ_SINE_SAMPLES_PER_CYC 64
+#define SJ_FS_MIN_HZ            1000
+#define SJ_FS_MAX_HZ            50000
 
 // ------------------------------------------------------------------ protocol
 #define SJ_LINE_MAX      999   // longest accepted serial line (excl. terminator)

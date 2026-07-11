@@ -190,10 +190,57 @@ static void testScaleQ15() {
   CHECK_EQ(scaleQ15(3, 16384), 2);
 }
 
+static void testSine() {
+  sineTabInit();
+  // cardinal points (Q32 phase: 2^30 per quadrant)
+  CHECK_EQ(sineQ15(0x00000000u), 0);
+  CHECK_EQ(sineQ15(0x40000000u), 32767);
+  CHECK_EQ(sineQ15(0x80000000u), 0);
+  CHECK_EQ(sineQ15(0xC0000000u), -32767);
+  // table + interpolation error against double sin across a dense sweep
+  {
+    double maxErr = 0;
+    for (uint64_t ph = 0; ph < (1ull << 32); ph += 999983) {   // prime stride
+      double ref = 32767.0 * std::sin(6.283185307179586 * (double)ph / 4294967296.0);
+      double err = std::fabs((double)sineQ15((uint32_t)ph) - ref);
+      if (err > maxErr) maxErr = err;
+    }
+    CHECK(maxErr <= 1.5);   // spec: ~1 LSB (0.5 quantization + lerp curvature)
+  }
+  // phase accumulator wrap = 360-degree wrap: one exact period at 64 samples
+  {
+    uint32_t inc = 1u << 26;                       // 2^32 / 64
+    uint32_t ph = sinePhaseInit(90000);            // start at +peak
+    CHECK_EQ(ph, 0x40000000u);
+    CHECK_EQ(sineQ15(ph), 32767);
+    for (int k = 0; k < 64; k++) ph += inc;
+    CHECK_EQ(ph, 0x40000000u);                     // back exactly, no drift
+  }
+  // phaseInit: sign and wrap handling, exact quadrants
+  CHECK_EQ(sinePhaseInit(0), 0u);
+  CHECK_EQ(sinePhaseInit(180000), 0x80000000u);
+  CHECK_EQ(sinePhaseInit(-90000), 0xC0000000u);    // -90 == +270
+  CHECK_EQ(sinePhaseInit(360000), 0u);
+  CHECK_EQ(sinePhaseInit(450000), 0x40000000u);    // 450 == 90
+  // phaseInc: 1 kHz at Fs = 64 kHz (sampleCyc = 1875 at 120 MHz) is exactly
+  // 1/64 turn per sample — the double path must hit the integer exactly
+  CHECK_EQ(sinePhaseInc(1000000u, 1875u, 120u), 1u << 26);
+  // frequency accuracy for a non-round case: 12.345 Hz at Fs = 1 kHz
+  // (sampleCyc = 120000): inc = 12.345e-3 * 2^32 / 1000
+  {
+    uint32_t inc = sinePhaseInc(12345u, 120000u, 120u);
+    double ref = 12.345 / 1000.0 * 4294967296.0;
+    CHECK(std::fabs((double)inc - ref) <= 0.5);    // only the final rounding
+  }
+  // DC (f = 0): the accumulator stands still at the start phase
+  CHECK_EQ(sinePhaseInc(0, 2400, 120), 0u);
+}
+
 int main() {
   testRamp();
   testEnv();
   testScaleQ15();
+  testSine();
   if (failures == 0) printf("test_samplegen: all checks passed\n");
   else               printf("test_samplegen: %d FAILURES\n", failures);
   return failures;

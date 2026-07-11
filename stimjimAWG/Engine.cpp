@@ -62,6 +62,10 @@ static inline void pitStop(uint8_t p) {
 //         last one exactly on the stage boundary/end value), then EV_OFF
 //         parks + grounds at pulseStart + cum[nStages]. A 0-duration stage is
 //         one sample at its start time — the instant jump.
+//   SINE  samples at pulseStart + k*sampleCyc while inside the burst (phase
+//         accumulators restart at phaseInit each burst, so bursts are
+//         identical and drift-free), then EV_OFF parks + grounds at
+//         pulseStart + burstCyc.
 struct Player {
   // arm-time constants (ISR-private while active)
   uint8_t  slot;
@@ -75,6 +79,11 @@ struct Player {
   uint64_t cum[SJ_MAX_STAGES + 1];     // stage boundaries from pulse start, cycles
   SampleGen::RampStage rst[SJ_MAX_STAGES];
   SampleGen::EnvCoef   env;
+  uint32_t phaseInit0, phaseInit1;     // SINE: Q32 start phase (per-burst restart)
+  uint32_t phaseInc0, phaseInc1;       // SINE: Q32 turns per sample
+  int32_t  sAmp0, sAmp1;               // SINE: amplitude deltas rel. offset
+  uint32_t sampleCyc;                  // SINE: exact cycles per sample
+  uint64_t burstCyc;
   uint64_t periodCyc, durationCyc;
   uint32_t preloadCyc;                 // DAC programming budget + CYCCNT spin margin
   uint64_t t0;
@@ -82,8 +91,11 @@ struct Player {
   uint64_t pulseStart;                 // current pulse's absolute start
   volatile uint32_t nPulses;
   uint8_t  evIdx;                      // HOLD: event index; RAMP: current stage
-  uint8_t  evPhase;                    // RAMP: EV_INIT / EV_SAMP / EV_OFF
+  uint8_t  evPhase;                    // RAMP/SINE: EV_INIT / EV_SAMP / EV_OFF
   SampleGen::RampCursor rc;
+  uint32_t ph0, ph1;                   // SINE: live phase accumulators
+  uint32_t sampK;                      // SINE: sample index within the burst
+  uint64_t sampT;                      // SINE: absolute deadline of the next sample
   volatile bool active;
   volatile uint32_t seq;               // seqlock: odd while the ISR updates
 };
@@ -172,6 +184,12 @@ static void playerRun(uint8_t p) {
       dl = (pl.evPhase == EV_INIT) ? pl.pulseStart
          : (pl.evPhase == EV_OFF)  ? pl.pulseStart + pl.cum[pl.nStages]
                                    : pl.rc.t;
+    } else if (pl.type == SINE) {
+      // burst end is a deadline comparison, not a sample count (plan §3.5);
+      // burstCyc = 0 degenerates to the off event alone
+      uint64_t burstEnd = pl.pulseStart + pl.burstCyc;
+      if (pl.evPhase == EV_SAMP && pl.sampT >= burstEnd) pl.evPhase = EV_OFF;
+      dl = (pl.evPhase == EV_OFF) ? burstEnd : pl.sampT;
     } else {                           // HOLD (also empty-train bookkeeping)
       dl = pl.pulseStart + pl.cum[pl.evIdx];
     }
@@ -217,6 +235,22 @@ static void playerRun(uint8_t p) {
       }
       progLatch(pl, dl, pl.off0, pl.off1);   // EV_OFF
       oeGround(pl);
+    } else if (pl.type == SINE) {      // chMask != 0 guaranteed (see startTrain)
+      if (pl.evPhase == EV_SAMP) {
+        int32_t q = pl.env.on ? SampleGen::envQ15(pl.env, dl) : 32768;
+        // sample = offset + env * (amp * sin(phase)); two Q15 multiplies
+        progLatch(pl, dl,
+            mkCode(pl.off0, SampleGen::scaleQ15(pl.sAmp0, SampleGen::sineQ15(pl.ph0)), q),
+            mkCode(pl.off1, SampleGen::scaleQ15(pl.sAmp1, SampleGen::sineQ15(pl.ph1)), q));
+        if (pl.sampK == 0) oeConnect(pl);
+        pl.sampK++;
+        pl.ph0 += pl.phaseInc0;        // Q32 wrap IS the 360-degree wrap
+        pl.ph1 += pl.phaseInc1;
+        pl.sampT += pl.sampleCyc;      // exact integer grid: drift-free
+        continue;
+      }
+      progLatch(pl, dl, pl.off0, pl.off1);   // EV_OFF: park + ground
+      oeGround(pl);
     } else if (pl.chMask) {            // HOLD
       int32_t q   = pl.env.on ? SampleGen::envQ15(pl.env, dl) : 32768;
       bool    off = (pl.evIdx == pl.nStages);
@@ -231,8 +265,16 @@ static void playerRun(uint8_t p) {
     pl.seq++;                          // odd: update in progress
     pl.nPulses = pl.nPulses + 1;
     pl.evIdx = 0;
-    pl.evPhase = EV_INIT;
     pl.pulseStart += pl.periodCyc;
+    if (pl.type == SINE) {             // next burst: restart phase on the new grid
+      pl.evPhase = EV_SAMP;
+      pl.sampK = 0;
+      pl.ph0 = pl.phaseInit0;
+      pl.ph1 = pl.phaseInit1;
+      pl.sampT = pl.pulseStart;
+    } else {
+      pl.evPhase = EV_INIT;
+    }
     pl.seq++;                          // even again
   }
 }
@@ -258,13 +300,20 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
              pl.slot, eng ? 'U' : 'T');
     return false;
   }
-  if (def.type == SINE) {
-    snprintf(err, errsz, "W (sine) playback arrives in Phase 5");
-    return false;
-  }
-
   uint8_t mask = (uint8_t)(((def.mode0 <= 1) ? 1 : 0) | ((def.mode1 <= 1) ? 2 : 0));
-  if (def.nStages == 0) mask = 0;      // empty train: bookkeeping only
+  if (def.type != SINE && def.nStages == 0) mask = 0;   // empty train: bookkeeping only
+  if (def.type == SINE && mask) {
+    // Nyquist gate: above Fs/2 the phase increment exceeds half a turn per
+    // sample — unrepresentable. Checked here (not at parse time) because
+    // FS_MAX is an engine property (provisional pre-bench, plan §3.5).
+    uint64_t f0 = (mask & 1) ? def.sine.freq0_mHz : 0;
+    uint64_t f1 = (mask & 2) ? def.sine.freq1_mHz : 0;
+    if ((f0 > f1 ? f0 : f1) > (uint64_t)SJ_FS_MAX_HZ * 1000 / 2) {
+      snprintf(err, errsz, "sine frequency above Fs/2 = %d Hz — start dropped",
+               SJ_FS_MAX_HZ / 2);
+      return false;
+    }
+  }
   const Player& other = player[eng ^ 1];
   if (other.active && (mask & other.chMask)) {
     snprintf(err, errsz, "channel conflict with the running %c train — start dropped",
@@ -284,6 +333,24 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.off0 = (int16_t)(pl.outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
   pl.off1 = (int16_t)(pl.outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
+  if (pl.type == SINE) {
+    // Fs policy (plan §3.5): clamp(64*f_max, FS_MIN, FS_MAX), realized as an
+    // exact integer cycle count per sample; phaseInc is derived from the
+    // *actual* sample period so frequency never depends on Fs rounding.
+    uint64_t f0 = (mask & 1) ? def.sine.freq0_mHz : 0;
+    uint64_t f1 = (mask & 2) ? def.sine.freq1_mHz : 0;
+    uint64_t fs_mHz = (f0 > f1 ? f0 : f1) * SJ_SINE_SAMPLES_PER_CYC;
+    if (fs_mHz < (uint64_t)SJ_FS_MIN_HZ * 1000) fs_mHz = (uint64_t)SJ_FS_MIN_HZ * 1000;
+    if (fs_mHz > (uint64_t)SJ_FS_MAX_HZ * 1000) fs_mHz = (uint64_t)SJ_FS_MAX_HZ * 1000;
+    pl.sampleCyc  = (uint32_t)(((uint64_t)SJ_CYC_PER_US * 1000000000ull + fs_mHz / 2) / fs_mHz);
+    pl.phaseInc0  = SampleGen::sinePhaseInc(def.sine.freq0_mHz, pl.sampleCyc, SJ_CYC_PER_US);
+    pl.phaseInc1  = SampleGen::sinePhaseInc(def.sine.freq1_mHz, pl.sampleCyc, SJ_CYC_PER_US);
+    pl.phaseInit0 = SampleGen::sinePhaseInit(def.sine.phase0_mdeg);
+    pl.phaseInit1 = SampleGen::sinePhaseInit(def.sine.phase1_mdeg);
+    pl.sAmp0 = (mask & 1) ? ampToCode(def.sine.amp0, pl.outMode0, 0) - pl.off0 : 0;
+    pl.sAmp1 = (mask & 2) ? ampToCode(def.sine.amp1, pl.outMode1, 1) - pl.off1 : 0;
+    pl.burstCyc = SJ_US_TO_CYC(def.sine.burst_us);
+  }
   uint64_t acc = 0;
   pl.cum[0] = 0;
   for (uint8_t i = 0; i < pl.nStages; i++) {
@@ -313,6 +380,13 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   // stays the fixed START_LATENCY regardless of train complexity
   pl.t0          = FastIO::cycles64() + SJ_US_TO_CYC(SJ_START_LATENCY_US);
   pl.pulseStart  = pl.t0;
+  if (pl.type == SINE) {               // first burst starts at t0
+    pl.evPhase = EV_SAMP;
+    pl.sampK   = 0;
+    pl.ph0     = pl.phaseInit0;
+    pl.ph1     = pl.phaseInit1;
+    pl.sampT   = pl.t0;
+  }
   SampleGen::envInit(pl.env, pl.t0, pl.durationCyc,
                      SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
   if (!mask) pl.env.on = false;
