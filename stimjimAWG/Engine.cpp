@@ -207,4 +207,8 @@ void poll() {
   (void)FastIO::cycles64();   // keep the 64-bit extension alive while idle
 }
 
+// Phase 2 stubs — ChannelPlayer state arrives in Phase 3.
+int16_t activeSlot(uint8_t) { return -1; }
+bool    anyActive()         { return false; }
+
 } // namespace Engine

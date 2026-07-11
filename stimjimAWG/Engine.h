@@ -22,6 +22,12 @@ void poll();
 uint8_t  pitChannelOf(uint8_t player);   // hardware PIT channel index owned by player 0/1
 uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU cycles)
 
+// Slot currently attached to a running player (-1 = idle). Drives the Phase-2
+// edit-refusal ("ERR ... stop first") and the V/A-during-train WARN; players
+// arrive in Phase 3, so the Phase-2 implementation always reports idle.
+int16_t activeSlot(uint8_t player);
+bool    anyActive();
+
 // Re-run the K_RELOAD calibration (BENCHK): schedules the *real* programming
 // path with a known deadline and measures fire-time error by polling TFLG.
 // Folds the median into the constant; fills min/median/max of the residuals.

@@ -23,7 +23,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.1.0"        // Phase 1 scaffold
+#define SJ_FW_VERSION    "0.2.0"        // Phase 2: TrainStore + protocol core
 #define SJ_PROTO_VERSION 1
 #define SJ_HW_NAME       "Teensy3.5"
 

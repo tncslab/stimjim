@@ -1,9 +1,11 @@
 # stimjimAWG serial protocol reference (draft)
 
-Status: design draft, protocol version 1 (implemented from Phase 2 onward — see
-[awg-implementation-plan.md](awg-implementation-plan.md)). The legacy sections below double as
-documentation of the current `stimjimPulser` behavior; the "hardened" notes describe what
-stimjimAWG changes.
+Status: protocol version 1. Waveform definition, queries, immediate commands and persistence
+(`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as of
+Phase 2; `T`/`U` execution arrives in Phase 3, `LOG` in Phase 7, `TRIG`/`R` setters in Phase 8
+(queries already answer) — see [awg-implementation-plan.md](awg-implementation-plan.md). The
+legacy sections below double as documentation of the old `stimjimPulser` behavior; the
+"hardened" notes describe what stimjimAWG changes.
 
 Backward-compatibility contract: every command of `stimjimPulser` keeps its syntax and semantics;
 `M`/`V`/`A`/`E` keep **byte-compatible single-line replies** because StimJimBIST performs exactly
@@ -40,9 +42,12 @@ between pulse/burst starts, `<duration_us>` total train length.
 ### `S` — piecewise-constant (rectangular step) train — legacy semantics, bit-exact
 
 ```
-S<idx>,<mode0>,<mode1>,<period_us>,<duration_us>; <a0>,<a1>,<dur_us>; ...   (1–10 stages)
+S<idx>,<mode0>,<mode1>,<period_us>,<duration_us>; <a0>,<a1>,<dur_us>; ...   (0–10 stages)
 S<idx>          → query (safe, never writes)      S<idx>?  → canonical one-line form
 ```
+
+A stage count of 0 stays accepted (legacy "empty train" — the boot default; the train runs its
+period/duration bookkeeping but emits nothing).
 
 Amplitudes in mV (voltage modes) or µA (current modes). Each stage *jumps* to its amplitudes and
 holds for `dur_us`. After the last stage the DAC returns to offset (0) and outputs are grounded.
@@ -96,7 +101,7 @@ convert incorrectly on the DAC → `WARN` on set.
 | `V` | `V<ch>,<mV>` immediate voltage | exactly 1 line: `Set channel <ch> to amplitude <mV> mV (dac value <dac>).` or `<dac> is out of range.` During a running train: executed under bus lock + `WARN`. |
 | `A` | `A<ch>,<dac>` immediate raw DAC (−32768…32767) | exactly 1 line: `Set channel <ch> to amplitude <dac>` |
 | `E` | `E<ch>,<line>` read ADC; line 0 = output voltage, 1 = current sense | exactly 1 line: `Read value: <raw> (<value>mV)` / `(<value>uA)` — format frozen for BIST |
-| `B` | recalibrate ADC offsets (grounds outputs) | legacy lines |
+| `B` | recalibrate ADC offsets (grounds outputs) | `OK` when done (legacy printed nothing, §6); refused while a train runs |
 | `C` | recalibrate current+voltage offsets | prints `WARN C: output will ramp` first — `getVoltageOffsets()` sweeps a voltage ramp on the outputs |
 | `D` | print offsets (human); `D?` machine CSV: `D,<adc25_0>,<adc25_1>,<adc10_0>,<adc10_1>,<ioff0>,<ioff1>,<voff0>,<voff1>` | |
 | `P` | save slots 0–9 + ENV/MEAS + TRIG table to EEPROM (versioned, checksummed) | legacy confirmation |
@@ -158,7 +163,7 @@ TRIG<t>?  → canonical line
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
 | `IDN` | `IDN,stimjimAWG,Teensy3.5,fw=<x.y.z>,proto=1` (also in boot banner; lets the Python GUI feature-detect) |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
-| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS`, both `TRIG` lines, `OK`. Paste-back restores the configuration. |
+| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, `OK`. Paste-back restores the configuration. Until the `TRIG` setter exists (Phase 8) the `TRIG` lines are emitted as `#` comments so paste-back stays clean. |
 | `LOG` | SD logging: `LOG?` status (card present, open file, bytes); `LOG1[,name]` open new file; `LOG0` close/flush. |
 | `BENCH` | benchmark group (implemented in Phase 1, see below). |
 
@@ -210,6 +215,17 @@ Deliberate behavior changes (documented compat risk, all fail-loudly):
 6. Editing a slot attached to a running engine is refused (`ERR … stop first (T-1)`).
 7. Buttons no longer directly start trigger-mapped trains — they navigate the menu (Btn0 = OK,
    Btn1/Btn2 = prev/next; see plan §5).
+8. `M` now maps command modes onto the OE decoder as documented. The legacy handler passed the
+   command mode (0–5) *raw* into the 2-bit decoder (`Stimjim::setOutputMode`, modes 0–3), so
+   **legacy `M2`/`M3` actually produced hi-Z/ground, and `M4`/`M5` connected the voltage/current
+   source** — the opposite of their documentation. BIST is unaffected (it only uses modes 0/1,
+   which map identically).
+9. Negative `W` frequencies → `ERR`. The legacy firmware accepted them (producing a time-reversed
+   sine through table-index wraparound); scripts relying on that should use the equivalent
+   positive-frequency + phase form.
+10. `B` replies with a lone `OK` (the legacy handler printed nothing at all). `B`/`C` are refused
+    while a train is running (calibration would fight the players for the SPI bus for hundreds
+    of ms).
 
 Corrections to stale legacy documentation:
 

@@ -24,6 +24,8 @@ static const uint32_t CTAR_ADC =
 static const uint32_t MCR_RUN =
     SPI_MCR_MSTR | SPI_MCR_PCSIS(0x1F);   // master, FIFOs enabled, hardware PCS unused
 
+static void reassertMiso();   // defined with the ADC section below
+
 void acquireBus() {
   // CTARs may only be written while the module is halted.
   KINETISK_SPI0.MCR   = MCR_RUN | SPI_MCR_CLR_TXF | SPI_MCR_CLR_RXF | SPI_MCR_HALT;
@@ -31,6 +33,9 @@ void acquireBus() {
   KINETISK_SPI0.CTAR1 = CTAR_ADC;
   KINETISK_SPI0.SR    = 0xFF0F0000;        // clear all w1c status flags
   KINETISK_SPI0.MCR   = MCR_RUN;
+  // Legacy SPI-library calls (Stimjim.readAdc) also re-mux MISO via
+  // SPI.setMISO, invalidating our cached selection — re-assert it.
+  reassertMiso();
 }
 
 // ------------------------------------------------------------ frame helpers
@@ -107,6 +112,12 @@ void adcSetMiso(uint8_t ch) {
     CORE_PIN8_CONFIG  = PORT_PCR_MUX(2);
   }
   misoCh = ch;
+}
+
+static void reassertMiso() {
+  uint8_t ch = (misoCh == 0xFF) ? 0 : misoCh;
+  misoCh = 0xFF;      // force adcSetMiso to rewrite both PORT muxes
+  adcSetMiso(ch);
 }
 
 void adcSelectLine(uint8_t ch, uint8_t line) {

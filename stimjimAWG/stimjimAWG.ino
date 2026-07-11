@@ -47,6 +47,18 @@ void setup() {
   Engine::begin();           // reserve 2 PIT channels + K_RELOAD self-calibration
   TrainStore::begin();
   Triggers::begin();
+
+  // Restore the EEPROM v2 image (slots 0-9 + trigger table) if magic/version/
+  // CRC check out; edge-ISR wiring on the restored routes arrives in Phase 8.
+  TriggerRoute trig[2];
+  if (TrainStore::eepromRestore(trig)) {
+    Triggers::setRoute(0, trig[0]);
+    Triggers::setRoute(1, trig[1]);
+    Serial.println("# EEPROM: restored slots 0-9 and the trigger table");
+  } else {
+    Serial.println("# EEPROM: no valid image — using boot defaults");
+  }
+
   Measure::begin();
   SdLog::begin();
   UiInput::begin();

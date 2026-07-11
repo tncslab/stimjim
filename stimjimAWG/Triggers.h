@@ -14,6 +14,9 @@ void begin();   // boot default: both inputs mode 3 (output marker) — legacy s
 void poll();    // print deferred WARNs (trigRejectCount) from loop context
 
 const TriggerRoute& route(uint8_t input);
+// Store a routing entry (EEPROM restore / future TRIG command). Phase 2 only
+// updates the table; the edge-ISR (re)wiring on top of it arrives in Phase 8.
+void setRoute(uint8_t input, const TriggerRoute& r);
 uint32_t rejectCount();
 
 } // namespace Triggers

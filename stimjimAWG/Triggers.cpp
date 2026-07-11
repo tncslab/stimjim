@@ -16,7 +16,8 @@ void begin() {
 
 void poll() {}
 
-const TriggerRoute& route(uint8_t input) { return routes[input]; }
-uint32_t rejectCount()                   { return rejects; }
+const TriggerRoute& route(uint8_t input)          { return routes[input]; }
+void setRoute(uint8_t input, const TriggerRoute& r) { routes[input] = r; }
+uint32_t rejectCount()                            { return rejects; }
 
 } // namespace Triggers

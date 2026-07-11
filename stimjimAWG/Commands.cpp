@@ -1,10 +1,14 @@
-//    stimjimAWG — command handlers. Phase 1: IDN/HELP/STAT + the BENCH group;
-//    legacy waveform commands are stubbed until Phase 2/3. GPL-3.0-or-later.
+//    stimjimAWG — command handlers. Phase 2: S/L/W with atomic staging, `?`
+//    queries + round-trip serializers, byte-exact M/V/A/E (BIST contract),
+//    B/C/D/P, ENV/MEAS, DUMP; plus the Phase-1 BENCH group. T/U arrive in
+//    Phase 3, TRIG/R setters in Phase 8, LOG in Phase 7. GPL-3.0-or-later.
 
 #include "Protocol.h"
 #include "Config.h"
 #include "FastIO.h"
 #include "Engine.h"
+#include "TrainStore.h"
+#include "Triggers.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,6 +19,7 @@ namespace Commands {
 
 // Parse up to `maxN` comma-separated integers after the command word.
 // Accepts an optional leading comma before each value. Returns count parsed.
+// (Lenient variant used by BENCH; the protocol handlers use parseFields.)
 static uint8_t parseLongs(const char* p, long* out, uint8_t maxN) {
   uint8_t n = 0;
   while (n < maxN) {
@@ -27,6 +32,27 @@ static uint8_t parseLongs(const char* p, long* out, uint8_t maxN) {
     p = end;
   }
   return n;
+}
+
+// Strict comma-separated integer list: returns the field count (0..maxN),
+// or -1 on malformed input, trailing garbage, or more than maxN fields —
+// the fail-loudly counterpart of the legacy sscanf handlers.
+static int8_t parseFields(const char* p, long* out, int8_t maxN) {
+  int8_t n = 0;
+  while (*p == ' ') p++;
+  if (!*p) return 0;
+  for (;;) {
+    char* end;
+    long v = strtol(p, &end, 10);
+    if (end == p || n == maxN) return -1;
+    out[n++] = v;
+    p = end;
+    while (*p == ' ') p++;
+    if (!*p) return n;
+    if (*p != ',') return -1;
+    p++;
+    while (*p == ' ') p++;
+  }
 }
 
 static inline uint32_t cycToNs(uint32_t cyc) {          // 1 cycle = 25/3 ns
@@ -68,8 +94,400 @@ static void spinUntil(uint64_t deadlineCyc) {
   while ((int64_t)(FastIO::cycles64() - deadlineCyc) < 0) ;
 }
 
-static void ok()                              { Serial.println("OK"); }
-static void err(const char* cmd, const char* msg) { Serial.printf("ERR %s: %s\n", cmd, msg); }
+static void ok()                                   { Serial.println("OK"); }
+static void err(const char* cmd, const char* msg)  { Serial.printf("ERR %s: %s\n", cmd, msg); }
+static void warn(const char* cmd, const char* msg) { Serial.printf("WARN %s: %s\n", cmd, msg); }
+
+// Last mode commanded per channel (`M` shadow state, protocol §3). Boot state
+// is grounded: Stimjim.begin() ends inside getCurrentOffsets with
+// setOutputMode(ch,3) == command mode 5.
+static uint8_t modeShadow[2] = {5, 5};
+
+// -------------------------------------------------- S / L / W (slots 0-99)
+
+static void dumpSlot(uint8_t idx) {
+  const TrainDef& t = TrainStore::slotConst(idx);
+  static const char* modeStr[6] = {
+    "Voltage output", "Current output",
+    "Voltage output (no measurement)", "Current output (no measurement)",
+    "No output (high-Z)", "No output (grounded)"
+  };
+  static const char* typeStr[3] = {"piecewise-constant (S)", "piecewise-ramp (L)", "sine (W)"};
+
+  Serial.println("----------------------------------");
+  Serial.printf("Parameters for PulseTrain[%u] — %s\r\n", idx, typeStr[t.type]);
+  Serial.printf("  mode[ch0]: %u (%s)\r\n  mode[ch1]: %u (%s)\r\n",
+                t.mode0, modeStr[t.mode0], t.mode1, modeStr[t.mode1]);
+  Serial.printf("  period:    %lu usec (%0.3f sec, %0.3f Hz)\r\n",
+                (unsigned long)t.period_us, 0.000001 * t.period_us, 1000000.0 / t.period_us);
+  Serial.printf("  duration:  %lu usec (%0.3f sec)\r\n",
+                (unsigned long)t.duration_us, 0.000001 * t.duration_us);
+  const char* u0 = (t.mode0 == 0 || t.mode0 == 2) ? "mV" : "uA";
+  const char* u1 = (t.mode1 == 0 || t.mode1 == 2) ? "mV" : "uA";
+  if (t.type == SINE) {
+    char f0[16], f1[16], p0[16], p1[16];
+    TrainStore::milliToStr(t.sine.freq0_mHz, f0);
+    TrainStore::milliToStr(t.sine.freq1_mHz, f1);
+    TrainStore::milliToStr(t.sine.phase0_mdeg, p0);
+    TrainStore::milliToStr(t.sine.phase1_mdeg, p1);
+    Serial.printf("  burst:     %lu usec per period\r\n", (unsigned long)t.sine.burst_us);
+    Serial.printf("  amplitude: %ld%s, %ld%s\r\n", (long)t.sine.amp0, u0, (long)t.sine.amp1, u1);
+    Serial.printf("  frequency: %sHz, %sHz\r\n", f0, f1);
+    Serial.printf("  phase:     %sdeg, %sdeg\r\n", p0, p1);
+  } else {
+    Serial.println("\r\n  stage    duration     output0   output1");
+    for (uint8_t j = 0; j < t.nStages; j++)
+      Serial.printf("   %2u  %7lu usec %8ld%s %8ld%s\r\n", j,
+                    (unsigned long)t.stages[j].dur_us,
+                    (long)t.stages[j].a0, u0, (long)t.stages[j].a1, u1);
+    if (t.nStages == 0)
+      Serial.println("   (no stages)");
+  }
+  Serial.printf("  env:  rampIn %lu usec, rampOut %lu usec, shape %u\r\n",
+                (unsigned long)t.env.rampIn_us, (unsigned long)t.env.rampOut_us, t.env.shape);
+  Serial.printf("  meas: what0 %u, what1 %u, when %u, report %u\r\n",
+                t.meas.what0, t.meas.what1, t.meas.when, t.meas.report);
+  Serial.println("----------------------------------");
+  ok();
+}
+
+// Parse "<idx>" and classify what follows: query dump (end), canonical query
+// ('?'), or set (','). Returns false after printing an ERR.
+static bool parseSlotIdx(const char* cmd, const char*& p, uint8_t& idx) {
+  char* end;
+  long v = strtol(p, &end, 10);
+  if (end == p) { err(cmd, "need a slot index 0-99"); return false; }
+  if (v < 0 || v >= SJ_NUM_SLOTS) { err(cmd, "slot index out of range 0-99"); return false; }
+  idx = (uint8_t)v;
+  p = end;
+  while (*p == ' ') p++;
+  return true;
+}
+
+static void handleTrain(char letter, const char* args) {
+  const char cmd[2] = {letter, '\0'};
+  const char* p = args;
+  uint8_t idx;
+  if (!parseSlotIdx(cmd, p, idx)) return;
+
+  if (*p == '\0') { dumpSlot(idx); return; }                 // bare S<idx> — legacy dump
+  if (*p == '?') {                                           // canonical one-line form,
+    char line[SJ_SERIALIZE_MAX];                             // letter matches actual type
+    TrainStore::serializeTrain(idx, TrainStore::slotConst(idx), line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  if (*p != ',') { err(cmd, "expected ',' , '?' or end of line after the index"); return; }
+
+  if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
+    err(cmd, "slot is attached to a running train — stop first (T-1 / U-1)");
+    return;
+  }
+
+  TrainDef staged;
+  char errbuf[SJ_MSG_MAX], warnbuf[SJ_MSG_MAX];
+  if (!TrainStore::parseTrainBody(letter, p, TrainStore::slotConst(idx), staged,
+                                  errbuf, sizeof errbuf, warnbuf, sizeof warnbuf)) {
+    err(cmd, errbuf);   // slot untouched — atomic staging
+    return;
+  }
+  if (warnbuf[0]) warn(cmd, warnbuf);
+  TrainStore::commit(idx, staged);
+
+  char line[SJ_SERIALIZE_MAX];
+  TrainStore::serializeTrain(idx, staged, line, sizeof line);
+  Serial.println(line);   // echo the canonical round-trip line of what was stored
+}
+
+// ------------------------------------------------------------- ENV / MEAS
+
+static void handleEnv(const char* args) {
+  const char* p = args;
+  uint8_t idx;
+  if (!parseSlotIdx("ENV", p, idx)) return;
+
+  char line[64];
+  if (*p == '?') {
+    TrainStore::serializeEnv(idx, TrainStore::slotConst(idx).env, line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  if (*p != ',') { err("ENV", "need ENV<idx>,<rampIn_us>,<rampOut_us>[,<shape>] or ENV<idx>?"); return; }
+
+  long v[3];
+  int8_t n = parseFields(p + 1, v, 3);
+  if (n < 2) { err("ENV", "need <rampIn_us>,<rampOut_us>[,<shape>]"); return; }
+  if (v[0] < 0 || v[1] < 0 || (n == 3 && v[2] < 0)) { err("ENV", "fields must be non-negative"); return; }
+
+  if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
+    err("ENV", "slot is attached to a running train — stop first (T-1 / U-1)");
+    return;
+  }
+
+  EnvDef e;
+  e.rampIn_us  = (uint32_t)v[0];
+  e.rampOut_us = (uint32_t)v[1];
+  e.shape      = (n == 3) ? (uint8_t)v[2] : 0;
+  const char* msg = TrainStore::validateEnv(TrainStore::slotConst(idx), e);
+  if (msg) { err("ENV", msg); return; }
+
+  TrainDef staged = TrainStore::slotConst(idx);
+  staged.env = e;
+  TrainStore::commit(idx, staged);
+  TrainStore::serializeEnv(idx, e, line, sizeof line);
+  Serial.println(line);
+}
+
+static void handleMeas(const char* args) {
+  const char* p = args;
+  uint8_t idx;
+  if (!parseSlotIdx("MEAS", p, idx)) return;
+
+  char line[64];
+  if (*p == '?') {
+    TrainStore::serializeMeas(idx, TrainStore::slotConst(idx).meas, line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  if (*p != ',') { err("MEAS", "need MEAS<idx>,<what0>,<what1>,<when>[,<report>] or MEAS<idx>?"); return; }
+
+  long v[4];
+  int8_t n = parseFields(p + 1, v, 4);
+  if (n < 3) { err("MEAS", "need <what0>,<what1>,<when>[,<report>]"); return; }
+  if (v[0] < 0 || v[1] < 0 || v[2] < 0 || (n == 4 && v[3] < 0)) { err("MEAS", "fields must be non-negative"); return; }
+
+  if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
+    err("MEAS", "slot is attached to a running train — stop first (T-1 / U-1)");
+    return;
+  }
+
+  MeasDef m;
+  m.what0  = (uint8_t)v[0];
+  m.what1  = (uint8_t)v[1];
+  m.when   = (uint8_t)v[2];
+  m.report = (n == 4) ? (uint8_t)v[3] : 0;
+  char warnbuf[SJ_MSG_MAX];
+  const char* msg = TrainStore::validateMeas(TrainStore::slotConst(idx), m, warnbuf, sizeof warnbuf);
+  if (msg) { err("MEAS", msg); return; }
+  if (warnbuf[0]) warn("MEAS", warnbuf);
+
+  TrainDef staged = TrainStore::slotConst(idx);
+  staged.meas = m;
+  TrainStore::commit(idx, staged);
+  TrainStore::serializeMeas(idx, m, line, sizeof line);
+  Serial.println(line);
+}
+
+// ------------------------------- M / V / A / E (byte-exact replies — BIST)
+
+static void handleM(const char* args) {
+  // query form: M<ch>? returns the shadow state as a canonical set-line
+  const char* p = args;
+  char* end;
+  long ch = strtol(p, &end, 10);
+  if (end != p) {
+    const char* q = end;
+    while (*q == ' ') q++;
+    if (*q == '?') {
+      if (ch < 0 || ch > 1) { err("M", "channel must be 0 or 1"); return; }
+      Serial.printf("M%ld,%u\n", ch, modeShadow[ch]);
+      return;
+    }
+  }
+
+  long v[2];
+  if (parseFields(args, v, 2) != 2) { err("M", "need <ch>,<mode>"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("M", "channel must be 0 or 1"); return; }
+  if (v[1] < 0 || v[1] > 5) { err("M", "mode must be 0-5"); return; }
+
+  // Map command mode (0-5) onto the OE-decoder mode (0-3: voltage, current,
+  // hi-Z, ground). The legacy firmware passed the command mode through raw,
+  // so M2/M3 actually produced hi-Z/ground and M4/M5 connected the voltage/
+  // current source(!) — documented correction, see protocol §6.
+  uint8_t libMode = (v[1] < 4) ? (uint8_t)(v[1] & 1) : (uint8_t)(v[1] - 2);
+  Stimjim.setOutputMode((byte)v[0], libMode);   // two GPIO writes — ISR-safe, no bus lock needed
+  modeShadow[v[0]] = (uint8_t)v[1];
+
+  Serial.print("Set channel "); Serial.print((int)v[0]);
+  Serial.print(" to mode ");    Serial.println((int)v[1]);
+}
+
+static void handleV(const char* args) {
+  long v[2];
+  if (parseFields(args, v, 2) != 2) { err("V", "need <ch>,<mV>"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("V", "channel must be 0 or 1"); return; }
+  if (Engine::anyActive()) warn("V", "train running — executing under bus lock");
+
+  int channel = (int)v[0], amp = (int)v[1];
+  int dacVal = 1.0 * amp / MILLIVOLTS_PER_DAC + Stimjim.voltageOffsets[channel];   // legacy float math
+  if (dacVal <= 32767 && dacVal >= -32768) {
+    FastIO::busLock();
+    Stimjim.writeToDac((byte)channel, (int16_t)dacVal);
+    FastIO::acquireBus();          // legacy SPI transaction clobbered the CTARs
+    FastIO::busUnlock();
+    Serial.print("Set channel "); Serial.print(channel);
+    Serial.print(" to amplitude "); Serial.print(amp);
+    Serial.print(" mV (dac value "); Serial.print(dacVal); Serial.println(").");
+  } else {
+    Serial.print(dacVal); Serial.println(" is out of range.");
+  }
+}
+
+static void handleA(const char* args) {
+  long v[2];
+  if (parseFields(args, v, 2) != 2) { err("A", "need <ch>,<dac>"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("A", "channel must be 0 or 1"); return; }
+  if (Engine::anyActive()) warn("A", "train running — executing under bus lock");
+
+  int channel = (int)v[0];
+  long amp = v[1];
+  if (amp <= 32767 && amp >= -32768) {
+    FastIO::busLock();
+    Stimjim.writeToDac((byte)channel, (int16_t)amp);
+    FastIO::acquireBus();
+    FastIO::busUnlock();
+    Serial.print("Set channel "); Serial.print(channel);
+    Serial.print(" to amplitude "); Serial.println((int)amp);
+  } else {
+    Serial.print((int)amp); Serial.println(" is out of range.");
+  }
+}
+
+static void handleE(const char* args) {
+  long v[2];
+  if (parseFields(args, v, 2) != 2) { err("E", "need <ch>,<line>"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("E", "channel must be 0 or 1"); return; }
+  if (v[1] < 0 || v[1] > 1) { err("E", "line must be 0 (voltage) or 1 (current)"); return; }
+  if (Engine::anyActive()) warn("E", "train running — executing under bus lock");
+
+  int channel = (int)v[0], line = (int)v[1];
+  FastIO::busLock();
+  int val = Stimjim.readAdc((byte)channel, (byte)line);
+  FastIO::acquireBus();
+  FastIO::busUnlock();
+  // identical expression to the legacy handler: float math, truncation to int
+  int valRealUnits = (val - Stimjim.adcOffset10[channel]) * (line ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
+  Serial.print("Read value: "); Serial.print(val);
+  Serial.print(" (");            Serial.print(valRealUnits);
+  Serial.println(line ? "uA)" : "mV)");
+}
+
+// -------------------------------------------------- B / C / D / P (offsets)
+
+static void handleB() {
+  if (Engine::anyActive()) { err("B", "calibration needs an idle engine — stop trains first"); return; }
+  Stimjim.getAdcOffsets();         // grounds the outputs, ~2000 ADC reads
+  FastIO::acquireBus();
+  modeShadow[0] = modeShadow[1] = 5;
+  ok();                            // legacy printed nothing — see protocol §6
+}
+
+static void handleC() {
+  if (Engine::anyActive()) { err("C", "calibration needs an idle engine — stop trains first"); return; }
+  warn("C", "output will ramp");   // getVoltageOffsets sweeps a DAC ramp on the outputs
+  Stimjim.getCurrentOffsets();
+  Stimjim.getVoltageOffsets();
+  FastIO::acquireBus();
+  modeShadow[0] = modeShadow[1] = 5;
+  ok();
+}
+
+static void handleD(const char* args) {
+  while (*args == ' ') args++;
+  if (*args == '?') {              // machine CSV (protocol §3)
+    Serial.printf("D,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d\n",
+                  Stimjim.adcOffset25[0], Stimjim.adcOffset25[1],
+                  Stimjim.adcOffset10[0], Stimjim.adcOffset10[1],
+                  Stimjim.currentOffsets[0], Stimjim.currentOffsets[1],
+                  Stimjim.voltageOffsets[0], Stimjim.voltageOffsets[1]);
+    return;
+  }
+  // legacy human dump, byte-identical text + trailing blank line, then OK
+  char str[240];
+  sprintf(str, "ADC offsets (+-2.5V): %f, %f\r\nADC offsets (+-10V): %f, %f\r\ncurrent offsets: %d, %d\r\nvoltage offsets: %d, %d\r\n",
+          Stimjim.adcOffset25[0], Stimjim.adcOffset25[1],
+          Stimjim.adcOffset10[0], Stimjim.adcOffset10[1],
+          Stimjim.currentOffsets[0], Stimjim.currentOffsets[1],
+          Stimjim.voltageOffsets[0], Stimjim.voltageOffsets[1]);
+  Serial.println(str);
+  ok();
+}
+
+static void handleP() {
+  TriggerRoute trig[2] = {Triggers::route(0), Triggers::route(1)};
+  TrainStore::eepromSave(trig);
+  Serial.println("First 10 slot definitions and the trigger table saved to EEPROM.");
+}
+
+// ------------------------------------------------- TRIG / R (queries only)
+
+static void serializeTrig(uint8_t t, char* buf, size_t n) {
+  const TriggerRoute& r = Triggers::route(t);
+  snprintf(buf, n, "TRIG%u,%u,%d,%d,%u", t, r.mode, r.slot0, r.slot1, r.edge);
+}
+
+static void handleTrig(const char* args) {
+  const char* p = args;
+  char* end;
+  long t = strtol(p, &end, 10);
+  if (end == p || t < 0 || t > 1) { err("TRIG", "need trigger input 0 or 1"); return; }
+  p = end;
+  while (*p == ' ') p++;
+  if (*p == '?') {
+    char line[48];
+    serializeTrig((uint8_t)t, line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  err("TRIG", "setter not implemented yet (Phase 8) — query with TRIG<t>?");
+}
+
+static void handleR(const char* args) {
+  const char* p = args;
+  char* end;
+  long t = strtol(p, &end, 10);
+  if (end != p) {
+    const char* q = end;
+    while (*q == ' ') q++;
+    if (*q == '?' && t >= 0 && t <= 1) {
+      // legacy view of the TRIG table: R<t>,<slot>,<outputFlag>
+      const TriggerRoute& r = Triggers::route((uint8_t)t);
+      Serial.printf("R%ld,%d,%d\n", t, (r.mode == 1) ? r.slot0 : -1, (r.mode == 3) ? 1 : 0);
+      return;
+    }
+  }
+  err("R", "setter not implemented yet (Phase 8) — query with R<t>?");
+}
+
+// --------------------------------------------------------------------- DUMP
+
+static void handleDump() {
+  Serial.printf("# %s fw=%s proto=%d session dump — paste back to restore\n",
+                SJ_FW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);
+  char line[SJ_SERIALIZE_MAX];
+  for (uint8_t idx = 0; idx < SJ_NUM_SLOTS; idx++) {
+    const TrainDef& t = TrainStore::slotConst(idx);
+    if (!TrainStore::isDefaultTrain(t)) {
+      TrainStore::serializeTrain(idx, t, line, sizeof line);
+      Serial.println(line);
+    }
+    // a W line already carries its envelope; S/L need a separate ENV line
+    if (t.type != SINE && !TrainStore::isDefaultEnv(t.env)) {
+      TrainStore::serializeEnv(idx, t.env, line, sizeof line);
+      Serial.println(line);
+    }
+    if (!TrainStore::isDefaultMeas(t)) {
+      TrainStore::serializeMeas(idx, t.meas, line, sizeof line);
+      Serial.println(line);
+    }
+  }
+  // commented until the TRIG setter exists (Phase 8) so paste-back stays clean
+  for (uint8_t t = 0; t < 2; t++) {
+    serializeTrig(t, line, sizeof line);
+    Serial.printf("# %s\n", line);
+  }
+  ok();
+}
 
 // -------------------------------------------------------------------- BENCH
 
@@ -227,13 +645,21 @@ static void benchDispatch(const char* sub, const char* args) {
 // --------------------------------------------------------------------- HELP
 
 static void help() {
-  Serial.println("# stimjimAWG Phase 1 scaffold — implemented commands:");
-  Serial.println("#   IDN            firmware identification line");
-  Serial.println("#   STAT           engine status (both engines idle in Phase 1)");
-  Serial.println("#   BENCH?         list hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("#   HELP or ?      this text");
-  Serial.println("# Legacy commands (S/L/W/T/U/R/M/V/A/E/B/C/D/P) and ENV/MEAS/TRIG/DUMP/LOG");
-  Serial.println("# arrive in Phase 2+ — see docs/serial-protocol.md. Until then use stimjimPulser.");
+  Serial.println("# stimjimAWG commands (Phase 2) — details: docs/serial-protocol.md");
+  Serial.println("#   S<i>,m0,m1,per,dur;a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
+  Serial.println("#   L<i>,...                        same syntax, linear ramps (0-dur stage = jump)");
+  Serial.println("#   W<i>,m0,m1,per,dur;amp;freq;phase[;env]  sine train (triplets, decimals in Hz ok)");
+  Serial.println("#   S<i> / L<i> / W<i>              human parameter dump; append ? for the canonical line");
+  Serial.println("#   ENV<i>,in,out[,shape]           amplitude envelope; ENV<i>?");
+  Serial.println("#   MEAS<i>,w0,w1,when[,rep]        measurement config; MEAS<i>?");
+  Serial.println("#   M<ch>,<mode>  V<ch>,<mV>  A<ch>,<dac>  E<ch>,<line>   immediate (legacy replies)");
+  Serial.println("#   B / C                           recalibrate ADC / current+voltage offsets");
+  Serial.println("#   D / D?                          print offsets (human / CSV)");
+  Serial.println("#   P                               save slots 0-9 + triggers to EEPROM");
+  Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
+  Serial.println("#   TRIG<t>? / R<t>?                trigger routing queries (setters in Phase 8)");
+  Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
+  Serial.println("# Not yet available: T/U start-stop (Phase 3), TRIG/R setters (Phase 8), LOG (Phase 7)");
   ok();
 }
 
@@ -248,15 +674,24 @@ void handleLine(const char* line) {
   const char* args = line + wl;
 
   if (wl == 1) {
-    // Single-letter namespace = legacy + `L`; all deferred to Phase 2/3.
-    static const char known[] = "SLWTURMVAEBCDP";
-    if (strchr(known, line[0])) {
-      Serial.printf("ERR %c: not implemented in Phase 1 scaffold (Phase 2+); "
-                    "BENCH/IDN/HELP available\n", line[0]);
-    } else {
-      Serial.printf("ERR %c: unknown command\n", line[0]);
+    switch (line[0]) {
+      case 'S': case 'L': case 'W': handleTrain(line[0], args); return;
+      case 'M': handleM(args); return;
+      case 'V': handleV(args); return;
+      case 'A': handleA(args); return;
+      case 'E': handleE(args); return;
+      case 'B': handleB(); return;
+      case 'C': handleC(); return;
+      case 'D': handleD(args); return;
+      case 'P': handleP(); return;
+      case 'R': handleR(args); return;
+      case 'T': case 'U':
+        Serial.printf("ERR %c: train start/stop arrives in Phase 3\n", line[0]);
+        return;
+      default:
+        Serial.printf("ERR %c: unknown command\n", line[0]);
+        return;
     }
-    return;
   }
 
   char word[16];
@@ -270,7 +705,19 @@ void handleLine(const char* line) {
   } else if (!strcmp(word, "HELP")) {
     help();
   } else if (!strcmp(word, "STAT")) {
-    Serial.println("STAT,-1,0,0,0,-1,0,0,0");   // both engines idle (Phase 1)
+    // idle engines until Phase 3: slot -1, zeros (protocol §4)
+    Serial.printf("STAT,%d,0,0,0,%d,0,0,0\n",
+                  Engine::activeSlot(0), Engine::activeSlot(1));
+  } else if (!strcmp(word, "ENV")) {
+    handleEnv(args);
+  } else if (!strcmp(word, "MEAS")) {
+    handleMeas(args);
+  } else if (!strcmp(word, "TRIG")) {
+    handleTrig(args);
+  } else if (!strcmp(word, "DUMP")) {
+    handleDump();
+  } else if (!strcmp(word, "LOG")) {
+    err("LOG", "SD logging arrives in Phase 7");
   } else if (!strncmp(word, "BENCH", 5)) {
     const char* sub = word + 5;
     // allow "BENCH?" — the '?' lands in args, sub is empty
