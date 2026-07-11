@@ -202,7 +202,7 @@ likewise within stages (Bresenham makes sample N exact on the boundary) and acro
 (b) *timebase* = 64-bit `cycles64()` (8.33 ns, exact ×120 µs↔cycles, wraps in ~4900 years; the
 35.8 s hardware CYCCNT wrap is bridged by the loop()+`MAX_SLICE` keep-alive). (c) *integer vs
 float*: event times and sine phase are integer-only (FP32's 24-bit mantissa can't represent
->0.14 s of cycles; FP64 is software-emulated on the M4F — banned from ISRs); amplitudes are
+*>0.14 s* of cycles; FP64 is software-emulated on the M4F — banned from ISRs); amplitudes are
 integer Q15 multiplies on offset-relative deltas; the envelope's single division becomes an
 arm-time FP32 reciprocal → one hardware-FPU multiply per event (~20 cycles incl. lazy stacking,
 error ≪ 1 Q15 LSB). Arm-time (loop-context) coefficient math may use double. (d) *sine* (Phase 5
@@ -260,3 +260,9 @@ not synchronized; same-slot dual-channel `W` via one engine is).
 collision-jitter benchmark between two independent players, publish the measured FsMax table into
 `Config.h` with ~30 % margin. The long-owed hardware bench session (Phases 1/3/4/5 acceptance)
 should precede or accompany it.
+
+**User request:** Some parts of the code are optimized for Teensy 3.5, e.g., KINETISK_SPI0 in
+`FastIO.cpp`, however OpenEPhys plans to update hardware and use Teensy 4 (due to older version
+being out of stock). Implement an alternative route (#ifdef) with standard Arduino for those
+hardware verions. Check for similar cases in other source files, and indicate if these need
+recalibratin of measured timing constants.
