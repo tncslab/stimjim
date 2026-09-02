@@ -1,4 +1,10 @@
-"""Minimal ctypes binding for the PicoScope 2000a driver (PicoScope 2204A).
+"""Minimal ctypes binding for the PicoScope 2000a driver.
+
+NOT for the 2204A on this bench -- that model enumerates as VID_0CE9 PID_1007
+and is served by the legacy `ps2000` driver, so use pico2000.py. This module is
+here for the 2000a-series models (2205 MSO, 2206/2207/2208 and their A/B
+variants), whose API differs: PICO_STATUS returns, an explicit handle, and
+per-channel data buffers.
 
 Only what block-mode capture needs. The driver DLL ships with the PicoScope 7
 application, so nothing has to be installed: no picosdk package, no C SDK.

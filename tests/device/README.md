@@ -9,7 +9,8 @@ there is nothing else to install.
 |---|---|
 | `sjcon.py` | Serial console. Library (`StimJim.cmd`, `.cmd1`, `.reset`) and a CLI: `python sjcon.py COM4 IDN "S0?" DUMP` |
 | `smoke.py` | Serial-only regression run: identity, backward compatibility, the post-trigger delay set both ways, rejection paths, completion reporting, and an OLED capture in each of the three views |
-| `pico2000.py` | ctypes binding for the legacy `ps2000` driver (the PicoScope 2204A needs it, not `ps2000a`). Run it directly to probe the scope |
+| `pico2000.py` | ctypes binding for the legacy `ps2000` driver, which is what the PicoScope 2204A needs. Run it directly to probe the scope |
+| `pico2000a.py` | the same for the newer `ps2000a` driver. Unused on this bench; kept for 2000a-series models |
 | `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
 
 ```
