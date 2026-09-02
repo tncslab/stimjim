@@ -30,6 +30,7 @@ void slotDefault(TrainDef& t) {
   t.mode1       = 3;
   t.period_us   = 10000;
   t.duration_us = 500000;
+  t.delay_us    = 0;          // fire immediately on the start request
   t.nStages     = 0;
   t.meas.what0  = 3;          // both V and I
   t.meas.what1  = 3;
@@ -51,7 +52,8 @@ uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 
 bool isDefaultTrain(const TrainDef& t) {
   return t.type == PIECEWISE_HOLD && t.mode0 == 3 && t.mode1 == 3 &&
-         t.period_us == 10000 && t.duration_us == 500000 && t.nStages == 0;
+         t.period_us == 10000 && t.duration_us == 500000 &&
+         t.delay_us == 0 && t.nStages == 0;
 }
 bool isDefaultEnv(const EnvDef& e) {
   return e.rampIn_us == 0 && e.rampOut_us == 0 && e.shape == 0;
@@ -202,6 +204,23 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
   if (period == 0) { setMsg(err, errsz, "period_us must be > 0"); return false; }
   staged.period_us   = (uint32_t)period;
   staged.duration_us = (uint32_t)duration;
+
+  // ---- optional 6th header field: post-trigger delay (protocol §2).
+  // A legacy line ends the header here (next character is ';' or end of line),
+  // so a ',' at this point can only be the new field — the syntax extension is
+  // unambiguous. Like the W envelope triplet, omitting it *resets* the delay
+  // to 0: an S/L/W line always fully defines its own header, so replaying an
+  // old script reproduces the old behaviour exactly.
+  p = sksp(p);
+  if (*p == ',') {
+    p++;
+    unsigned long delay;
+    if (!scanULong(p, delay)) { setMsg(err, errsz, "bad delay_us"); return false; }
+    if (delay > SJ_MAX_DELAY_US) { setMsg(err, errsz, "delay_us exceeds 2000000000 us (2000 s)"); return false; }
+    staged.delay_us = (uint32_t)delay;
+  } else {
+    staged.delay_us = 0;
+  }
 
   if (staged.type != SINE) {
     // ---- S/L stage triplets: ;a0,a1,dur_us  (0-10 of them; 0 = legacy "empty train")
@@ -378,6 +397,11 @@ void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n) {
   size_t o = snprintf(buf, n, "%c%u,%u,%u,%lu,%lu", letter, idx,
                       modeOut(t.mode0, t.meas.what0), modeOut(t.mode1, t.meas.what1),
                       (unsigned long)t.period_us, (unsigned long)t.duration_us);
+  // The optional delay field is emitted only when it is set, so a slot that
+  // uses no delay still serializes to a line an older firmware would accept.
+  // Round-trip stays exact: an absent field parses back as 0.
+  if (t.delay_us)
+    o += snprintf(buf + o, n - o, ",%lu", (unsigned long)t.delay_us);
   if (t.type == SINE) {
     char f0[16], f1[16], p0[16], p1[16];
     milliToStr(t.sine.freq0_mHz, f0);
@@ -398,6 +422,10 @@ void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n) {
   }
 }
 
+void serializeDelay(uint8_t idx, uint32_t delay_us, char* buf, size_t n) {
+  snprintf(buf, n, "DELAY%u,%lu", idx, (unsigned long)delay_us);
+}
+
 void serializeEnv(uint8_t idx, const EnvDef& e, char* buf, size_t n) {
   snprintf(buf, n, "ENV%u,%lu,%lu,%u", idx,
            (unsigned long)e.rampIn_us, (unsigned long)e.rampOut_us, e.shape);
@@ -410,7 +438,13 @@ void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n) {
 // --------------------------------------------------------------------- EEPROM
 
 #ifdef ARDUINO
-static_assert(sizeof(EepromImage) <= 4096, "EepromImage exceeds Teensy 3.5 EEPROM");
+// EEPROM.put() beyond E2END is a silent no-op in the Teensy core, so an image
+// that does not fit would "save" and then restore as garbage. Catch it at
+// compile time on whatever board is selected: 4096 B on Teensy 3.5 and 4.1,
+// but only 1080 B on a Teensy 4.0, which cannot hold ten slots.
+static_assert(sizeof(EepromImage) <= (size_t)E2END + 1,
+              "EepromImage exceeds this board's EEPROM — rebuild with a smaller "
+              "-DSJ_EEPROM_SLOTS (a Teensy 4.0 fits about 6)");
 
 // CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over everything after the
 // header's crc field, i.e. slots + trig (WaveformDef.h contract).

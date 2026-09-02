@@ -1,5 +1,5 @@
-//    stimjimAWG — SampleGen implementation. Phase 4: ramp Bresenham +
-//    envelope; Phase 5: sine table + phase-accumulator coefficients.
+//    stimjimAWG — SampleGen implementation: ramp Bresenham, envelope, sine
+//    table and phase-accumulator coefficients.
 //    Pure math, host-testable. GPL-3.0-or-later; see Config.h header.
 
 #include "SampleGen.h"

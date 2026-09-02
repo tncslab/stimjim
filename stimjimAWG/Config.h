@@ -1,8 +1,8 @@
 //    stimjimAWG (c) 2026- TNCS, Dept of Comp Sci, HUN-REN Wigner RCP, Hungary
 //
-//    Arbitrary-waveform-generator firmware for the StimJim board (Teensy 3.5).
+//    Arbitrary-waveform-generator firmware for the StimJim board.
 //    Design documents: docs/awg-implementation-plan.md, docs/serial-protocol.md,
-//    docs/hardware-notes.md.
+//    docs/hardware-notes.md, docs/hardware-variants.md.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -23,28 +23,86 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.5.0"        // Phase 5: sine playback
+#define SJ_FW_VERSION    "0.6.0"
 #define SJ_PROTO_VERSION 1
-#define SJ_HW_NAME       "Teensy3.5"
+
+// ---------------------------------------------------------- hardware variant
+//
+// Teensy 3.5/3.6 (Kinetis K64/K66) run the register-level fast path the whole
+// timing design was calibrated on: SPI0 driven through its DSPI registers and
+// two PIT channels whose vectors we take over one by one.
+//
+// Every other target -- notably the Teensy 4.x boards open-ephys is moving to
+// now that the 3.5 is out of stock -- builds a portable route on the standard
+// Arduino SPI library and IntervalTimer. It is functionally identical but
+// slower and less predictable per event, so every timing constant marked
+// RECALIBRATE below must be re-measured on the new board with the BENCH group
+// (docs/serial-protocol.md §4) before the firmware is trusted for stimulation.
+//
+// Why Teensy 4 does not simply reuse the register path: on the i.MX RT1062 all
+// four PIT channels share a single IRQ_PIT vector (Teensyduino 1.62 core,
+// cores/teensy4/IntervalTimer.cpp), so the per-channel attachInterruptVector
+// and per-channel NVIC priority of the Kinetis path have no equivalent. Going
+// through IntervalTimer lets the core's own shared dispatcher do that work.
+// A native LPSPI4 + shared-vector PIT backend is a later optimization.
+#if defined(__MK64FX512__)
+  #define SJ_MCU_KINETISK  1
+  #define SJ_HW_NAME       "Teensy3.5"
+#elif defined(__MK66FX1M0__)
+  #define SJ_MCU_KINETISK  1
+  #define SJ_HW_NAME       "Teensy3.6"
+#elif defined(__IMXRT1062__)
+  #define SJ_MCU_KINETISK  0
+  #define SJ_HW_NAME       "Teensy4.x"
+#else
+  #define SJ_MCU_KINETISK  0
+  #define SJ_HW_NAME       "generic-ARM"
+#endif
+
+// Backend selection. Both default to the MCU family but can be forced from the
+// build (-DSJ_FASTIO_REGISTER=0) to A/B the portable route on a Teensy 3.5 --
+// that is how the portable path's timing constants get measured on known-good
+// hardware instead of guessed.
+#ifndef SJ_FASTIO_REGISTER
+  #define SJ_FASTIO_REGISTER SJ_MCU_KINETISK   // 1 = DSPI registers, 0 = Arduino SPI library
+#endif
+#ifndef SJ_TIMER_REGISTER
+  #define SJ_TIMER_REGISTER  SJ_MCU_KINETISK   // 1 = raw PIT + own vectors, 0 = IntervalTimer
+#endif
+
+// The 64-bit timebase and the bus lock are Cortex-M3/M4/M7 features (DWT cycle
+// counter, BASEPRI). Both Teensy families have them; a target without them
+// needs a different timebase design, not a #define.
+#if !defined(ARM_DWT_CYCCNT)
+  #error "stimjimAWG needs the Cortex-M DWT cycle counter (Teensy 3.x / 4.x)"
+#endif
 
 // ------------------------------------------------------------ feature switches
 #define SJ_USE_DISPLAY   1   // SSD1306 128x32 on Wire @0x3C (geometry below)
-#define SJ_USE_SD        0   // SdLog arrives in Phase 7
+#define SJ_USE_SD        0   // SD logging is not implemented
 
 // ---------------------------------------------------------------- clocking
-// The entire timing design assumes Teensy 3.5 at stock clocks:
-// F_CPU = 120 MHz, F_BUS = 60 MHz  =>  1 us = exactly 120 CPU cycles
-// = exactly 60 PIT ticks. All us<->cycle conversions are exact integers.
-#if F_CPU != 120000000
-#error "stimjimAWG assumes Teensy 3.5 at 120 MHz (Tools > CPU Speed: 120 MHz)"
+// 1 us must be an exact whole number of CPU cycles -- every us<->cycle
+// conversion in the engine is an integer multiply and must not drift.
+// Teensy 3.5 @120 MHz: 120 cycles/us. Teensy 4.x @600 MHz: 600 cycles/us.
+#if (F_CPU % 1000000) != 0
+#error "stimjimAWG needs an integer number of CPU cycles per microsecond"
 #endif
-#if F_BUS != 60000000
-#error "stimjimAWG assumes F_BUS = 60 MHz"
-#endif
-#define SJ_CYC_PER_US    120u   // CPU cycles per microsecond (exact)
-#define SJ_PIT_PER_US    60u    // PIT (F_BUS) ticks per microsecond (exact)
+#define SJ_CYC_PER_US    ((uint32_t)(F_CPU / 1000000u))
 #define SJ_US_TO_CYC(us) ((uint64_t)(us) * SJ_CYC_PER_US)
 #define SJ_CYC_TO_US(cy) ((uint64_t)(cy) / SJ_CYC_PER_US)
+
+#if SJ_TIMER_REGISTER
+// The raw-PIT backend converts CPU cycles to PIT ticks by a shift, which
+// assumes the Kinetis F_BUS = F_CPU/2 relationship (60 MHz at stock clocks).
+#if F_CPU != 120000000
+#error "the Kinetis register backend is calibrated for 120 MHz (Tools > CPU Speed)"
+#endif
+#if F_BUS != 60000000
+#error "the Kinetis register backend assumes F_BUS = F_CPU/2 = 60 MHz"
+#endif
+#define SJ_PIT_PER_US    60u    // PIT (F_BUS) ticks per microsecond (exact)
+#endif
 
 // -------------------------------------------------- NVIC priorities (plan §3.3)
 // Lower value = higher priority. SysTick stays at core default 32;
@@ -53,22 +111,49 @@
 #define SJ_TRIG_PRIO     80   // IN0/IN1 edge ISRs
 
 // ------------------------------------------------- engine knobs (plan §3.1)
-#define SJ_PRELOAD_US        4         // ISR wakes this early, spins on CYCCNT, latches on deadline
-#define SJ_DAC_PROG1_US      3         // budgeted dacProgram cost, single channel (calibrated 2.75 —
-#define SJ_DAC_PROG2_US      5         //   re-measure with BENCHDAC/BENCHDAC2); wake preload adds this
+//
+// RECALIBRATE all of the following whenever the MCU, the clock speed or a
+// backend changes. Procedure, in this order, with nothing else running:
+//   BENCHDAC / BENCHDAC2          -> SJ_DAC_PROG1_US / SJ_DAC_PROG2_US (round up)
+//   BENCHADC / BENCHSW            -> the measurement budget of plan §3.6
+//   BENCHPIT,1000,5000            -> raw ISR wake latency, sizes SJ_PRELOAD_US
+//   BENCHPIT,1000,5000,<preload>  -> residual latch jitter, must stay <200 ns
+//   BENCHK                        -> K_RELOAD spread (self-calibrated at boot anyway)
+// The register-path values are desk estimates for the Teensy 3.5, not measured
+// figures. The portable route pays an extra SPI-library
+// beginTransaction/endTransaction per DAC word and an IntervalTimer
+// end()+begin() per scheduled event, so its budgets are deliberately generous.
+#if SJ_FASTIO_REGISTER
+  #define SJ_DAC_PROG1_US    3   // budgeted dacProgram cost, single channel (calibrated 2.75)
+  #define SJ_DAC_PROG2_US    5   // dacProgramBoth
+#else
+  #define SJ_DAC_PROG1_US    6   // RECALIBRATE: SPI-library transaction overhead included
+  #define SJ_DAC_PROG2_US   11
+#endif
+#if SJ_TIMER_REGISTER
+  #define SJ_PRELOAD_US      4   // ISR wakes this early, spins on CYCCNT, latches on deadline
+#else
+  #define SJ_PRELOAD_US      8   // RECALIBRATE: IntervalTimer re-arm is slower than a raw LDVAL
+#endif
 #define SJ_MIN_SCHEDULE_US   3         // events closer than this are run inline in the same ISR pass
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
 #define SJ_START_LATENCY_US  20        // fixed arm->first-latch latency: trigger latency is deterministic
 #define SJ_TARGET_DT_US      20        // default ramp sample interval (per-train overridable later)
+// SJ_MAX_DELAY_US (per-slot post-trigger delay ceiling) lives in WaveformDef.h:
+// the host-testable parser validates against it and never includes this file.
 
 // Sine sample-rate policy (plan §3.5): Fs = clamp(SAMPLES_PER_CYC * f_max,
 // FS_MIN, FS_MAX), realized as an exact integer number of CPU cycles per
 // sample. FS_MAX is provisional pre-bench (min sample period 20 us >> the
-// preload+program budget); Phase 6 publishes the measured dual-channel
+// preload+program budget) and must be replaced by the measured dual-channel
 // ceiling with ~30 % margin. f_max above FS_MAX/2 is refused at start.
 #define SJ_SINE_SAMPLES_PER_CYC 64
 #define SJ_FS_MIN_HZ            1000
-#define SJ_FS_MAX_HZ            50000
+#if SJ_FASTIO_REGISTER
+  #define SJ_FS_MAX_HZ          50000
+#else
+  #define SJ_FS_MAX_HZ          25000   // RECALIBRATE: halved for the slower portable route
+#endif
 
 // ------------------------------------------------------------------ protocol
 #define SJ_LINE_MAX      999   // longest accepted serial line (excl. terminator)
@@ -77,6 +162,9 @@
 #define SJ_OLED_WIDTH    128
 #define SJ_OLED_HEIGHT   32
 #define SJ_OLED_ADDR     0x3C
+#define SJ_OLED_COLS     (SJ_OLED_WIDTH / 6)    // 6x8 default GFX font
+#define SJ_OLED_ROWS     (SJ_OLED_HEIGHT / 8)
+#define SJ_UI_MIN_MS     100   // minimum interval between physical display writes
 #define SJ_BTN_OK        17    // Btn0
 #define SJ_BTN_PREV      39    // Btn1
 #define SJ_BTN_NEXT      16    // Btn2

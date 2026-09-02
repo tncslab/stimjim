@@ -1,15 +1,15 @@
 //    stimjimAWG — Engine: PIT deadline scheduler + channel players (plan §3.1/§3.3).
 //    GPL-3.0-or-later; see Config.h header.
 //
-//    Phase 1: reserve two PIT channels from the Teensyduino core, take over
-//    their vectors at SJ_PLAYER_PRIO, self-calibrate K_RELOAD, BENCH services.
-//    Phase 3: ChannelPlayer — copy-on-arm start/stop, absolute-deadline HOLD
-//    (`S`) playback with program-early/latch-on-deadline, seqlock status,
-//    completion ring.
-//    Phase 4: RAMP (`L`) playback (SampleGen Bresenham samples, 0-duration
-//    jump chains) and the ENV envelope on S/L.
-//    Phase 5: SINE (`W`) playback — Q32 phase accumulator with per-burst
-//    restart, applied start phase, per-train Fs on an exact cycle grid.
+//    Two timer channels are reserved from the Teensyduino core, their vectors
+//    taken over at SJ_PLAYER_PRIO and K_RELOAD self-calibrated at boot (the
+//    portable backend leaves the channels under IntervalTimer control).
+//    Each ChannelPlayer does copy-on-arm start/stop against absolute deadlines,
+//    programming early and latching on the deadline, with seqlock status and a
+//    completion ring. It plays all three slot types: HOLD (`S`) stage latches,
+//    RAMP (`L`) Bresenham samples with 0-duration jump chains, and SINE (`W`)
+//    from a Q32 phase accumulator restarted at the applied start phase every
+//    burst on an exact per-train cycle grid. The ENV envelope applies to all.
 
 #ifndef STIMJIMAWG_ENGINE_H
 #define STIMJIMAWG_ENGINE_H
@@ -31,11 +31,11 @@ void poll();
 uint8_t  pitChannelOf(uint8_t player);   // hardware PIT channel index owned by player 0/1
 uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU cycles)
 
-// ------------------------------------------------------------ Phase 3 players
+// ------------------------------------------------------------------- players
 //
 // Start `def` (copied — copy-on-arm, live serial editing stays safe) on engine
 // 0 (`T`) or 1 (`U`). The first latch happens at now + SJ_START_LATENCY_US in
-// PIT-ISR context (never in the caller's). All slot types play as of Phase 5.
+// timer-ISR context, never in the caller context. All slot types play.
 // Returns false with a short reason in err (busy engine, channel conflict
 // with the other engine, sine frequency above Fs/2) — caller prints the
 // WARN/ERR (ignore-and-warn policy, plan §2.5).
@@ -58,8 +58,14 @@ bool    anyActive();
 struct EngineStatus {
   int16_t  slot;         // -1 = idle (remaining fields 0)
   uint32_t nPulses;      // pulses completed so far
-  uint32_t elapsed_us;   // since t0, clamped to [0, duration]
+  uint32_t elapsed_us;   // since t0, clamped to [0, duration]; 0 while waiting
   uint32_t duration_us;
+  // The slot's post-trigger delay and how much of it is left. `waiting` means
+  // the train is armed and its outputs are still grounded. The STAT reply does
+  // not carry these (its 8 fields are unchanged) — they drive the display.
+  uint32_t delay_us;
+  uint32_t remaining_delay_us;
+  bool     waiting;
 };
 void status(uint8_t eng, EngineStatus& out);
 

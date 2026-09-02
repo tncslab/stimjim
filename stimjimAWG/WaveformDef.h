@@ -8,7 +8,15 @@
 
 #define SJ_NUM_SLOTS    100
 #define SJ_MAX_STAGES   10
-#define SJ_EEPROM_SLOTS 10   // slots 0-9 persisted by `P`
+// Slots persisted by `P`. Overridable from the build: the image must fit the
+// board EEPROM (4096 B on Teensy 3.5 and 4.1, only 1080 B on a Teensy 4.0 --
+// TrainStore.cpp static_asserts this and names the fix).
+#ifndef SJ_EEPROM_SLOTS
+#define SJ_EEPROM_SLOTS 10
+#endif
+// Ceiling of the per-slot post-trigger delay (2000 s). Defined here rather than in
+// Config.h because the host-testable parser validates against it.
+#define SJ_MAX_DELAY_US 2000000000u
 
 enum TrainType : uint8_t {
   PIECEWISE_HOLD = 0,   // `S` — rectangular steps, legacy bit-exact semantics
@@ -54,6 +62,9 @@ struct TrainDef {
                           // parse time and re-rendered on serialization.
   uint32_t period_us;     // interval between pulse/burst starts
   uint32_t duration_us;   // total train length
+  uint32_t delay_us;      // wait between the start request (trigger edge, T/U or
+                          // menu) and the train's first sample; 0 = legacy
+                          // behaviour. Optional 6th header field of S/L/W.
   uint8_t  nStages;       // used by PIECEWISE_* only
   union {
     StageDef stages[SJ_MAX_STAGES];
@@ -71,10 +82,11 @@ struct TriggerRoute {
   uint8_t edge;
 };
 
-// EEPROM image (written by `P`, Phase 2/8): versioned + checksummed so a
+// EEPROM image (written by `P`): versioned + checksummed so a
 // layout change can never mis-restore silently. v3: MeasDef gained the stage
-// field and modes returned to the original 0-3 numbering — v2 images are
-// rejected and boot defaults apply.
+// field and modes returned to the original 0-3 numbering. v4: TrainDef gained
+// delay_us. An image of an older version is rejected outright and boot
+// defaults apply — never re-interpreted.
 struct EepromImage {
   uint32_t     magic;    // 'S''J''A''W' = 0x534A4157
   uint16_t     version;  // SJ_EEPROM_VERSION
@@ -83,6 +95,6 @@ struct EepromImage {
   TriggerRoute trig[2];
 };
 #define SJ_EEPROM_MAGIC   0x534A4157u
-#define SJ_EEPROM_VERSION 3
+#define SJ_EEPROM_VERSION 4
 
 #endif // STIMJIMAWG_WAVEFORMDEF_H

@@ -87,3 +87,4 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
 
 - Tektronix TDS 2004B oscilloscope (timing/jitter/settling verification).
 - Rigol DG800 Pro function generator (trigger-latency stimulus into IN0/IN1).
+- PicoScope 2204A two-channel USB scope with one AWG (versatile verification during development).

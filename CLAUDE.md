@@ -29,7 +29,14 @@ will fail. Use these patterns instead.
 
 When beginning a new phase, make sure that changes from the previous phase are commited to the git repo if it exists.
 
-At the end of each phase, append a handoff entry to @docs/PROGRESS.md covering decisions, rationale, open questions, and the next entry point; if all objectives are fulfilled, commit to the existing git repo; then stop.
+At the end of each phase, write the handoff entry — decisions, rationale, open questions, next
+entry point — to `docs/progress/<NNN>-<topic>.md` and prepend its one-line summary to the index
+in @docs/PROGRESS.md (newest first). To pick up work, read the index and then at most the newest
+one or two entry files, never the whole log. If all objectives are fulfilled, commit to the
+existing git repo; then stop.
+
+Development story and historic references live exclusively in the progress reports and git messages.
+All other documents describe current state, rationale, known limitaions and remaining tasks without referring to history.
 
 # GPU notes (this project: OpenMM MD)
 

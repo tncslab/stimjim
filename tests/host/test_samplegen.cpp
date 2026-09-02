@@ -1,5 +1,5 @@
 //    stimjimAWG — host-side tests for SampleGen: ramp Bresenham iterator and
-//    envelope (Phase 4), sine table/phase accumulator (Phase 5). No Arduino
+//    envelope, sine table and phase accumulator. No Arduino
 //    dependencies — build & run on the development machine:
 //
 //      g++ -std=c++17 -Wall -Wextra -I stimjimAWG tests/host/test_samplegen.cpp

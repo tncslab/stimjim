@@ -1,32 +1,45 @@
-//    stimjimAWG — Engine implementation: Phase 1 scheduling core + BENCH,
-//    Phase 3 ChannelPlayer (HOLD trains), Phase 4 RAMP playback + envelope.
-//    GPL-3.0-or-later.
+//    stimjimAWG — Engine implementation: the deadline scheduling core, the two
+//    ChannelPlayers (HOLD / RAMP / SINE playback with the ENV envelope) and the
+//    BENCH services. GPL-3.0-or-later.
 
 #include "Engine.h"
 #include "Config.h"
 #include "FastIO.h"
 #include "SampleGen.h"
+#include "Triggers.h"
 #include <string.h>
 #include <stdio.h>
 
 namespace Engine {
 
-static KINETISK_PIT_CHANNEL_t* const PIT = KINETISK_PIT_CHANNELS;
-
-static IntervalTimer reserve[2];      // held forever so the core never re-allocates
 static uint8_t  pitIdx[2] = {0xFF, 0xFF};
 static uint32_t kReload   = 0;        // CPU cycles between the CYCCNT read inside
-                                      // pitProgram() and the PIT actually firing
+                                      // pitProgram() and the timer actually firing
+
+// The ISR each player's timer must call. Indirection exists for two reasons:
+// the portable backend has to hand the callback to IntervalTimer::begin() on
+// every re-arm, and the K_RELOAD calibration temporarily borrows player 0's
+// timer for its own measurement ISR.
+static void (*isrFn[2])(void) = {nullptr, nullptr};
 
 uint8_t  pitChannelOf(uint8_t player) { return pitIdx[player]; }
 uint32_t kReloadCycles()              { return kReload; }
 
 // ------------------------------------------------------------- scheduling core
 //
-// Program player `p`'s PIT so it fires when CYCCNT reaches deadlineCyc.
-// Absolute deadlines: ISR latency affects each event by its own latency only
-// and never accumulates. kReload compensates the software+peripheral overhead
-// of this very function (self-calibrated at boot, see calibrateKReload).
+// pitProgram(p, deadlineCyc, enableIrq) makes player `p`'s timer fire when
+// CYCCNT reaches deadlineCyc; pitStop(p) disarms it. Absolute deadlines: ISR
+// latency affects each event by its own latency only and never accumulates.
+// kReload compensates the software+peripheral overhead of pitProgram itself
+// and is self-calibrated at boot (calibrateKReload), so it absorbs whatever
+// the selected backend costs — that is what makes the portable route usable
+// without hand-tuned magic numbers.
+
+#if SJ_TIMER_REGISTER
+// ---- Backend A: raw Kinetis PIT channels with our own vectors --------------
+static KINETISK_PIT_CHANNEL_t* const PIT = KINETISK_PIT_CHANNELS;
+static IntervalTimer reserve[2];      // held forever so the core never re-allocates
+
 static inline void pitProgram(uint8_t p, uint64_t deadlineCyc, bool enableIrq) {
   KINETISK_PIT_CHANNEL_t* ch = &PIT[pitIdx[p]];
   ch->TCTRL = 0;
@@ -44,6 +57,39 @@ static inline void pitStop(uint8_t p) {
   ch->TCTRL = 0;
   ch->TFLG  = 1;
 }
+
+#else
+// ---- Backend B: IntervalTimer (portable; Teensy 4.x and others) ------------
+//
+// IntervalTimer is periodic, so each event re-arms it with the interval to the
+// *next* deadline; playerRun() already calls pitStop() on entry, which both
+// prevents a re-entry if an event body overruns its interval and releases the
+// hardware channel. Re-acquiring it costs a short scan of the four channels
+// inside begin() — part of what K_RELOAD absorbs. Nothing else in this sketch
+// uses IntervalTimer, so the channel always comes straight back.
+//
+// The float overload keeps sub-microsecond resolution (the core multiplies by
+// its timer clock in ticks/us before truncating), so the scheduling grid is
+// not coarsened to 1 us.
+static IntervalTimer tmr[2];
+
+// Below this the core's begin() refuses the period (Teensy 4 needs >= 17 timer
+// ticks) — fire as soon as the hardware allows instead.
+static const uint32_t MIN_ARM_CYC = SJ_CYC_PER_US;   // 1 us
+
+static inline void pitProgram(uint8_t p, uint64_t deadlineCyc, bool /*enableIrq*/) {
+  uint64_t now = FastIO::cycles64();
+  int64_t  dc  = (int64_t)(deadlineCyc - now) - (int64_t)kReload;
+  if (dc < (int64_t)MIN_ARM_CYC) dc = MIN_ARM_CYC;   // already (nearly) due
+  // The priority set once in begin() survives end()/begin() — IntervalTimer
+  // keeps it in a member and re-applies it on every beginCycles().
+  tmr[p].begin(isrFn[p], (float)dc / (float)SJ_CYC_PER_US);
+}
+
+static inline void pitStop(uint8_t p) {
+  tmr[p].end();
+}
+#endif // SJ_TIMER_REGISTER
 
 // ------------------------------------------------------------------ players
 //
@@ -84,7 +130,7 @@ struct Player {
   int32_t  sAmp0, sAmp1;               // SINE: amplitude deltas rel. offset
   uint32_t sampleCyc;                  // SINE: exact cycles per sample
   uint64_t burstCyc;
-  uint64_t periodCyc, durationCyc;
+  uint64_t periodCyc, durationCyc, delayCyc;
   uint32_t preloadCyc;                 // DAC programming budget + CYCCNT spin margin
   uint64_t t0;
   // live state
@@ -127,6 +173,7 @@ bool popCompletion(Completion& out) {
 static inline void groundClaimed(uint8_t chMask) {
   if (chMask & 1) { Stimjim.setOutputMode(0, 3); digitalWriteFast(LED0, LOW); }
   if (chMask & 2) { Stimjim.setOutputMode(1, 3); digitalWriteFast(LED1, LOW); }
+  Triggers::marker(false);   // a train that ends mid-pulse must not leave it high
 }
 
 // Program during the preload window, spin, latch exactly on the deadline.
@@ -139,18 +186,22 @@ static inline void progLatch(const Player& pl, uint64_t dl, int16_t c0, int16_t 
 }
 
 // OE toggles per pulse like the legacy firmware: connect right after the
-// pulse's first latch, back to ground right after the off latch.
+// pulse's first latch, back to ground right after the off latch. Marker-mode
+// trigger pins follow the same edges, which is what "driven high during
+// stimulus" means (protocol §3) — two GPIO writes at most.
 static inline void oeConnect(const Player& pl) {
   if (pl.chMask & 1) Stimjim.setOutputMode(0, pl.outMode0);
   if (pl.chMask & 2) Stimjim.setOutputMode(1, pl.outMode1);
+  Triggers::marker(true);
 }
 static inline void oeGround(const Player& pl) {
   if (pl.chMask & 1) Stimjim.setOutputMode(0, 3);
   if (pl.chMask & 2) Stimjim.setOutputMode(1, 3);
+  Triggers::marker(false);
 }
 
 // offset + envelope-scaled delta, saturated to the DAC range. envq = 32768
-// (identity) reproduces the Phase 3 codes bit-exactly (scaleQ15 is exact
+// (identity) reproduces the un-enveloped codes bit-exactly (scaleQ15 is exact
 // there and the saturation already happened in ampToCode).
 static inline int16_t mkCode(int16_t off, int32_t delta, int32_t envq) {
   int32_t v = off + ((envq == 32768) ? delta : SampleGen::scaleQ15(delta, envq));
@@ -377,8 +428,14 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.evIdx       = 0;
   pl.evPhase     = EV_INIT;
   // t0 is taken *after* all precomputation so the arm->first-latch latency
-  // stays the fixed START_LATENCY regardless of train complexity
-  pl.t0          = FastIO::cycles64() + SJ_US_TO_CYC(SJ_START_LATENCY_US);
+  // stays the fixed START_LATENCY regardless of train complexity. The slot's
+  // delay_us is added on top: the train's whole timebase (pulse grid, envelope,
+  // duration) starts at t0, so the delay shifts the waveform without changing
+  // its length. It applies to every start path — trigger edge, T/U and menu —
+  // so a delay can be verified over the serial port before it is wired to a
+  // trigger.
+  pl.delayCyc    = SJ_US_TO_CYC(def.delay_us);
+  pl.t0          = FastIO::cycles64() + SJ_US_TO_CYC(SJ_START_LATENCY_US) + pl.delayCyc;
   pl.pulseStart  = pl.t0;
   if (pl.type == SINE) {               // first burst starts at t0
     pl.evPhase = EV_SAMP;
@@ -391,10 +448,18 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
                      SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
   if (!mask) pl.env.on = false;
 
-  if (mask & 1) digitalWriteFast(LED0, HIGH);
+  if (mask & 1) digitalWriteFast(LED0, HIGH);   // lit from arm, i.e. through the delay
   if (mask & 2) digitalWriteFast(LED1, HIGH);
   pl.active = true;
-  pitProgram(eng, pl.t0 - pl.preloadCyc, true);   // first latch in ISR context
+  // First latch in ISR context, never in the caller's. A delay longer than one
+  // slice is chunked here the same way playerRun() chunks long inter-event
+  // gaps — the timers cannot be loaded with an arbitrary number of cycles, and
+  // the intermediate wakeups keep the 64-bit CYCCNT extension alive.
+  uint64_t wake = pl.t0 - pl.preloadCyc;
+  uint64_t now  = FastIO::cycles64();
+  if ((int64_t)(wake - now) > (int64_t)SJ_US_TO_CYC(SJ_MAX_SLICE_US))
+    wake = now + SJ_US_TO_CYC(SJ_MAX_SLICE_US);
+  pitProgram(eng, wake, true);
   return true;
 }
 
@@ -421,7 +486,7 @@ bool    anyActive()              { return player[0].active || player[1].active; 
 
 void status(uint8_t eng, EngineStatus& out) {
   Player& pl = player[eng];
-  if (!pl.active) { out.slot = -1; out.nPulses = 0; out.elapsed_us = 0; out.duration_us = 0; return; }
+  if (!pl.active) { out = EngineStatus{-1, 0, 0, 0, 0, 0, false}; return; }
   uint32_t n;
   do {                                 // seqlock: retry while the ISR is mid-update
     uint32_t s1 = pl.seq;
@@ -430,12 +495,16 @@ void status(uint8_t eng, EngineStatus& out) {
     if (pl.seq == s1) break;
   } while (true);
   uint64_t now = FastIO::cycles64();
-  uint64_t el  = (now > pl.t0) ? (now - pl.t0) : 0;
+  bool     pre = (int64_t)(pl.t0 - now) > 0;     // still inside the start delay
+  uint64_t el  = pre ? 0 : (now - pl.t0);
   if (el > pl.durationCyc) el = pl.durationCyc;
   out.slot        = (int16_t)pl.slot;
   out.nPulses     = n;
   out.elapsed_us  = (uint32_t)SJ_CYC_TO_US(el);
   out.duration_us = (uint32_t)SJ_CYC_TO_US(pl.durationCyc);
+  out.delay_us    = (uint32_t)SJ_CYC_TO_US(pl.delayCyc);
+  out.remaining_delay_us = pre ? (uint32_t)SJ_CYC_TO_US(pl.t0 - now) : 0;
+  out.waiting     = pre;
 }
 
 // ---------------------------------------------------------- PIT jitter bench
@@ -509,21 +578,61 @@ bool benchPitLatency(uint32_t period_us, uint32_t reps, uint32_t preload_us,
 // -------------------------------------------------------- K_RELOAD calibration
 //
 // Closed-loop: run the *actual* pitProgram() path with a known deadline and
-// poll TFLG (interrupts off, TIE off), measuring when the timer really fired.
-// The median error is folded into kReload. Residual detection latency of the
-// poll loop (a few cycles) stays inside the constant, which is fine: players
-// wake PRELOAD (~4 us) early and spin on CYCCNT, so K_RELOAD only needs to be
-// accurate to well under PRELOAD, not to the ns.
+// measure when the timer really fired. The median error is folded into
+// kReload. K_RELOAD only needs to be accurate to well under PRELOAD (players
+// wake PRELOAD early and spin on CYCCNT), not to the ns — which is why the two
+// backends may measure it slightly differently.
+static void player0Isr();
+
+#if SJ_TIMER_REGISTER
+// Register backend: poll TFLG with interrupts off and TIE off. The few cycles
+// of poll-detection latency stay inside the constant.
+static bool calFailed = false;
+
 static int32_t calOnce() {
   __disable_irq();
   uint64_t deadline = FastIO::cycles64() + SJ_US_TO_CYC(50);
   pitProgram(0, deadline, false);
-  while (!(PIT[pitIdx[0]].TFLG & 1)) ;
+  // Bounded spin. An unbounded one with interrupts off would turn any timer
+  // misconfiguration into a dead board that not even USB answers. 1 ms is 20x
+  // the scheduled interval, so the bound can only be hit by a real fault.
+  uint64_t giveUp = deadline + SJ_US_TO_CYC(1000);
+  while (!(PIT[pitIdx[0]].TFLG & 1)) {
+    if ((int64_t)(FastIO::cycles64() - giveUp) > 0) { calFailed = true; break; }
+  }
   uint64_t fired = FastIO::cycles64();
   pitStop(0);
   __enable_irq();
   return (int32_t)(fired - deadline);
 }
+#else
+// Portable backend: IntervalTimer offers no way to run a channel without its
+// interrupt, so the fire time is stamped by a borrowed ISR. That folds the
+// NVIC entry latency into K_RELOAD as well — which is the right thing here,
+// because on this route every real event pays it too.
+static volatile uint64_t calFired;
+static volatile bool     calDone;
+static bool              calFailed = false;
+
+static void calIsr() {
+  calFired = FastIO::cycles64();
+  pitStop(0);
+  calDone = true;
+}
+
+static int32_t calOnce() {
+  calDone  = false;
+  isrFn[0] = calIsr;
+  uint64_t deadline = FastIO::cycles64() + SJ_US_TO_CYC(50);
+  pitProgram(0, deadline, true);
+  uint64_t giveUp = deadline + SJ_US_TO_CYC(1000);       // bounded, see backend A
+  while (!calDone) {
+    if ((int64_t)(FastIO::cycles64() - giveUp) > 0) { calFailed = true; calFired = giveUp; break; }
+  }
+  isrFn[0] = player0Isr;
+  return (int32_t)(calFired - deadline);
+}
+#endif
 
 void calibrateKReload(uint16_t reps, int32_t* outMin, int32_t* outMed, int32_t* outMax) {
   static int32_t s[201];
@@ -537,7 +646,15 @@ void calibrateKReload(uint16_t reps, int32_t* outMin, int32_t* outMed, int32_t* 
     }
   }
   int32_t med = s[reps / 2];
-  kReload += med;               // pitProgram already subtracted the old value
+  if (calFailed) {
+    // The timer never fired within the bound: folding this median in would
+    // poison every future deadline. Leave K_RELOAD alone and say so — the
+    // engine still runs, just with an uncompensated scheduling offset.
+    Serial.println("WARN engine: K_RELOAD calibration timed out — timer not firing");
+    calFailed = false;
+  } else {
+    kReload += med;             // pitProgram already subtracted the old value
+  }
   if (outMin) *outMin = s[0];
   if (outMed) *outMed = med;
   if (outMax) *outMax = s[reps - 1];
@@ -556,7 +673,20 @@ static void player1Isr() {
 
 // --------------------------------------------------------------------- begin
 
+#if SJ_TIMER_REGISTER
 static void dummyIsr() {}
+
+// Ungate the PIT before any of its registers is read. On the K64 a load from a
+// clock-gated peripheral is a bus fault, not a zero, and enabledMask() below
+// samples TCTRL before the first IntervalTimer::begin() would have ungated it.
+// The nop mirrors the core's own workaround comment ("solves timing problem on
+// Teensy 3.5"); MCR = 1 is the core's setting (MDIS = 0 enable, FRZ = 1 freeze
+// while halted in a debugger).
+static void pitClockEnable() {
+  SIM_SCGC6 |= SIM_SCGC6_PIT;
+  __asm__ volatile("nop");
+  PIT_MCR = 1;
+}
 
 static uint32_t enabledMask() {
   uint32_t m = 0;
@@ -565,36 +695,64 @@ static uint32_t enabledMask() {
   return m;
 }
 
-// Reserve one PIT channel through IntervalTimer (so the core marks it used),
-// identify which hardware channel we got by diffing TCTRL enable bits, then
-// take over its vector and priority. Works whatever the allocation order —
-// no dependence on the core's low-to-high scan (verified but not relied on).
-static uint8_t grabChannel(IntervalTimer& t, void (*isr)(void)) {
-  uint32_t before = enabledMask();
-  bool ok = t.begin(dummyIsr, 1000000);    // 1 s period: cannot fire before takeover
-  uint32_t added = enabledMask() & ~before;
-  if (!ok || !added) return 0xFF;
-  uint8_t idx = __builtin_ctz(added);
-  PIT[idx].TCTRL = 0;
-  PIT[idx].TFLG  = 1;
-  attachInterruptVector((IRQ_NUMBER_t)(IRQ_PIT_CH0 + idx), isr);
-  NVIC_SET_PRIORITY(IRQ_PIT_CH0 + idx, SJ_PLAYER_PRIO);
-  return idx;
+// Reserve both PIT channels through IntervalTimer (so the core marks them
+// used), identifying each by diffing the TCTRL enable bits around its begin().
+// Works whatever the allocation order — no dependence on the core's
+// low-to-high scan (verified but not relied on).
+//
+// Both channels must be claimed *before* either is disarmed: IntervalTimer
+// picks a channel by scanning for TCTRL == 0, so clearing the first channel's
+// TCTRL before claiming the second would hand the same channel out twice and
+// leave both players sharing it. The 1 s period cannot elapse before the
+// takeover below.
+static bool grabChannels(void (*isr0)(void), void (*isr1)(void)) {
+  uint32_t m0 = enabledMask();
+  bool ok0 = reserve[0].begin(dummyIsr, 1000000);
+  uint32_t m1 = enabledMask();
+  bool ok1 = reserve[1].begin(dummyIsr, 1000000);
+  uint32_t m2 = enabledMask();
+
+  uint32_t a0 = m1 & ~m0, a1 = m2 & ~m1;
+  if (!ok0 || !ok1 || !a0 || !a1) return false;
+  pitIdx[0] = (uint8_t)__builtin_ctz(a0);
+  pitIdx[1] = (uint8_t)__builtin_ctz(a1);
+
+  void (*isr[2])(void) = {isr0, isr1};
+  for (uint8_t p = 0; p < 2; p++) {
+    uint8_t idx = pitIdx[p];
+    PIT[idx].TCTRL = 0;
+    PIT[idx].TFLG  = 1;
+    attachInterruptVector((IRQ_NUMBER_t)(IRQ_PIT_CH0 + idx), isr[p]);
+    NVIC_SET_PRIORITY(IRQ_PIT_CH0 + idx, SJ_PLAYER_PRIO);
+  }
+  return true;
 }
+#endif
 
 void begin() {
   bench.active = false;
   memset(player, 0, sizeof(player));
-  pitIdx[0] = grabChannel(reserve[0], player0Isr);
-  pitIdx[1] = grabChannel(reserve[1], player1Isr);
+  isrFn[0] = player0Isr;
+  isrFn[1] = player1Isr;
+#if SJ_TIMER_REGISTER
+  pitClockEnable();
   // Failure here means another library consumed the PITs — impossible in this
   // sketch, and loud is better than subtly broken timing.
-  if (pitIdx[0] == 0xFF || pitIdx[1] == 0xFF) {
+  if (!grabChannels(player0Isr, player1Isr)) {
     while (true) {
       Serial.println("ERR engine: could not reserve 2 PIT channels");
       delay(1000);
     }
   }
+#else
+  // The portable backend acquires and releases its channel per event, so there
+  // is no fixed channel index to report; the priority set here persists across
+  // every later end()/begin() pair (IntervalTimer keeps it in a member).
+  for (uint8_t p = 0; p < 2; p++) {
+    tmr[p].priority(SJ_PLAYER_PRIO);
+    pitIdx[p] = 0xFE;                      // "IntervalTimer-managed"
+  }
+#endif
   calibrateKReload(65, nullptr, nullptr, nullptr);   // pass 1: bulk of the constant
   calibrateKReload(65, nullptr, nullptr, nullptr);   // pass 2: residual refinement
 }

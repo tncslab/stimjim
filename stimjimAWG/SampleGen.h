@@ -1,9 +1,9 @@
 //    stimjimAWG — SampleGen: pure sample math, no Arduino dependencies so it is
-//    host-testable (plan §3.5, tests/host/test_samplegen.cpp). Phase 4: ramp
-//    Bresenham + envelope; Phase 5: sine table + phase accumulator.
+//    host-testable (plan §3.5, tests/host/test_samplegen.cpp): ramp Bresenham,
+//    envelope, sine table and phase accumulator.
 //    GPL-3.0-or-later; see Config.h header.
 //
-//    Numeric design (plan §3.5, decided in Phase 4):
+//    Numeric design (plan §3.5):
 //    - Event *times* are 64-bit CPU-cycle counts, integer arithmetic only.
 //      FP32 has a 24-bit mantissa (loses cycle exactness beyond 0.14 s) and
 //      FP64 is software-emulated on the M4F — both unusable for deadlines.
@@ -35,7 +35,7 @@ static inline int32_t scaleQ15(int32_t v, int32_t q15) {
   return (int32_t)(((int64_t)v * q15 + 16384) >> 15);
 }
 
-// ---------------------------------------------------- Phase 4: RAMP stages
+// ------------------------------------------------------------- RAMP stages
 //
 // One `L` stage ramps from its entry value (previous stage's end, 0 for the
 // first stage) to its programmed end value over dur_us, sampled at
@@ -79,7 +79,7 @@ void rampEnter(RampCursor& c, const RampStage& st, uint64_t stageStartCyc,
 // Advance the cursor to the next sample (call after latching, while k < N).
 void rampStep(RampCursor& c, const RampStage& st);
 
-// ------------------------------------------------------ Phase 4: envelope
+// ---------------------------------------------------------------- envelope
 //
 // env(t): 0 -> 1 linearly over rampIn from train start, 1 -> 0 ending exactly
 // at duration (protocol §4). Evaluated per latch event against the event's
@@ -101,7 +101,7 @@ void envInit(EnvCoef& e, uint64_t t0, uint64_t durCyc,
 // Envelope value at absolute time t, Q15 in [0, 32768].
 int32_t envQ15(const EnvCoef& e, uint64_t t);
 
-// ---------------------------------------------------------- Phase 5: sine
+// -------------------------------------------------------------------- sine
 //
 // Q32 phase accumulator per channel: 2^32 = one turn, so wrap-around IS the
 // 360 degree wrap — exact modular arithmetic, no drift. The only rounding is

@@ -51,6 +51,7 @@ void commit(uint8_t idx, const TrainDef& staged);   // atomic slot replacement
 // ------------------------------------------------------ round-trip serializers
 // Canonical one-line set-commands (protocol §1 query contract), no spaces.
 void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n);
+void serializeDelay(uint8_t idx, uint32_t delay_us, char* buf, size_t n);
 void serializeEnv(uint8_t idx, const EnvDef& e, char* buf, size_t n);
 void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n);
 

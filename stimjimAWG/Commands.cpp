@@ -1,9 +1,8 @@
-//    stimjimAWG — command handlers. Phase 2: S/L/W with atomic staging, `?`
-//    queries + round-trip serializers, byte-exact M/V/A/E (BIST contract),
-//    B/C/D/P, ENV/MEAS, DUMP; plus the Phase-1 BENCH group. Phase 3: T/U
-//    start/stop (legacy reply lines), completion-ring drain + result summary,
-//    READ manual measurement, live STAT. TRIG/R setters arrive in Phase 8,
-//    LOG in Phase 7. GPL-3.0-or-later.
+//    stimjimAWG — command handlers: S/L/W definition with atomic staging, `?`
+//    queries + round-trip serializers, DELAY/ENV/MEAS, T/U start-stop with the
+//    completion-ring drain, TRIG/R routing, byte-exact M/V/A/E (BIST contract),
+//    READ, B/C/D/P, STAT, SCREEN, DUMP and the BENCH group. `MEAS` execution
+//    and `LOG` are not implemented. GPL-3.0-or-later.
 
 #include "Protocol.h"
 #include "Config.h"
@@ -11,6 +10,7 @@
 #include "Engine.h"
 #include "TrainStore.h"
 #include "Triggers.h"
+#include "UiMenu.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -57,8 +57,11 @@ static int8_t parseFields(const char* p, long* out, int8_t maxN) {
   }
 }
 
-static inline uint32_t cycToNs(uint32_t cyc) {          // 1 cycle = 25/3 ns
-  return (cyc * 25u + 1u) / 3u;
+// Clock-independent: 1000 ns / cycles-per-us. 8.33 ns at 120 MHz (Teensy 3.5),
+// 1.67 ns at 600 MHz (Teensy 4.x). uint64 intermediate so long BENCH intervals
+// cannot overflow the multiply.
+static inline uint32_t cycToNs(uint32_t cyc) {
+  return (uint32_t)(((uint64_t)cyc * 1000u + SJ_CYC_PER_US / 2) / SJ_CYC_PER_US);
 }
 
 static void printStat(const char* name, uint32_t n, uint32_t mn, uint64_t sum, uint32_t mx) {
@@ -127,6 +130,8 @@ static void dumpSlot(uint8_t idx) {
                 (unsigned long)t.period_us, 0.000001 * t.period_us, 1000000.0 / t.period_us);
   Serial.printf("  duration:  %lu usec (%0.3f sec)\r\n",
                 (unsigned long)t.duration_us, 0.000001 * t.duration_us);
+  Serial.printf("  delay:     %lu usec after the start request (%0.3f sec)\r\n",
+                (unsigned long)t.delay_us, 0.000001 * t.delay_us);
   const char* u0 = (t.mode0 == 1) ? "uA" : "mV";
   const char* u1 = (t.mode1 == 1) ? "uA" : "mV";
   if (t.type == SINE) {
@@ -202,6 +207,42 @@ static void handleTrain(char letter, const char* args) {
   char line[SJ_SERIALIZE_MAX];
   TrainStore::serializeTrain(idx, staged, line, sizeof line);
   Serial.println(line);   // echo the canonical round-trip line of what was stored
+}
+
+// ----------------------------------------------------------------- DELAY
+//
+// Convenience setter for the slot's post-trigger delay, which is also the
+// optional 6th field of the S/L/W header. Note the asymmetry that follows from
+// "a waveform line fully defines its header": a later S/L/W line without that
+// field resets the delay to 0, so set DELAY *after* defining the waveform.
+static void handleDelay(const char* args) {
+  const char* p = args;
+  uint8_t idx;
+  if (!parseSlotIdx("DELAY", p, idx)) return;
+
+  char line[48];
+  if (*p == '?') {
+    TrainStore::serializeDelay(idx, TrainStore::slotConst(idx).delay_us, line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  if (*p != ',') { err("DELAY", "need DELAY<idx>,<delay_us> or DELAY<idx>?"); return; }
+
+  long v[1];
+  if (parseFields(p + 1, v, 1) != 1) { err("DELAY", "need <delay_us>"); return; }
+  if (v[0] < 0)                      { err("DELAY", "delay_us must be >= 0"); return; }
+  if ((unsigned long)v[0] > SJ_MAX_DELAY_US) { err("DELAY", "delay_us exceeds 2000000000 us (2000 s)"); return; }
+
+  if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
+    err("DELAY", "slot is attached to a running train — stop first (T-1 / U-1)");
+    return;
+  }
+
+  TrainDef staged = TrainStore::slotConst(idx);
+  staged.delay_us = (uint32_t)v[0];
+  TrainStore::commit(idx, staged);
+  TrainStore::serializeDelay(idx, staged.delay_us, line, sizeof line);
+  Serial.println(line);
 }
 
 // ------------------------------------------------------------- ENV / MEAS
@@ -292,7 +333,7 @@ static void handleMeas(const char* args) {
   Serial.println(line);
 }
 
-// ------------------------------------------------- T / U (start/stop, Phase 3)
+// ------------------------------------------------------- T / U (start/stop)
 
 // Completed trains per boot — the legacy `Train #<n> complete.` counter.
 static uint32_t trainCount = 0;
@@ -320,8 +361,16 @@ static void handleStart(char letter, const char* args) {
   }
 
   char errbuf[SJ_MSG_MAX];
-  if (!Engine::startTrain(eng, (uint8_t)v, TrainStore::slotConst((uint8_t)v),
-                          errbuf, sizeof errbuf)) {
+  // A trigger edge can preempt loop() and call startTrain for the same engine,
+  // and the busy check plus the arm-time writes are not atomic. The bus lock
+  // masks the trigger ISRs (priority 80) for the duration. Trigger ISRs need no
+  // lock themselves: they cannot preempt each other, and the players -- the
+  // only thing above them -- never start trains.
+  FastIO::busLock();
+  bool started = Engine::startTrain(eng, (uint8_t)v, TrainStore::slotConst((uint8_t)v),
+                                    errbuf, sizeof errbuf);
+  FastIO::busUnlock();
+  if (!started) {
     warn(cmd, errbuf);                   // ignore-and-warn policy (plan §2.5)
     return;
   }
@@ -342,7 +391,7 @@ void poll() {
     Serial.print("Train #"); Serial.print(trainCount);
     Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
     Serial.println(" pulses.");
-    // Phase 7 replaces this note with MSUM summary lines (protocol §4)
+    // MSUM summary lines replace this note once `MEAS` execution exists (protocol §4)
     Serial.println("Note: no measurement carried out.");
     if (c.chMask & 1) modeShadow[0] = 3;
     if (c.chMask & 2) modeShadow[1] = 3;
@@ -541,13 +590,31 @@ static void handleTrig(const char* args) {
   if (end == p || t < 0 || t > 1) { err("TRIG", "need trigger input 0 or 1"); return; }
   p = end;
   while (*p == ' ') p++;
+  char line[48];
   if (*p == '?') {
-    char line[48];
     serializeTrig((uint8_t)t, line, sizeof line);
     Serial.println(line);
     return;
   }
-  err("TRIG", "setter not implemented yet (Phase 8) — query with TRIG<t>?");
+  if (*p != ',') { err("TRIG", "need TRIG<t>,<mode>,<slot0>,<slot1>,<edge> or TRIG<t>?"); return; }
+
+  long v[4];
+  if (parseFields(p + 1, v, 4) != 4) {
+    err("TRIG", "need <mode>,<slot0>,<slot1>,<edge> (slots -1 for none)");
+    return;
+  }
+  if (v[0] < 0 || v[0] > 3 || v[3] < 0 || v[3] > 1 ||
+      v[1] < -128 || v[1] > 127 || v[2] < -128 || v[2] > 127) {
+    err("TRIG", "field out of range");
+    return;
+  }
+  TriggerRoute r = {(uint8_t)v[0], (int8_t)v[1], (int8_t)v[2], (uint8_t)v[3]};
+  const char* msg = Triggers::validateRoute(r);
+  if (msg) { err("TRIG", msg); return; }
+
+  Triggers::setRoute((uint8_t)t, r);
+  serializeTrig((uint8_t)t, line, sizeof line);
+  Serial.println(line);
 }
 
 static void handleR(const char* args) {
@@ -564,7 +631,28 @@ static void handleR(const char* args) {
       return;
     }
   }
-  err("R", "setter not implemented yet (Phase 8) — query with R<t>?");
+
+  // Legacy setter: R<trig>,<slot>[,<outputFlag>]. It writes the same table the
+  // TRIG command owns — outputFlag != 0 makes the pin a stimulus marker,
+  // otherwise the edge starts <slot> jointly on rising edges (protocol §3).
+  long v[3];
+  int8_t n = parseFields(args, v, 3);
+  if (n < 2) { err("R", "need R<trig>,<slot>[,<output>] or R<t>?"); return; }
+  if (v[0] < 0 || v[0] > 1) { err("R", "trigger input must be 0 or 1"); return; }
+  if (v[1] < -1 || v[1] >= SJ_NUM_SLOTS) { err("R", "slot must be -1 or 0-99"); return; }
+
+  TriggerRoute r;
+  if (n == 3 && v[2] != 0)   r = {3, -1, -1, 0};                     // marker output
+  else if (v[1] < 0)         r = {0, -1, -1, 0};                     // disabled
+  else                       r = {1, (int8_t)v[1], -1, 0};           // joint, rising
+
+  const char* msg = Triggers::validateRoute(r);
+  if (msg) { err("R", msg); return; }
+  Triggers::setRoute((uint8_t)v[0], r);
+
+  char line[48];
+  serializeTrig((uint8_t)v[0], line, sizeof line);
+  Serial.println(line);
 }
 
 // --------------------------------------------------------------------- DUMP
@@ -589,10 +677,10 @@ static void handleDump() {
       Serial.println(line);
     }
   }
-  // commented until the TRIG setter exists (Phase 8) so paste-back stays clean
+  // Real lines now that TRIG is a setter: a dump pastes back complete.
   for (uint8_t t = 0; t < 2; t++) {
     serializeTrig(t, line, sizeof line);
-    Serial.printf("# %s\n", line);
+    Serial.println(line);
   }
   ok();
 }
@@ -600,7 +688,8 @@ static void handleDump() {
 // -------------------------------------------------------------------- BENCH
 
 static void benchList() {
-  Serial.println("# BENCH group (Phase 1) — timing in CPU cycles (120/us) and ns");
+  Serial.printf("# BENCH group — timing in CPU cycles (%lu/us) and ns\n",
+                (unsigned long)SJ_CYC_PER_US);
   Serial.println("# BENCHDAC[,n]                 dacProgram single channel (no latch)");
   Serial.println("# BENCHDAC2[,n]                dacProgramBoth (no latch)");
   Serial.println("# BENCHLATCH[,n]               dacLatch(0b11) pulse");
@@ -756,13 +845,14 @@ static void benchDispatch(const char* sub, const char* args) {
 // --------------------------------------------------------------------- HELP
 
 static void help() {
-  Serial.println("# stimjimAWG commands (Phase 5) — details: docs/serial-protocol.md");
-  Serial.println("#   S<i>,m0,m1,per,dur;a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
+  Serial.println("# stimjimAWG commands — details: docs/serial-protocol.md");
+  Serial.println("#   S<i>,m0,m1,per,dur[,delay];a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
   Serial.println("#   L<i>,...                        same syntax, linear ramps (0-dur stage = jump)");
-  Serial.println("#   W<i>,m0,m1,per,dur;amp;freq;phase[;env]  sine train (triplets, decimals in Hz ok)");
+  Serial.println("#   W<i>,m0,m1,per,dur[,delay];amp;freq;phase[;env]  sine train (decimals in Hz ok)");
   Serial.println("#   modes: 0 V, 1 I, 2/3 channel not driven; 90/91 V/I without measurement");
   Serial.println("#   S<i> / L<i> / W<i>              human parameter dump; append ? for the canonical line");
   Serial.println("#   T<i> / T-1, U<i> / U-1          start/stop engine 0 / 1");
+  Serial.println("#   DELAY<i>,<us>                   delay from start request to first sample; DELAY<i>?");
   Serial.println("#   ENV<i>,in,out[,shape]           amplitude envelope; ENV<i>?");
   Serial.println("#   MEAS<i>,w0,w1,when,stage[,rep]  measurement config; MEAS<i>?");
   Serial.println("#   READ<ch>[,n]                    manual averaged V+I read (mean and std dev)");
@@ -771,9 +861,12 @@ static void help() {
   Serial.println("#   D / D?                          print offsets (human / CSV)");
   Serial.println("#   P                               save slots 0-9 + triggers to EEPROM");
   Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
-  Serial.println("#   TRIG<t>? / R<t>?                trigger routing queries (setters in Phase 8)");
+  Serial.println("#   SCREEN                          dump the OLED framebuffer as ASCII art");
+  Serial.println("#   TRIG<t>,<mode>,<s0>,<s1>,<edge> route input 0/1: 0 off, 1 joint, 2 independent,");
+  Serial.println("#                                   3 stimulus marker out; edge 0 rising, 1 falling");
+  Serial.println("#   R<t>,<slot>[,<out>]             legacy alias of TRIG; TRIG<t>? / R<t>? query");
   Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("# Not yet available: MEAS execution + LOG (Phase 7), TRIG/R setters (Phase 8)");
+  Serial.println("# Not implemented: MEAS execution, LOG (SD logging), the button menu editor");
   ok();
 }
 
@@ -812,8 +905,7 @@ void handleLine(const char* line) {
   word[wl] = '\0';
 
   if (!strcmp(word, "IDN")) {
-    Serial.printf("IDN,%s,%s,fw=%s,proto=%d\n",
-                  SJ_FW_NAME, SJ_HW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);
+    Protocol::printIdentity();
   } else if (!strcmp(word, "HELP")) {
     help();
   } else if (!strcmp(word, "STAT")) {
@@ -827,6 +919,10 @@ void handleLine(const char* line) {
                   (unsigned long)s[1].elapsed_us, (unsigned long)s[1].duration_us);
   } else if (!strcmp(word, "READ")) {
     handleRead(args);
+  } else if (!strcmp(word, "DELAY")) {
+    handleDelay(args);
+  } else if (!strcmp(word, "SCREEN")) {
+    UiMenu::dumpScreen();
   } else if (!strcmp(word, "ENV")) {
     handleEnv(args);
   } else if (!strcmp(word, "MEAS")) {
@@ -836,7 +932,7 @@ void handleLine(const char* line) {
   } else if (!strcmp(word, "DUMP")) {
     handleDump();
   } else if (!strcmp(word, "LOG")) {
-    err("LOG", "SD logging arrives in Phase 7");
+    err("LOG", "SD logging is not implemented");
   } else if (!strncmp(word, "BENCH", 5)) {
     const char* sub = word + 5;
     // allow "BENCH?" — the '?' lands in args, sub is empty

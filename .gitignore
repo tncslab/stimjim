@@ -62,3 +62,8 @@ fp-info-cache
 
 # Editor and tool history
 .history/
+
+# Project working directories (CLAUDE.md conventions): not tracked
+data/
+tmp/
+tmp-figs/

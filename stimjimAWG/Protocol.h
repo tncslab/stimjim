@@ -5,8 +5,10 @@
 #define STIMJIMAWG_PROTOCOL_H
 
 namespace Protocol {
-void begin();   // prints the boot banner + IDN line
+void begin();   // prints the boot banner + identity block
 void poll();    // drain Serial, assemble lines, dispatch complete ones
+// IDN line plus `#` build/engine detail — shared by the banner and `IDN`.
+void printIdentity();
 }
 
 namespace Commands {

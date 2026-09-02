@@ -1,13 +1,15 @@
 # stimjimAWG serial protocol reference (draft)
 
-Status: protocol version 1. Waveform definition, queries, immediate commands and persistence
-(`S`/`L`/`W`, `ENV`/`MEAS`, `M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`/`P`, `DUMP`) are implemented as
-of Phase 2/3; `T`/`U` execution runs all slot types with the `ENV` envelope as of Phase 5;
-the measurement engine (`MEAS` execution, `MSUM`/`MDATA` output) arrives in Phase 7, `LOG` in
-Phase 7, `TRIG`/`R` setters in Phase 8 (queries already answer) — see
-[awg-implementation-plan.md](awg-implementation-plan.md). The
-legacy sections below double as documentation of the old `stimjimPulser` behavior; the
-"hardened" notes describe what stimjimAWG changes.
+Status: protocol version 1. Implemented: waveform definition and queries (`S`/`L`/`W`,
+`DELAY`, `ENV`/`MEAS`), `T`/`U` playback of all three slot types with the `ENV` envelope,
+`TRIG`/`R` trigger routing, the immediate commands (`M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`),
+persistence (`P`), and `STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`. **Not implemented:** the
+in-train measurement engine (`MEAS` execution and its `MSUM`/`MDATA` output — the config is
+stored and validated, but nothing measures yet) and `LOG` SD logging; both are specified below
+so their record formats are fixed. See [awg-implementation-plan.md](awg-implementation-plan.md)
+for what remains. The legacy sections below double as documentation of the sibling
+`stimjimPulser` firmware in this repository; the "hardened" notes describe where stimjimAWG
+deliberately differs from it.
 
 Backward-compatibility contract: every command of `stimjimPulser` keeps its syntax and semantics;
 `M`/`V`/`A`/`E` keep **byte-compatible single-line replies** because StimJimBIST performs exactly
@@ -39,7 +41,29 @@ one `ReadLine()` per command and parses `E`'s `(<value><unit>)` group.
 
 Common header for `S`/`L`/`W`:
 `<idx>` 0–99 (slot), `<mode0>,<mode1>` per physical channel (below), `<period_us>` interval
-between pulse/burst starts, `<duration_us>` total train length.
+between pulse/burst starts, `<duration_us>` total train length, and the optional
+`<delay_us>` below.
+
+**Optional 6th header field — `delay_us`.** A legacy header ends after `duration_us` (the next
+character is `;` or end of line), so a `,` in that position can only be the new field: the
+extension is unambiguous and every pre-existing command line keeps its exact meaning. The delay
+is the wait between the *start request* and the train's first sample. It applies to every start
+path — a trigger edge, `T`/`U`, or the menu — so a delay can be verified over the serial port
+before it is wired to a trigger. The whole train timebase (pulse grid, envelope, duration)
+begins after the delay, so the delay shifts the waveform without changing its length; the
+outputs stay grounded throughout it. Range 0…2 000 000 000 µs (2000 s); out of range → `ERR`.
+
+Omitting the field **resets the delay to 0**, the same rule the `W` envelope triplet follows: an
+`S`/`L`/`W` line fully defines its own header, so replaying an old script reproduces the old
+behaviour exactly and can never inherit a delay set earlier. Set `DELAY` *after* defining the
+waveform, or carry the delay in the line itself. Queries emit the field only when it is
+non-zero, so a delay-free slot still serializes to a line older firmware would accept; round-trip
+stays exact because an absent field parses back as 0.
+
+```
+S0,0,1,2000,1000000;100,0,150        # legacy line: no delay
+S0,0,1,2000,1000000,5000;100,0,150   # same train, 5 ms after the trigger
+```
 
 **Mode field** — the original stimjim numbering (same as `M`): 0 voltage, 1 current,
 2 disconnected (hi-Z), 3 grounded. In a train definition 2 and 3 both mean *this channel is not
@@ -60,7 +84,7 @@ Queries render 90/91 whenever the stored `what` is 0, so the flag round-trips th
 ### `S` — piecewise-constant (rectangular step) train — legacy semantics, bit-exact
 
 ```
-S<idx>,<mode0>,<mode1>,<period_us>,<duration_us>; <a0>,<a1>,<dur_us>; ...   (0–10 stages)
+S<idx>,<mode0>,<mode1>,<period_us>,<duration_us>[,<delay_us>]; <a0>,<a1>,<dur_us>; ...  (0–10 stages)
 S<idx>          → query (safe, never writes)      S<idx>?  → canonical one-line form
 ```
 
@@ -77,7 +101,7 @@ outside {0–3, 90, 91} → `ERR` (old: silently coerced out-of-range values).
 ### `L` — piecewise-linear (ramp) train — NEW
 
 ```
-L<idx>,<mode0>,<mode1>,<period_us>,<duration_us>; <a0>,<a1>,<dur_us>; ...
+L<idx>,<mode0>,<mode1>,<period_us>,<duration_us>[,<delay_us>]; <a0>,<a1>,<dur_us>; ...
 ```
 
 Identical syntax to `S`; each stage **ramps linearly from the previous end value** to
@@ -98,7 +122,7 @@ boundary and immediately parked — append a same-value stage to hold it.
 ### `W` — sine train — explicit fields, phase fixed
 
 ```
-W<idx>,<mode0>,<mode1>,<period_us>,<duration_us>;
+W<idx>,<mode0>,<mode1>,<period_us>,<duration_us>[,<delay_us>];
    <amp0>,<amp1>,<burst_us>;      # amplitudes (mV/µA), burst length per period
    <freq0>,<freq1>,0;             # frequency in Hz, decimals accepted (stored as mHz); 3rd field reserved, must be present
    <phase0>,<phase1>,0[;          # start phase in degrees — NOW APPLIED (old firmware ignored it)
@@ -108,12 +132,12 @@ W<idx>,<mode0>,<mode1>,<period_us>,<duration_us>;
 Omitting the 5th triplet resets the envelope to `0,0,0` — a full `W` line fully defines the slot,
 keeping query output round-trip exact. Legacy `W` lines (4 triplets, integer Hz) parse unchanged.
 
-Playback (Phase 5, plan §3.5): each period runs one burst of `burst_us`; the **phase restarts at
+Playback (plan §3.5): each period runs one burst of `burst_us`; the **phase restarts at
 `phase` every burst** (bursts are identical and drift-free; legacy-consistent), and the output
 parks at offset + grounds between bursts. `burst_us = period_us` is continuous sine except for a
 few-µs park at each period boundary (same as legacy; a gapless mode may suppress the off event
 later). Sample rate per train: `Fs = clamp(64·f_max, 1 kHz, 50 kHz)` on an exact CPU-cycle grid
-(the 50 kHz ceiling is provisional until the Phase 6 bench). Frequencies above `Fs/2 = 25 kHz`
+(the 50 kHz ceiling is a desk estimate, not a measured limit). Frequencies above `Fs/2 = 25 kHz`
 are accepted at parse time but **refused at start** with a `WARN` (Nyquist).
 
 Known hardware limit (see [hardware-notes.md](hardware-notes.md)): amplitudes above 3000 µA
@@ -123,7 +147,7 @@ convert incorrectly on the DAC → `WARN` on set.
 
 | Cmd | Syntax | Reply / notes |
 |---|---|---|
-| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy reply lines kept: `\r\nStarted T train with parameters of PulseTrain <idx>` / `Forcing T train to stop` / `Invalid PulseTrain index.`. Busy engine or channel conflict with the other engine → drop + `WARN` (decision: ignore-and-warn). Strict index parse: `Tfoo` → `ERR` (legacy `atoi` silently started train 0). Train completion prints `Train #<n> complete. Delivered <p> pulses.` from `loop()` (Phase 7 appends `MSUM` lines). |
+| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy reply lines kept: `\r\nStarted T train with parameters of PulseTrain <idx>` / `Forcing T train to stop` / `Invalid PulseTrain index.`. Busy engine or channel conflict with the other engine → drop + `WARN` (decision: ignore-and-warn). Strict index parse: `Tfoo` → `ERR` (legacy `atoi` silently started train 0). Train completion prints `Train #<n> complete. Delivered <p> pulses.` from `loop()`; `MSUM` lines will follow it once the measurement engine exists. |
 | `U` | `U<idx>` / `U-1` | same, engine 1 (players are per-engine; a train drives the channels its modes activate) |
 | `R` | `R<trig>,<idx>[,<output>]` | **legacy alias** writing the `TRIG` table: `output≠0` → marker mode (`TRIG<t>,3,-1,-1,0`); else joint start of `idx` on rising edge (`TRIG<t>,1,<idx>,-1,0`). `R<t>?` renders the legacy view. NOTE: the old README documented the 3rd arg as an edge selector — the code's actual meaning is the output-marker flag; edge selection lives in `TRIG`. |
 | `M` | `M<ch>,<mode>` | exactly 1 line: `Set channel <ch> to mode <mode>`. Modes: 0 voltage, 1 current, 2 disconnected (hi-Z), 3 grounded — original numbering, mapping 1:1 onto the OE decoder (§6.8). 90/91 are train-definition sugar and are rejected here. `M<ch>?` returns shadow state (new); running trains switch the OE pins autonomously (driven channels end grounded, shadow tracks that). |
@@ -136,6 +160,22 @@ convert incorrectly on the DAC → `WARN` on set.
 | `P` | save slots 0–9 + ENV/MEAS + TRIG table to EEPROM (versioned, checksummed) | legacy confirmation |
 
 ## 4. New long-form commands
+
+### `DELAY` — per-train post-trigger delay
+
+```
+DELAY<idx>,<delay_us>        0 .. 2000000000 (2000 s)
+DELAY<idx>?  →  DELAY<idx>,<delay_us>
+```
+
+Convenience setter for the same field the `S`/`L`/`W` header carries as its optional 6th
+value (§2, which also documents the semantics and the reset-on-redefinition rule). Refused
+while the slot is attached to a running train, like every other slot edit.
+
+Accuracy: the delay is an exact integer cycle count on the `cycles64()` timebase. Measured on a
+PicoScope 2204A from the trigger edge to the first output sample, corrected for the 7.5 µs skew
+between the two engines' arming: 2000 µs set → 1999.3 µs, 5000 → 5000.2, 20000 → 20002.7, the
+residual being the scope's own sample interval.
 
 ### `ENV` — per-train amplitude envelope
 
@@ -218,26 +258,37 @@ TRIG<t>,<mode>,<slot0>,<slot1>,<edge>
 TRIG<t>?  → canonical line
 ```
 
-- `mode`: 0 disabled; 1 joint — edge starts `slot0` on both channels synchronized (`slot1` must be
-  −1); 2 independent — edge starts `slot0` on channel 0 and `slot1` on channel 1 (−1 = none);
-  3 output marker (pin driven high during stimulus — legacy `R…,…,1`; slots must be −1).
+- `mode`: 0 disabled; 1 joint — edge starts `slot0` on engine 0 (`slot1` must be −1; which
+  physical channels move is a property of the slot's own mode fields, so "both channels
+  synchronized" is expressed in the waveform definition, not in the routing); 2 independent —
+  edge starts `slot0` on engine 0 and `slot1` on engine 1 (−1 = none); 3 output marker (the same
+  pin becomes an output driven high during each stimulus — legacy `R…,…,1`; slots must be −1).
 - `edge`: 0 rising, 1 falling (required for modes 1–2).
-- A trigger for a busy channel is dropped; `trigRejectCount` increments and a `WARN` is printed
-  from `loop()`.
+- A trigger for a busy engine or channel is dropped; the reject counter increments and a `WARN`
+  is printed from `loop()` (the edge ISR never prints).
 - Boot default (no valid EEPROM): both triggers mode 3 — matches legacy boot state.
+- The edge ISR runs the whole arm-and-start in place at priority 80, below the players (64): a
+  trigger can never delay a waveform already playing, and the trigger-to-first-sample latency is
+  the fixed `START_LATENCY` plus the slot's `delay_us`, not something that depends on how busy
+  `loop()` is. Loop-context `T`/`U` takes the bus lock around `startTrain` so a trigger edge
+  cannot interleave with it.
+- In mode 2 the two engines are armed one after the other inside the same ISR, which puts
+  engine 1 about **7.5 µs** behind engine 0 (measured). Trains that must be sample-
+  synchronous belong in one slot driving both channels (mode 1), not in two.
 
 ### Status and utility
 
 | Cmd | Reply |
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
-| `IDN` | `IDN,stimjimAWG,Teensy3.5,fw=<x.y.z>,proto=1` (also in boot banner; lets the Python GUI feature-detect) |
+| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>` and `# engine: …, K_RELOAD=<n> cycles`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)). |
+| `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
-| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, `OK`. Paste-back restores the configuration. Until the `TRIG` setter exists (Phase 8) the `TRIG` lines are emitted as `#` comments so paste-back stays clean. |
+| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, `OK`. Paste-back restores the configuration, `TRIG` lines included (they are real set-commands). |
 | `LOG` | SD logging: `LOG?` status (card present, open file, bytes); `LOG1[,name]` open new file; `LOG0` close/flush. |
-| `BENCH` | benchmark group (implemented in Phase 1, see below). |
+| `BENCH` | hardware benchmark group, see below. |
 
-**`BENCH` group** (Phase 1). Timing results are printed in CPU cycles (120/µs) and ns; multi-line
+**`BENCH` group.** Timing results are printed in CPU cycles (120/µs on a Teensy 3.5) and ns; multi-line
 output ends with `OK`. `BENCH?` lists the group. DAC benches program without latching (or re-latch
 the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive the DAC and print a
 `WARN` first — keep outputs grounded (boot state).
@@ -259,14 +310,15 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 
 | Item | Default |
 |---|---|
-| Slot (boot, all 100) | mode0=mode1=3 (grounded = not driven), period=10000 µs, duration=500000 µs, 0 stages, type=S |
+| Slot (boot, all 100) | mode0=mode1=3 (grounded = not driven), period=10000 µs, duration=500000 µs, delay=0 µs, 0 stages, type=S |
+| `DELAY` | 0 (fire on the start request); reset to 0 by any `S`/`L`/`W` line without the 6th header field |
 | `ENV` | 0,0,0 (no ramp) |
 | `MEAS` | 3,3,auto-when (0 for S/L, 3 for W),-1 (all stages),0 (summary only) |
 | `READ` sample count | 16 |
 | Triggers | both `TRIG<t>,3,-1,-1,0` (output marker) |
 | `R` third argument | 0 (trigger-input mode) |
 | Ramp sample interval | 20 µs (`TARGET_DT_US`) |
-| EEPROM restore | overrides boot defaults for slots 0–9 + ENV/MEAS + TRIG when version+checksum valid |
+| EEPROM restore | overrides boot defaults for slots 0–9 + ENV/MEAS/DELAY + TRIG when version+checksum valid (image v4; older images are rejected outright, never re-interpreted) |
 | Serial | USB CDC — baud irrelevant (fixes the `Serial.begin(112500)` typo) |
 
 ## 6. Compatibility appendix
@@ -308,6 +360,13 @@ Deliberate behavior changes (documented compat risk, all fail-loudly):
 10. `B` replies with a lone `OK` (the legacy handler printed nothing at all). `B`/`C` are refused
     while a train is running (calibration would fight the players for the SPI bus for hundreds
     of ms).
+11. The optional 6th header field `delay_us` (§2) is new syntax, not a changed meaning: legacy
+    5-field lines parse and serialize exactly as before. The one behaviour worth knowing is
+    that a waveform line *without* the field clears any delay the slot had — the header is
+    defined by the line, never inherited.
+12. `R` now writes the routing table instead of erroring, and `DUMP` emits `TRIG` lines as real
+    set-commands rather than `#` comments, so a dump pastes back complete. `R<t>,<slot>` with
+    `slot = -1` disables the input (mode 0) rather than routing nothing.
 
 Corrections to stale legacy documentation:
 

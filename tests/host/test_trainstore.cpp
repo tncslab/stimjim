@@ -230,6 +230,50 @@ int main() {
   TrainStore::serializeMeas(7, {3, 3, 3, -1, 1}, line, sizeof line);
   CHECK_STREQ(line, "MEAS7,3,3,3,-1,1");
 
+  // --------------------------------------- optional post-trigger delay field
+  // A legacy header (5 fields) must keep meaning exactly what it meant before:
+  // no delay, and a canonical line that carries no 6th field either.
+  CHECK(parse('S', ",0,1,2000,1000000;100,0,150", t, err, warn));
+  CHECK(t.delay_us == 0);
+  TrainStore::serializeTrain(0, t, line, sizeof line);
+  CHECK_STREQ(line, "S0,0,1,2000,1000000;100,0,150");
+
+  // 6th header field = delay, on each of the three waveform letters
+  CHECK(parse('S', ",0,1,2000,1000000,2500;100,0,150", t, err, warn));
+  CHECK(t.delay_us == 2500 && t.nStages == 1 && t.period_us == 2000);
+  TrainStore::serializeTrain(4, t, line, sizeof line);
+  CHECK_STREQ(line, "S4,0,1,2000,1000000,2500;100,0,150");
+  CHECK(parse('S', line + 2, t, err, warn));            // canonical form round-trips
+  TrainStore::serializeTrain(4, t, line2, sizeof line2);
+  CHECK_STREQ(line, line2);
+
+  CHECK(parse('L', ",0,0,5000,100000,750;1000,1000,200", t, err, warn));
+  CHECK(t.type == PIECEWISE_RAMP && t.delay_us == 750);
+  CHECK(parse('W', ",0,0,10000,1000000,30000;1000,1000,5000;100,100,0;0,0,0", t, err, warn));
+  CHECK(t.type == SINE && t.delay_us == 30000 && t.sine.freq0_mHz == 100000);
+  TrainStore::serializeTrain(2, t, line, sizeof line);
+  CHECK_STREQ(line, "W2,0,0,10000,1000000,30000;1000,1000,5000;100,100,0;0,0,0;0,0,0");
+  CHECK(parse('W', line + 2, t, err, warn));
+  TrainStore::serializeTrain(2, t, line2, sizeof line2);
+  CHECK_STREQ(line, line2);
+
+  // Omitting the field resets the delay: an S/L/W line fully defines its header,
+  // so replaying an old script cannot inherit a delay set earlier.
+  TrainDef withDelay;
+  TrainStore::slotDefault(withDelay);
+  withDelay.delay_us = 12345;
+  CHECK(parse('S', ",0,1,2000,1000000;100,0,150", t, err, warn, &withDelay));
+  CHECK(t.delay_us == 0);
+
+  CHECK(!parse('S', ",0,1,2000,1000000,-5;100,0,150", t, err, warn));   // negative
+  CHECK(!parse('S', ",0,1,2000,1000000,2000000001;100,0,150", t, err, warn));  // over the cap
+  CHECK(parse('S', ",0,1,2000,1000000,2000000000;100,0,150", t, err, warn));   // exactly the cap
+  CHECK(t.delay_us == 2000000000u);
+  CHECK(!parse('S', ",0,1,2000,1000000,;100,0,150", t, err, warn));      // empty field
+
+  TrainStore::serializeDelay(9, 4200, line, sizeof line);
+  CHECK_STREQ(line, "DELAY9,4200");
+
   // ------------------------------------------------------- default helpers
   TrainStore::slotDefault(cur);
   CHECK(TrainStore::isDefaultTrain(cur) && TrainStore::isDefaultEnv(cur.env));

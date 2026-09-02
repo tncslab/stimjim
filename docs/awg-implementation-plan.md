@@ -1,7 +1,7 @@
 # stimjimAWG — implementation plan
 
-Status: approved plan (Phase 0, 2026-07-09). Target folder `stimjimAWG/` (branch `arbitrary_waveform`).
-Companion documents: [serial-protocol.md](serial-protocol.md), [hardware-notes.md](hardware-notes.md), [PROGRESS.md](PROGRESS.md).
+Status: in progress. Target folder `stimjimAWG/` (branch `arbitrary_waveform`).
+Companion documents: [serial-protocol.md](serial-protocol.md), [hardware-notes.md](hardware-notes.md), [hardware-variants.md](hardware-variants.md), [PROGRESS.md](PROGRESS.md).
 License: GPL-3.0-or-later (same as the rest of the project).
 
 ## 1. Context and goals
@@ -50,7 +50,8 @@ These answer the spec's "find out and decide" items.
 Each channel player owns one PIT channel. Two of the four PITs are reserved by acquiring
 `IntervalTimer` objects first in `setup()` (so the Teensyduino core cannot hand them out), then
 their `PIT_LDVALn/TCTRLn/TFLGn` registers are driven directly with our own ISRs. The core's
-low-to-high PIT allocation must be confirmed once in the Teensyduino source (Phase 1 checklist).
+low-to-high PIT allocation is not relied on: the granted channel is identified by diffing the
+TCTRL enable bits around each begin().
 
 Timebase: DWT `CYCCNT` extended to 64 bits in software (`cycles64()`, 8.33 ns resolution). At
 120 MHz CPU / 60 MHz bus, **1 µs = exactly 120 CPU cycles = exactly 60 PIT cycles** — all
@@ -85,7 +86,7 @@ DMA-driven SPI on the K64 is technically possible but the wrong trade for this b
   included.
 
 The `dacProgram`/`dacLatch` split in `FastIO` is exactly the seam a future DMA backend would
-replace if Phase 6 benchmarks disappoint — the decision is revisitable without redesign.
+replace if the benchmarks disappoint — the decision is revisitable without redesign.
 
 ### 3.3 Generation from ISR, not loop(); priority map
 
@@ -140,7 +141,7 @@ issued during a train).
 
 ### 3.5 Sample synthesis
 
-Decided numerics (Phase 4; the pure math lives in `SampleGen`, host-tested by
+Decided numerics (the pure math lives in `SampleGen`, host-tested by
 `tests/host/test_samplegen.cpp`):
 
 **Timebase and integer/float policy.** All event *times* are 64-bit CPU-cycle counts on the
@@ -287,31 +288,32 @@ for the spec's "button … may allow setting the waveform". Screen geometry live
 defines for the taller-display upgrade; current buttons map Btn0→OK (BACK synthesized from OK
 long-press), Btn1/Btn2→prev/next — 1:1 replaceable by the rotary encoder events.
 
-## 6. Implementation phases
+## 6. What is built and what remains
 
-Per project convention (CLAUDE.md): commit at each phase end and append a handoff entry to
-[PROGRESS.md](PROGRESS.md).
+Per project convention (CLAUDE.md), each phase ends with a commit and a handoff entry under
+`docs/progress/`, indexed by [PROGRESS.md](PROGRESS.md); that log is where the history lives.
 
-- **Phase 0 — Planning (this document).** docs/ + firmware-spec.md SD amendment + commit.
-- **Phase 1 — Scaffold + FastIO + bench harness.** All files compiling; register-level split
-  DAC/ADC ops; `cycles64`; `busLock`; `BENCH` commands; `K_RELOAD` boot self-calibration.
-  Scope-verify `dacProgram`+`dacLatch` ≡ `Stimjim.writeToDac`.
-- **Phase 2 — TrainStore + protocol core.** Legacy commands with atomic staging, `?` queries,
-  round-trip serializers. Verify against StimJimBIST and the README/header example command lines.
-- **Phase 3 — Scheduler + HOLD trains.** `T`/`U` live for `S` slots (copy-on-arm, completion
-  ring, `STAT`); `READ` manual measurement; jitter histograms vs acceptance (latch < 200 ns;
-  ≤ 1 µs cumulative over a 10 s train; trigger latency = `START_LATENCY` ± 1 µs); A/B against
-  old firmware on the scope.
-- **Phase 4 — RAMP (`L`), 0-duration chains, drift-free repeats, envelope (`ENV`).**
-- **Phase 5 — Sine (`W`).** int16 table, applied phase, per-train Fs; confirm ~30 KB RAM saved.
-- **Phase 6 — Dual channel.** dualSync + two independent players; collision-jitter benchmark;
-  publish the measured FsMax table into `Config.h` with ~30 % margin.
-- **Phase 7 — Measurement engine + SD.** `MeasurePlan` execution (stage-end / sine-peak events,
-  per-stage selection, Σv/Σv² accumulation), `MSUM` summaries; `SdLog` + `LOG`; MDATA ring
-  (record format final; live streaming optional).
-- **Phase 8 — Triggers, UI, persistence, final protocol.** `TRIG`/`R`, button/menu UI, EEPROM v2,
-  `STAT`/`IDN`/`HELP`/`DUMP` final; full verification battery (Rigol DG800 Pro → IN0
-  trigger-latency measured on the TDS 2004B; long-run drift).
+**Built and on hardware.** The scaffold and `FastIO` (register-level split DAC/ADC ops,
+`cycles64`, `busLock`, the `BENCH` group, `K_RELOAD` boot self-calibration); `TrainStore` with
+atomic staging, `?` queries and round-trip serializers; the deadline scheduler and both channel
+players, playing `S`, `L` and `W` slots with the `ENV` envelope, copy-on-arm, the completion ring
+and `STAT`; the per-slot post-trigger delay; `TRIG`/`R` routing with edge ISRs and the stimulus
+marker; EEPROM persistence; the OLED status display with `SCREEN` capture; and the register /
+portable backend split that lets the same source run on Teensy 3.x and 4.x
+([hardware-variants.md](hardware-variants.md)).
+
+**Remaining work.**
+
+- **Bench constants.** Run the `BENCH` group on hardware and replace the estimated
+  `SJ_DAC_PROG*_US`, `SJ_PRELOAD_US` and `SJ_FS_MAX_HZ`; the dual-channel collision-jitter
+  benchmark and a measured FsMax table with ~30 % margin. This also settles the acceptance
+  numbers the design targets: latch jitter < 200 ns, ≤ 1 µs cumulative over a 10 s train,
+  trigger latency = `START_LATENCY` ± 1 µs.
+- **Measurement engine + SD.** `MeasurePlan` execution (stage-end and sine-peak events, per-stage
+  selection, Σv/Σv² accumulation), `MSUM` summaries, `SdLog` + `LOG`, and the MDATA ring (record
+  format already fixed; live streaming optional).
+- **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`), long-run drift
+  measurement, and the full trigger-latency battery.
 
 ## 7. Bench-verify, don't guess
 

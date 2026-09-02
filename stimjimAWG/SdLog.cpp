@@ -1,4 +1,4 @@
-//    stimjimAWG — SdLog implementation placeholder (Phase 7).
+//    stimjimAWG — SdLog: not implemented yet (see SdLog.h).
 //    GPL-3.0-or-later; see Config.h header.
 
 #include "SdLog.h"

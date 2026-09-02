@@ -1,0 +1,67 @@
+# On-target bench harness for stimjimAWG
+
+Scripts that talk to a StimJim running `stimjimAWG` over USB serial and, where a measurement
+needs microsecond accuracy, to a PicoScope. They need `pyserial` and `matplotlib`; the PicoScope
+driver is loaded straight from the PicoScope application's install directory by `ctypes`, so
+there is nothing else to install.
+
+| File | What it is |
+|---|---|
+| `sjcon.py` | Serial console. Library (`StimJim.cmd`, `.cmd1`, `.reset`) and a CLI: `python sjcon.py COM4 IDN "S0?" DUMP` |
+| `smoke.py` | Serial-only regression run: identity, backward compatibility, the post-trigger delay set both ways, rejection paths, completion reporting, and an OLED capture in each of the three views |
+| `pico2000.py` | ctypes binding for the legacy `ps2000` driver (the PicoScope 2204A needs it, not `ps2000a`). Run it directly to probe the scope |
+| `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
+
+```
+python smoke.py COM4 --screens ../../tmp/screens
+python capture.py all
+```
+
+`smoke.py` exits with the number of failed checks.
+
+## Bench wiring
+
+```
+PicoScope AWG  -> StimJim trigger input IN0
+StimJim CH0(+) -> PicoScope channel A ("channel 1")
+StimJim CH1(+) -> PicoScope channel B ("channel 2")
+StimJim CH0(-) -> PicoScope ground
+
+A(CH1+) --1k-- B(CH0+) --1k-- C(CH0-) --[two antiparallel LEDs]-- D(CH1-)
+```
+
+The AWG wire is not teed to a scope input, so `capture.py` measures the trigger-to-output delay
+differentially: the same edge starts a zero-delay reference pulse on CH1 and the delayed pulse
+under test on CH0, the scope triggers on the reference, and the two engines' arming skew
+(measured the same way with the delay set to 0, ~7.5 µs) is subtracted.
+
+The resistor network couples the channels, and the captures show it: while CH0 is grounded a
+CH1 pulse divides down onto B, and a CH0 pulse is clamped onto A at the LEDs' forward drop
+(~2.2 V). That is the circuit, not the instrument.
+
+## Gotchas found on this bench
+
+- **Close the PicoScope application first.** It holds the USB device exclusively and
+  `ps2000_open_unit` then returns 0.
+- The 2204A is 8-bit: on the ±10 V range one code is 78 mV, so a trigger threshold within a few
+  codes of the baseline sits inside the trigger hysteresis and never fires. Keep scope trigger
+  levels ≥1 V clear of ground.
+- Capture buffer is 3968 samples with both channels enabled.
+- A one-shot train cannot be started *after* arming the scope from the host — the serial round
+  trip alone is tens of milliseconds. Shape captures run against a multi-second train instead.
+- Host-side timing over serial is good to roughly ±200 ms because a `STAT` poll costs 60–150 ms.
+  `smoke.py` only uses it as a sanity check; `capture.py` is the real measurement.
+
+## Building and flashing
+
+The Arduino IDE keeps no `arduino-cli.yaml`, so a bare `arduino-cli` invocation does not know the
+Teensy board index and reports "Platform 'teensy:avr' not found". `tmp/arduino-cli.yaml` (created
+on demand, not tracked) supplies the index URL and the IDE's data/user directories:
+
+```
+arduino-cli --config-file tmp/arduino-cli.yaml compile --fqbn teensy:avr:teensy35 --warnings more stimjimAWG
+arduino-cli --config-file tmp/arduino-cli.yaml upload  --fqbn teensy:avr:teensy35 -p COM4 stimjimAWG
+```
+
+Build with `-DSJ_BOOT_TRACE` to make `setup()` wait for a serial host and announce each init
+step; that is how a hang in initialization gets pinned down in one flash cycle.
