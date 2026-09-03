@@ -15,6 +15,17 @@ sample is emitted from the timer ISR; generation is interrupt-driven with a boun
 microseconds per event, not a busy loop; and an SD write can never delay a waveform, because only
 `loop()` touches the card and the player ISRs preempt it.
 
+## 0. Terminology: what "latch" means here
+
+A **latch** is one DAC output update. The AD5752 keeps a written value in its input register and
+does nothing with it until the `NLDAC` pin is pulsed low, which transfers the value to the DAC
+register and moves the output. Analog Devices names that pin "load DAC", so **update** and **load**
+are the neutral synonyms; the word carries no sense of a software lock or mutex. This document uses
+"latch" for the event itself — the instant the output moves — and "update" wherever "latch" would
+read as locking. The engine's whole timing design rests on the two halves being separable: it
+*programs* (SPI write) during a preload window and *latches* (one `NLDAC` pulse, 0.44 µs) exactly
+on the deadline.
+
 ## 1. Trigger-to-output latency
 
 A trigger start delivers its first DAC latch at
@@ -233,3 +244,55 @@ Nothing else goes to the card. Output samples are not dumped, and the persistent
 lives in the EEPROM, not on the card. The socket sits under the instrument cover, so the whole
 card is readable back over the serial port with the `SD` group — see
 [serial-protocol.md](serial-protocol.md) §4.
+
+## 7. Where the arm's microseconds go
+
+`STARTLAT` is sized by `Engine::startTrain`, so this section accounts for that cost. The target
+is a start latency no longer than the interval between two latches — the default `DT` and the
+50 kHz sine sample interval are both 20 µs — which means the arm has to fit in 8 µs, since
+`STARTLAT` must also cover `PRELOAD + DACPROG2 + MIN_SCHEDULE` = 12 µs.
+
+Measured with `BENCHARM` on a Teensy 3.5 at 120 MHz (120 cycles/µs), register backends:
+
+| Case | µs | Increment |
+|---|---|---|
+| undriven, 0 stages | 16.2 | the floor every arm pays |
+| `S`, 2 ch, 1 stage | 19.2 | |
+| `S`, 2 ch, 10 stages | 28.2 | ~1.0 µs per extra stage |
+| `S`, 2 ch, 1 stage, default `MEAS` | 23.4 | +4.2 µs for the measurement plan |
+| `L`, 2 ch, 1 stage | 22.8 | +3.6 µs per ramp stage |
+| `W`, 2 ch | 37.5 | +18.3 µs for the sine setup |
+
+What the arm produces, in the order it runs: gatekeeping (busy and channel-conflict checks, the
+Nyquist and ramp-interval refusals, a copy of the `CAL` set); copy-on-arm of the definition into
+the 912-byte player state, which is what keeps live serial editing safe mid-train; unit conversion
+of every stage amplitude to a DAC-code delta relative to the park code and every duration to a
+cumulative cycle offset, so the ISR does no unit math; the shape-specific constants (`L` Bresenham
+steps per stage, `W` sample rate and phase increments, the envelope's reciprocals); the
+measurement plan; and finally `t0` plus one timer program.
+
+Where the cost sits, from the compiled binary (`-O2`, hard single-precision FPU,
+`-fsingle-precision-constant`) rather than from a profile:
+
+- **The measurement plan is zeroed in full on every arm.** `sizeof(Measure::Plan)` is 1216 bytes,
+  960 of which are the accumulators, and `planBuild` opens with a `memset` of all of it — even for
+  a train that measures nothing. At 16 bytes per `memset` iteration that is ~600–900 cycles,
+  **5–7 µs of the 16.2 µs floor**.
+- **The sine setup is soft-float.** `SampleGen::sinePhaseInc` uses explicit `double`, which the
+  Cortex-M4F has no hardware for: nine library calls (3×`ui2d`, 3×`dmul`, `ddiv`, `adddf3`,
+  `d2uiz`) ≈ 450–500 cycles ≈ 4 µs, once per channel, so **~8 µs of the sine's 18.3 µs**. It is the
+  only double-precision arithmetic left in the arm — `ampToCode`'s division is a 14-cycle
+  `VDIV.F32`, because `-fsingle-precision-constant` narrows the unit constants.
+- **Each ramp stage pays two 64-bit divisions.** `rampStageInit` calls `__aeabi_uldivmod` twice
+  (~100–150 cycles each), which is most of the 430 cycles a ramp stage costs.
+- **The rest of the floor is straight-line copying that runs slower than it should.** After the
+  `memset`, ~1000–1300 cycles remain for roughly 200 instructions — 5–6 cycles per instruction,
+  too high for SRAM-resident M4 code. `startTrain` is 2800 bytes and `playerRun` 3164 bytes, and
+  the K64 fetches both through a flash controller with a 512-byte cache at 120 MHz. This is a
+  hypothesis, not a measurement; running the same code from RAM tests it directly.
+
+Of everything the arm computes, only the train-level scalars and **one stage's worth** of codes and
+times are needed at `t0`. Stage i's constants are first read at the end of stage i−1 — 20 µs to
+seconds later — and the measurement plan's first point cannot fire until at least `SETTLE` after
+the first latch. That gap between what is computed and what is needed is where the remaining
+microseconds are, and [PLAN_arm-cost.md](PLAN_arm-cost.md) is the plan to collect them.
