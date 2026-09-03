@@ -6,7 +6,8 @@ after a trigger edge, why that number is what it is, how it compares with the or
 interrupt actually starts, whether waveform generation occupies the CPU, and what SD logging
 costs and stores. The short answers: a trigger edge delivers the first latch a fixed **60 µs**
 later on a Teensy 3.5 with the register backends (`CAL STARTLAT`, adjustable without a rebuild),
-of which 16–42 µs is the arm itself and none is the DAC write; the original firmware had no fixed
+almost all of which is the arm — the copy and precomputation the edge ISR does before it hands the
+train to the timer — and none of which is the DAC write; the original firmware had no fixed
 figure at all, because it played the first pulse inside the trigger ISR after two USB
 `Serial.print` calls; the AD5752 *can* hold a preloaded code and fire on a bare `NLDAC` pulse in
 0.44 µs, so a pre-armed trigger path could reach a few microseconds, but that needs the arm moved
@@ -44,7 +45,7 @@ What has to fit in the window:
 
 | Term | Cost (T3.5, register backends) |
 |---|---|
-| `Engine::startTrain` — copy-on-arm, fixed-point precomputation, measurement plan | 16.2 µs undriven, 19.2 µs two-channel `S`, 23.5 µs measured `S`, 28.3 µs ten-stage `S`, 22.9 µs `L`, 37.5 µs `W` (`BENCHARM`) |
+| `Engine::startTrain` — copy-on-arm, fixed-point precomputation, measurement plan | 16.2–37.5 µs depending on the train, measured on the phase-9 firmware; work has since been moved out of it and the result is not re-measured — §7 has the accounting, the changes and the predictions |
 | `CAL PRELOAD` — how early the player ISR wakes before the first latch | 4 µs |
 | `CAL DACPROG2` — the dual-channel SPI write inside that window | 5 µs budgeted (2.75 µs measured) |
 | `SJ_MIN_SCHEDULE_US` | 3 µs |
@@ -245,23 +246,14 @@ lives in the EEPROM, not on the card. The socket sits under the instrument cover
 card is readable back over the serial port with the `SD` group — see
 [serial-protocol.md](serial-protocol.md) §4.
 
+
 ## 7. Where the arm's microseconds go
 
-`STARTLAT` is sized by `Engine::startTrain`, so this section accounts for that cost. The target
-is a start latency no longer than the interval between two latches — the default `DT` and the
-50 kHz sine sample interval are both 20 µs — which means the arm has to fit in 8 µs, since
-`STARTLAT` must also cover `PRELOAD + DACPROG2 + MIN_SCHEDULE` = 12 µs.
-
-Measured with `BENCHARM` on a Teensy 3.5 at 120 MHz (120 cycles/µs), register backends:
-
-| Case | µs | Increment |
-|---|---|---|
-| undriven, 0 stages | 16.2 | the floor every arm pays |
-| `S`, 2 ch, 1 stage | 19.2 | |
-| `S`, 2 ch, 10 stages | 28.2 | ~1.0 µs per extra stage |
-| `S`, 2 ch, 1 stage, default `MEAS` | 23.4 | +4.2 µs for the measurement plan |
-| `L`, 2 ch, 1 stage | 22.8 | +3.6 µs per ramp stage |
-| `W`, 2 ch | 37.5 | +18.3 µs for the sine setup |
+`STARTLAT` is the trigger latency and `Engine::startTrain` is what sizes it, so this section
+accounts for the arm. The **goal is an arm inside one latch interval**: the shortest interval the
+engine schedules is 20 µs (the default `DT`, and the sine sample interval at the 50 kHz `FS_MAX`
+ceiling), and `STARTLAT` must also cover `PRELOAD + DACPROG2 + MIN_SCHEDULE` = 12 µs, so the arm
+has to fit in **8 µs**.
 
 What the arm produces, in the order it runs: gatekeeping (busy and channel-conflict checks, the
 Nyquist and ramp-interval refusals, a copy of the `CAL` set); copy-on-arm of the definition into
@@ -271,28 +263,120 @@ cumulative cycle offset, so the ISR does no unit math; the shape-specific consta
 steps per stage, `W` sample rate and phase increments, the envelope's reciprocals); the
 measurement plan; and finally `t0` plus one timer program.
 
-Where the cost sits, from the compiled binary (`-O2`, hard single-precision FPU,
+Of all that, only the train-level scalars and **one stage's worth** of codes and times are needed
+at `t0`. Stage i's constants are first read at the end of stage i−1 — 20 µs to seconds later — and
+the measurement plan's first point cannot fire until at least `SETTLE` after the first latch.
+
+### Measured, on the phase-9 firmware
+
+`BENCHARM` on a Teensy 3.5 at 120 MHz (120 cycles/µs), register backends. These figures predate
+the reductions below and are the baseline they are measured against:
+
+| Case | µs | Increment |
+|---|---|---|
+| undriven, 0 stages | 16.2 | the floor every arm paid |
+| `S`, 2 ch, 1 stage | 19.2 | |
+| `S`, 2 ch, 10 stages | 28.2 | ~1.0 µs per extra stage |
+| `S`, 2 ch, 1 stage, default `MEAS` | 23.4 | +4.2 µs for the measurement plan |
+| `L`, 2 ch, 1 stage | 22.8 | +3.6 µs per ramp stage |
+| `W`, 2 ch | 37.5 | +18.3 µs for the sine setup |
+
+Where that went, read off the compiled binary (`-O2`, hard single-precision FPU,
 `-fsingle-precision-constant`) rather than from a profile:
 
-- **The measurement plan is zeroed in full on every arm.** `sizeof(Measure::Plan)` is 1216 bytes,
-  960 of which are the accumulators, and `planBuild` opens with a `memset` of all of it — even for
-  a train that measures nothing. At 16 bytes per `memset` iteration that is ~600–900 cycles,
+- **The measurement plan was zeroed in full on every arm.** `sizeof(Measure::Plan)` is 1216 bytes,
+  960 of which are the accumulators, and `planBuild` opened with a `memset` of all of it — even
+  for a train that measures nothing. At 16 bytes per `memset` iteration that is ~600–900 cycles,
   **5–7 µs of the 16.2 µs floor**.
-- **The sine setup is soft-float.** `SampleGen::sinePhaseInc` uses explicit `double`, which the
+- **The sine setup was soft-float.** `SampleGen::sinePhaseInc` uses explicit `double`, which the
   Cortex-M4F has no hardware for: nine library calls (3×`ui2d`, 3×`dmul`, `ddiv`, `adddf3`,
-  `d2uiz`) ≈ 450–500 cycles ≈ 4 µs, once per channel, so **~8 µs of the sine's 18.3 µs**. It is the
-  only double-precision arithmetic left in the arm — `ampToCode`'s division is a 14-cycle
+  `d2uiz`) ≈ 450–500 cycles ≈ 4 µs, once per channel, so **~8 µs of the sine's 18.3 µs**. It is
+  the only double-precision arithmetic anywhere in the arm — `ampToCode`'s division is a 14-cycle
   `VDIV.F32`, because `-fsingle-precision-constant` narrows the unit constants.
-- **Each ramp stage pays two 64-bit divisions.** `rampStageInit` calls `__aeabi_uldivmod` twice
-  (~100–150 cycles each), which is most of the 430 cycles a ramp stage costs.
-- **The rest of the floor is straight-line copying that runs slower than it should.** After the
-  `memset`, ~1000–1300 cycles remain for roughly 200 instructions — 5–6 cycles per instruction,
-  too high for SRAM-resident M4 code. `startTrain` is 2800 bytes and `playerRun` 3164 bytes, and
-  the K64 fetches both through a flash controller with a 512-byte cache at 120 MHz. This is a
-  hypothesis, not a measurement; running the same code from RAM tests it directly.
+- **Each ramp stage paid two 64-bit divisions.** `rampStageInit` called `__aeabi_uldivmod` twice
+  (~100–150 cycles each), most of the 430 cycles a ramp stage costs.
+- **What remains runs slower than its instruction mix explains.** After the `memset`, ~1000–1300
+  cycles were left for roughly 200 instructions — 5–6 cycles per instruction, too high for
+  SRAM-resident M4 code. `startTrain` is ~2.8 kB and `playerRun` ~3.2 kB, and the K64 fetches both
+  through a flash controller with a 512-byte cache at 120 MHz.
 
-Of everything the arm computes, only the train-level scalars and **one stage's worth** of codes and
-times are needed at `t0`. Stage i's constants are first read at the end of stage i−1 — 20 µs to
-seconds later — and the measurement plan's first point cannot fire until at least `SETTLE` after
-the first latch. That gap between what is computed and what is needed is where the remaining
-microseconds are, and [PLAN_arm-cost.md](PLAN_arm-cost.md) is the plan to collect them.
+### What the firmware does now
+
+Four changes, all of them moving work out of the arm rather than making it faster:
+
+1. **The measurement plan is compiled once per definition, not once per arm.** The compiled region
+   depends only on `(slot, definition, CAL)` — never on the calibration offsets — so it carries
+   that tag and `armPlan` skips the compile when it matches. Every trigger edge after the first
+   reuses it.
+2. **Only the plan a train uses is zeroed.** The compiled region is 242 bytes of the struct's
+   1224, and the accumulators are cleared per existing point (96 bytes each) instead of all ten.
+   An unmeasured train, and any re-arm that hits the tag, zeroes nothing at all.
+3. **The sine constants are derived when `W` is parsed.** `sampleCyc`, both phase increments and
+   both start phases depend on the definition alone, so they are computed in command context and
+   cached per slot (2 kB), keyed on the definition epoch. No soft-float double is left in the arm.
+   The arm still derives on demand if the cache was invalidated, so correctness never depends on
+   the warm-up — only the latency does.
+4. **The ramp's time-axis division is 32-bit.** `qt = durCyc/N` and `rt = durCyc%N` are computed as
+   `qt = (dur_us/N)·cycPerUs + ((dur_us%N)·cycPerUs)/N`, `rt = ((dur_us%N)·cycPerUs)%N`, which is
+   an algebraic identity, not an approximation: four hardware `UDIV`s replace two
+   `__aeabi_uldivmod` calls with bit-identical results. Stages longer than ~35 s fall back to the
+   64-bit form, and `tests/host/test_samplegen.cpp` checks both paths against the 64-bit reference
+   over the whole range including both overflow guards.
+
+And one change of placement: **`SJ_CODE_IN_RAM` (default on for Kinetis) puts `startTrain` and
+`playerRun` in the `.fastrun` section**, which the core copies from flash into SRAM at boot, so
+they execute without flash wait states. It costs 6120 B of RAM and nothing else — the copy is
+remade from the flash image on every reset, and the MCU's POR/LVD resets the chip long before SRAM
+contents could decay, so there is no failure mode here that the stack and globals do not already
+have. `IDN` reports `hot=RAM`, `hot=flash` or `hot=ITCM` (Teensy 4.x runs all code from RAM
+anyway), because a `BENCHARM` figure is only comparable against a binary with the same answer.
+To build the flash-resident half of the A/B, pass the define through the property the Teensy
+recipe actually reads — `compiler.cpp.extra_flags` is silently ignored here
+([hardware-variants.md](hardware-variants.md) §1):
+
+```
+arduino-cli --config-file tmp/arduino-cli.yaml compile --fqbn teensy:avr:teensy35 \
+  --build-property "build.flags.defs=-D__MK64FX512__ -DTEENSYDUINO=160 -DSJ_CODE_IN_RAM=0" \
+  --warnings more stimjimAWG
+```
+
+### Predicted, and not yet measured
+
+Subtracting the pieces above from the measured baseline predicts, before any flash-wait-state
+effect:
+
+| Case | measured (phase 9) | predicted |
+|---|---|---|
+| undriven, 0 stages | 16.2 | ~10.7 |
+| `S`, 2 ch, 1 stage | 19.2 | ~13.7 |
+| `S`, 2 ch, 1 stage, `MEAS` | 23.4 | ~14 |
+| `L`, 2 ch, 1 stage | 22.8 | ~14.8 |
+| `L`, 2 ch, 10 stages | ~61 (projected, never measured) | ~30 |
+| `W`, 2 ch | 37.5 | ~24 |
+
+**None of this is measured yet**, and `CAL STARTLAT` therefore stays at 60 µs: lowering a budget
+on a prediction is exactly the mistake phase 9 was spent correcting. `tests/device/bench_arm.py`
+runs `BENCHARM` over one slot per shape — including the ten-stage `L` case that has never been
+measured — and prints what `STARTLAT` each case needs, using the board's own `CAL` values. Run it
+on both binaries (`hot=RAM` and `hot=flash`) and the flash-wait-state hypothesis is settled at the
+same time.
+
+If the prediction holds and RAM residency buys the 30–50 % the hypothesis implies, a single-stage
+`S`, `L` or `W` train reaches the 8 µs target and `STARTLAT` can go to ~20 µs. A ten-stage `L`
+train will not, and cannot without deriving stages during playback — the one deferred item below.
+
+### Planned, not implemented
+
+- **Derive stage i+1 during stage i.** Removes `(nStages−1) × ~1.0 µs` for `S` and `× ~2 µs` for
+  `L` from the arm, and is the only route to a multi-stage `L` train inside 8 µs. Deferred because
+  it turns one straight-line function into a state machine whose invariants have to hold in ISR
+  context. Its prerequisite is in place: a 0-duration `L` stage means "shift the level here, then
+  ramp on from it", and two in a row are now refused at parse time, so a lazy scheme never has to
+  look more than one stage ahead — on entering a 0-duration stage it prepares the next one too.
+- **Pre-build the plan when a `TRIG` route is set.** The tag makes every arm after the first free,
+  but the first arm after an edit still compiles inside the start latency. Warming it when the
+  route is set would close that hole; it needs the train geometry computed outside `startTrain`.
+- **Pre-arm the whole train and fire on a bare `NLDAC` pulse** (§3). This makes the arm's cost
+  irrelevant rather than smaller, and is the only path to a single-digit *total* trigger latency.
+- **`CAL TRIGCOMP`** is still 0 and unmeasured — the one term of the delivered latency that
+  software cannot see. [bench-wiring.md](bench-wiring.md) configuration B measures it.

@@ -19,11 +19,15 @@ static bool     discarding = false;   // overflow: swallow until next '\n'
 void printIdentity(Print& out) {
   out.printf("IDN,%s,%s,fw=%s,proto=%d\n",
              SJ_FW_NAME, SJ_HW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);
-  out.printf("# build: %s, F_CPU=%lu MHz, fastio=%s, timer=%s, sd=%s\n",
+  // `hot` is where the arm and the player event loop execute from. It belongs
+  // next to the backends because it changes the same numbers they do: RAM-
+  // resident code skips the flash controller's wait states, so a BENCHARM
+  // figure is only comparable against another binary with the same answer.
+  out.printf("# build: %s, F_CPU=%lu MHz, fastio=%s, timer=%s, sd=%s, hot=%s\n",
              SJ_HW_NAME, (unsigned long)(F_CPU / 1000000),
              SJ_FASTIO_REGISTER ? "registers" : "Arduino-SPI",
              SJ_TIMER_REGISTER  ? "raw-PIT"   : "IntervalTimer",
-             SJ_USE_SD ? "yes" : "no");
+             SJ_USE_SD ? "yes" : "no", SJ_HOT_NAME);
   // `cal` says whether the timing budgets are still this build's defaults;
   // a board calibrated by hand answers `custom`, and `CAL?` prints the values.
   const char* calState = Cal::isDefault() ? "default" : "custom";

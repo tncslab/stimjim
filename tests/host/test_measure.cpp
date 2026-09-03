@@ -145,6 +145,58 @@ static void testHoldPlan() {
   CHECK(p.atCyc[0] < p.atCyc[1] && p.atCyc[1] < p.atCyc[2]);
 }
 
+// planBuild no longer zeroes the whole Plan: it clears the compiled region and
+// the accumulators of the points it produced, because the full 1224-byte memset
+// cost 5-7 us inside the start latency (docs/timing.md §7). Anything that lands
+// in the struct after `acc` therefore has to be reset explicitly, and a field
+// added there without that would silently inherit the previous train's value.
+// Pre-poisoning the struct is what catches it.
+static void testPlanResetsWhatItMustNotInherit() {
+  TrainDef t;
+  defaultDef(t, 0, 1);
+  t.nStages = 2;
+  uint64_t cum[3] = {0, 100 * CYC, 300 * CYC};
+  t.stages[0].dur_us = 100;
+  t.stages[1].dur_us = 200;
+  Geometry g;
+  fillGeometry(g, PIECEWISE_HOLD, 0b11);
+  g.nStages = 2;
+  g.cum     = cum;
+
+  Plan p;
+  memset(&p, 0xAA, sizeof p);       // every byte non-zero going in
+  planBuild(p, 4, t, g);
+  CHECK(p.on);
+  CHECK_EQ(p.nPoints, 2);
+  // result state of the points that exist
+  for (uint8_t i = 0; i < p.nPoints; i++)
+    for (uint8_t ch = 0; ch < 2; ch++)
+      for (uint8_t ln = 0; ln < 2; ln++) {
+        CHECK_EQ(p.acc[i][ch][ln].n, 0);
+        CHECK_EQ(p.acc[i][ch][ln].sum, 0);
+        CHECK_EQ(p.acc[i][ch][ln].sumsq, 0);
+      }
+  CHECK_EQ(p.next, 0);
+  CHECK_EQ(p.envSkipped, 0);
+  // the tag is the caller's to set, so planBuild must leave it invalid rather
+  // than letting poison read as a valid cached compile
+  CHECK(!p.tagValid);
+  // the compiled region is zeroed, so masks and counters do not inherit either
+  CHECK_EQ(p.skipMask, 0);
+  CHECK_EQ(p.rotMask, 0);
+  CHECK_EQ(p.needCyc, 0);
+
+  // A plan that measures nothing returns early; the same must hold for it.
+  t.meas.what0 = t.meas.what1 = 0;
+  memset(&p, 0xAA, sizeof p);
+  planBuild(p, 4, t, g);
+  CHECK(!p.on);
+  CHECK_EQ(p.nPoints, 0);
+  CHECK_EQ(p.next, 0);
+  CHECK_EQ(p.envSkipped, 0);
+  CHECK(!p.tagValid);
+}
+
 static void testHoldStageTooShort() {
   // V+I on both channels needs roomOf(4) = 42 us; a 30 us stage cannot host it
   // and must be refused rather than pushing the next latch late.
@@ -563,6 +615,7 @@ static void testAccumStats() {
 int main() {
   testPeakSolver();
   testHoldPlan();
+  testPlanResetsWhatItMustNotInherit();
   testHoldStageTooShort();
   testStageSelection();
   testUndrivenAndDisabled();

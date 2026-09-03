@@ -78,6 +78,36 @@
   #error "stimjimAWG needs the Cortex-M DWT cycle counter (Teensy 3.x / 4.x)"
 #endif
 
+// --------------------------------------------------- code placement (Kinetis)
+//
+// The K64 fetches instructions from flash through a controller with a 512-byte
+// cache at 120 MHz, so a long straight-line function pays wait states its
+// instruction mix does not explain: the arm spends ~5-6 cycles per instruction
+// where SRAM-resident code would spend 1-2 (docs/timing.md §7). SJ_CODE_IN_RAM
+// puts the two functions whose cost is a latency -- the arm and the player
+// event loop -- in the .fastrun section, which the core's startup copies from
+// flash into SRAM at boot; they then execute at SRAM speed. It costs RAM equal
+// to their code size and nothing else: the copy is remade from the flash image
+// on every reset, so a brownout cannot leave stale code behind (and the MCU's
+// own POR/LVD resets it long before SRAM contents decay).
+//
+// Teensy 4.x already runs *all* code from ITCM RAM and needs FLASHMEM to opt
+// out, so this switch is Kinetis-only and a no-op elsewhere. Build with
+// -DSJ_CODE_IN_RAM=0 to A/B it with BENCHARM.
+#ifndef SJ_CODE_IN_RAM
+  #define SJ_CODE_IN_RAM SJ_MCU_KINETISK
+#endif
+#if SJ_CODE_IN_RAM && defined(FASTRUN)
+  #define SJ_HOT      FASTRUN
+  #define SJ_HOT_NAME "RAM"
+#elif defined(__IMXRT1062__)
+  #define SJ_HOT                  // Teensy 4.x: the core already runs all code from ITCM
+  #define SJ_HOT_NAME "ITCM"
+#else
+  #define SJ_HOT
+  #define SJ_HOT_NAME "flash"
+#endif
+
 // ------------------------------------------------------------ feature switches
 #define SJ_USE_DISPLAY   1   // SSD1306 128x32 on Wire @0x3C (geometry below)
 

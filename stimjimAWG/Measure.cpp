@@ -5,6 +5,7 @@
 #include "Measure.h"
 #include <math.h>
 #include <string.h>
+#include <stddef.h>   // offsetof: the Plan splits into a compiled and a result region
 
 namespace Measure {
 
@@ -95,8 +96,13 @@ static bool rotationShort(const Plan& pl) {
   return pl.reps < maxGrp;
 }
 
-void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
-  memset(&pl, 0, sizeof pl);
+// The compiled region runs from the start of the Plan up to the tag; the
+// result state follows it. Splitting the zeroing at that boundary is what took
+// the arm's memset from 1224 bytes to 242 plus 96 per point (Measure.h).
+#define SJ_PLAN_COMPILED_BYTES offsetof(Plan, tagValid)
+
+static void planCompile(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
+  memset(&pl, 0, SJ_PLAN_COMPILED_BYTES);
   pl.slot   = slot;
   pl.type   = g.type;
   pl.report = def.meas.report;
@@ -198,6 +204,21 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
   pl.rotShort = rotationShort(pl);
 }
 
+// Clear the result state: the accumulators of the points that exist, the
+// envelope-skip count and the point cursor. 96 bytes per point, so a one- or
+// two-point plan costs a fraction of what zeroing all ten did.
+static inline void planResetResults(Plan& pl) {
+  memset(pl.acc, 0, (size_t)pl.nPoints * sizeof pl.acc[0]);
+  pl.next       = 0;
+  pl.envSkipped = 0;
+}
+
+void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
+  planCompile(pl, slot, def, g);
+  pl.tagValid = false;          // the caller owns the tag
+  planResetResults(pl);
+}
+
 // ------------------------------------------------------------- device section
 #ifdef ARDUINO
 
@@ -235,9 +256,28 @@ void begin() {
 
 bool hasPlan(uint8_t eng) { return plan_[eng].on; }
 
-void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g) {
-  planBuild(plan_[eng], slot, def, g);
-  notePending[eng] = plan_[eng].on;
+void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
+             uint32_t defEpoch, uint32_t calEpoch) {
+  Plan& p = plan_[eng];
+  // The compiled region depends on the slot, its definition and the CAL set --
+  // never on the calibration offsets, which is why an offset recalibration is
+  // not in the tag. Re-arming an unedited slot therefore reuses it, and the
+  // 4.2 us compile drops out of every trigger edge after the first.
+  if (!p.tagValid || p.tagSlot != slot ||
+      p.tagDefEpoch != defEpoch || p.tagCalEpoch != calEpoch) {
+    planCompile(p, slot, def, g);
+    p.tagValid    = true;
+    p.tagSlot     = slot;
+    p.tagDefEpoch = defEpoch;
+    p.tagCalEpoch = calEpoch;
+  }
+  // Always: an armed train starts from zeroed accumulators. Keeping this in the
+  // arm rather than deferring it to the end of the previous train is deliberate
+  // -- a trigger that re-arms the engine before loop() has drained the previous
+  // completion would otherwise have its own accumulators wiped by that drain
+  // (docs/PLAN_arm-cost.md).
+  planResetResults(p);
+  notePending[eng] = p.on;
 }
 
 uint64_t nextDeadline(uint8_t eng, uint64_t pulseStart) {

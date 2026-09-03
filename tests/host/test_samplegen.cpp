@@ -136,6 +136,46 @@ static void testRamp() {
   }
 }
 
+// rampStageInit computes the time-axis quotient and remainder with 32-bit
+// divisions (a hardware UDIV each) and falls back to the 64-bit division only
+// for stages longer than ~35 s. The split is an algebraic identity, so this
+// walks both paths against the 64-bit reference: any disagreement is a bug in
+// the identity or in the overflow guard, and either would put ramp samples on
+// the wrong cycles.
+static void testRampDivisionPaths() {
+  const uint32_t dts[] = {2, 3, 7, 20, 999, 1000000};
+  const uint32_t durs[] = {
+    0, 1, 2, 3, 19, 20, 21, 41, 130, 999, 1000, 1001, 65535, 100000, 999999,
+    35791394,          // just under the fast path's b*cycPerUs limit
+    35791395, 35791396,
+    2000000000u,       // the practical ceiling (SJ_MAX_DELAY_US)
+    4294967295u,       // strtoul's ceiling: exercises both overflow guards
+    4294967290u,
+  };
+  for (uint32_t dt : dts)
+    for (uint32_t dur : durs) {
+      RampStage st;
+      rampStageInit(st, dur, CYC, dt, 0, 100, 0, -100);
+      // Reference: N and the division done entirely in 64-bit arithmetic.
+      uint32_t nRef = (uint32_t)(((uint64_t)dur + dt / 2) / dt);
+      if (nRef == 0) nRef = 1;
+      const uint64_t durCyc = (uint64_t)dur * CYC;
+      CHECK_EQ(st.N, nRef);
+      CHECK_EQ(st.qt, durCyc / nRef);
+      CHECK_EQ(st.rt, durCyc % nRef);
+      // The invariant the player depends on: N steps of (qt, rt) land exactly
+      // on the stage end, with no accumulated rounding.
+      uint64_t t = 0;
+      uint32_t acc = 0;
+      for (uint32_t k = 0; k < st.N; k++) {
+        t += st.qt;
+        acc += st.rt;
+        if (acc >= st.N) { acc -= st.N; t++; }
+      }
+      CHECK_EQ(t, durCyc);
+    }
+}
+
 static void testEnv() {
   // 100 us in, 200 us out, 1000 us duration (all in cycles below)
   const uint64_t t0 = 5000000;
@@ -238,6 +278,7 @@ static void testSine() {
 
 int main() {
   testRamp();
+  testRampDivisionPaths();
   testEnv();
   testScaleQ15();
   testSine();

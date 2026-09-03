@@ -89,6 +89,10 @@ const Def& live();             // the values the engine arms with
 const Def& defaults();         // the compiled-in defaults (DUMP compares against these)
 void       set(const Def& c);  // replace wholesale (EEPROM restore); caller validates first
 bool       isDefault();        // true when nothing has been changed from the build
+// Bumped by every set(). Anything that caches a value derived from the budget
+// stores this alongside it and recomputes when it no longer matches — the
+// measurement plan does (Measure::armPlan).
+uint32_t   epoch();
 
 #endif // ARDUINO
 

@@ -212,6 +212,16 @@ def main():
         check(any("ramp interval" in l for l in r), f"2 us ramp interval refused at start: {r}")
         sj.cmd("T-1", quiet=0.2)
 
+        print("\n[L: 0-duration stages are level shifts, and only one at a time]")
+        eq(sj.cmd1("L8,0,1,10000,200000;1000,0,0;2000,0,500"),
+           "L8,0,1,10000,200000;1000,0,0;2000,0,500", "a single 0-duration jump is accepted")
+        check(sj.cmd1("L8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500").startswith("ERR"),
+              "two 0-duration L stages in a row refused")
+        # S stages are rectangular steps, not jumps: any number of 0-duration
+        # ones stays legal there (bit-exact legacy semantics).
+        eq(sj.cmd1("S8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500"),
+           "S8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500", "S keeps 0-duration steps")
+
         print("\n[screens: browse view]")
         screen(sj, "1-browse", a.screens)
 

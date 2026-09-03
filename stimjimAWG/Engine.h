@@ -53,6 +53,15 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
 // offsets and ground the claimed channels. Safe no-op when idle.
 void stopTrain(uint8_t eng);
 
+// Derive and cache slot `slot`'s definition-only playback constants — the sine
+// Fs, phase increments and start phases, which cost ~10 us to compute and none
+// of which depend on anything the arm learns later. Called from command
+// context right after a slot is written so the arm never pays for it; a no-op
+// on an `S`/`L` slot. The arm derives on demand if this was never called (or
+// if any slot has been written since), so correctness does not depend on the
+// call, only the start latency does.
+void deriveSine(uint8_t slot);
+
 // Channels the engine's running train drives (bit0/bit1); 0 when idle.
 uint8_t claimedMask(uint8_t eng);
 

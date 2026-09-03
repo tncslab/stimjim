@@ -302,6 +302,21 @@ int main() {
   CHECK(parse('L', ",0,1,2000,1000000;100,0,150", t, err, warn, &withDt));
   CHECK(t.dt_us == 0);
 
+  // ------------------------------------------- 0-duration L stages (jumps)
+  // One is the documented instant jump — legal anywhere, including first and
+  // last — and it means "shift the level here, then ramp on from it".
+  CHECK(parse('L', ",0,1,2000,1000000;100,0,0;200,0,150", t, err, warn));
+  CHECK(t.nStages == 2 && t.stages[0].dur_us == 0);
+  CHECK(parse('L', ",0,1,2000,1000000;100,0,150;200,0,0", t, err, warn));
+  CHECK(parse('L', ",0,1,2000,1000000;100,0,150;200,0,0;300,0,150", t, err, warn));
+  // Two in a row ask for two levels at one instant: the first could never be
+  // delivered, so the line is refused rather than silently losing a level.
+  CHECK(!parse('L', ",0,1,2000,1000000;100,0,0;200,0,0;300,0,150", t, err, warn));
+  CHECK(strstr(err, "0-duration") != nullptr);
+  // `S` stages are rectangular steps, not jumps — a 0-duration one there is
+  // legacy-legal and stays legal (bit-exact S semantics).
+  CHECK(parse('S', ",0,1,2000,1000000;100,0,0;200,0,0;300,0,150", t, err, warn));
+
   CHECK(!parse('L', ",0,1,2000,1000000,0,1;100,0,150", t, err, warn));        // below the floor
   CHECK(!parse('L', ",0,1,2000,1000000,0,1000001;100,0,150", t, err, warn));  // above the ceiling
   CHECK(!parse('L', ",0,1,2000,1000000,0,0;100,0,150", t, err, warn));        // 0 = omit the field

@@ -125,6 +125,13 @@ L0,...;1000,-1000,200      # ramp 0 → (1000,−1000) over 200 µs
 L0,...;1000,0,0;1000,0,500 # jump to 1000, hold 500 µs (ramp from 1000 to 1000)
 ```
 
+A 0-duration stage is legal anywhere, including first and last, and means "shift the level here,
+then ramp on from it". **Two of them in a row are refused**: they would ask for two levels at the
+same instant, so the first could never be delivered — one sample latches, carrying the second
+value. The `ERR` names the pair rather than silently dropping a level. `S` is unaffected: there a
+0-duration stage is a rectangular step of zero length, legal in any number, and `S` keeps its
+bit-exact legacy semantics.
+
 **Optional 7th header field — `dt_us`, the ramp sample interval.** It defaults to 20 µs (the
 build's `SJ_TARGET_DT_US`) and is settable per slot, either as this field or with `DT` below.
 The field is positional, so a slot that wants an interval and no delay writes the delay as `0`;
@@ -441,11 +448,16 @@ these checks at boot is dropped with a `#` line and the build defaults stay in f
 **`STARTLAT` also has to cover the arm itself**, and that is the term which actually sizes it.
 `t0` is measured from the *start request* — a trigger edge timestamps itself in the ISR's first
 instruction — so every microsecond `Engine::startTrain` spends comes out of the latency rather
-than being added to it. `BENCHARM,<slot>` measures that cost for one slot; on a Teensy 3.5 with
-the register backends it is 16.6 µs for a slot that drives nothing, 19.5 µs for an unmeasured
-two-channel `S` train, 23.8 µs with in-train measurement, 28.7 µs for ten stages and 42 µs for a
-measured sine. `STARTLAT` must be at least that plus `PRELOAD + DACPROG2 + 3 µs`, which is where
-the 60 µs default comes from.
+than being added to it. `BENCHARM,<slot>` measures that cost for one slot, and
+`tests/device/bench_arm.py` sweeps one slot per shape and prints what `STARTLAT` each needs. On a
+Teensy 3.5 with the register backends the phase-9 firmware measured 16.6 µs for a slot that drives
+nothing, 19.5 µs for an unmeasured two-channel `S` train, 23.8 µs with in-train measurement,
+28.7 µs for ten stages and 42 µs for a measured sine; `STARTLAT` must be at least that plus
+`PRELOAD + DACPROG2 + 3 µs`, which is where the 60 µs default comes from. Work has since been
+moved out of the arm — the measurement plan is compiled once per definition rather than per arm,
+the sine constants are derived when `W` is parsed, and the hot functions can execute from RAM —
+so those figures are now upper bounds, and the default stays at 60 µs until the sweep has been
+re-run on silicon ([timing.md](timing.md) §7).
 
 A `TRIG` route in independent mode (`mode 2`) arms **two** engines from one edge, inside one ISR,
 so it pays the arm twice before the second engine's first latch is due: two `S` or `L` trains fit
@@ -591,7 +603,7 @@ TRIG<t>?  → canonical line
 | Cmd | Reply |
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
-| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>` and `# engine: …, K_RELOAD=<n> cycles, cal=<default|custom>`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)); `cal` says whether they are still the ones the board runs on, or a hand-calibrated set (`CAL?`). |
+| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>, hot=<RAM\|ITCM\|flash>` and `# engine: …, K_RELOAD=<n> cycles, cal=<default|custom>`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)); `cal` says whether they are still the ones the board runs on, or a hand-calibrated set (`CAL?`); `hot` says whether the arm and the player loop execute from RAM or from flash, which changes what `BENCHARM` reports (`SJ_CODE_IN_RAM`, [timing.md](timing.md) §7). |
 | `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
 | `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, one `CAL` line per hand-calibrated timing budget, `OK`. Paste-back restores the configuration, `TRIG` and `CAL` lines included (they are real set-commands). |

@@ -9,14 +9,20 @@ there is nothing else to install.
 |---|---|
 | `sjcon.py` | Serial console. Library (`StimJim.cmd`, `.cmd1`, `.reset`) and a CLI: `python sjcon.py COM4 IDN "S0?" DUMP` |
 | `smoke.py` | Serial-only regression run: identity, backward compatibility, the post-trigger delay set both ways, rejection paths, completion reporting, and an OLED capture in each of the three views |
+| `bench_arm.py` | Serial-only: `BENCHARM` over one slot per waveform shape (empty, `S` 1/10 stages, measured `S`, `L` 1/10 stages, `W`), printing what `CAL STARTLAT` each case needs from the board's own `CAL` values. Nothing is played — `BENCHARM` stops each train inside the bus lock it armed it in — so it is safe with or without a load. Uses slots 90–97 and leaves them defined; slots 0–9 are untouched |
 | `pico2000.py` | ctypes binding for the legacy `ps2000` driver, which is what the PicoScope 2204A needs. Run it directly to probe the scope |
 | `pico2000a.py` | the same for the newer `ps2000a` driver. Unused on this bench; kept for 2000a-series models |
 | `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
 
 ```
 python smoke.py COM4 --screens ../../tmp/screens
+python bench_arm.py COM4
 python capture.py all
 ```
+
+`bench_arm.py` is what sizes `CAL STARTLAT`, so run it on a binary whose `IDN` line you have
+recorded: `hot=RAM` and `hot=flash` builds give different arm costs, and comparing the two is how
+the flash-wait-state question gets answered ([timing.md](../../docs/timing.md) §7).
 
 `smoke.py` exits with the number of failed checks.
 

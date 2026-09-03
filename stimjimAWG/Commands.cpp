@@ -214,6 +214,9 @@ static void handleTrain(char letter, const char* args) {
   }
   if (warnbuf[0]) warn(cmd, warnbuf);
   TrainStore::commit(idx, staged);
+  // Precompute what this definition alone decides, here in command context
+  // where microseconds are free, rather than inside the start latency.
+  Engine::deriveSine(idx);
 
   char line[SJ_SERIALIZE_MAX];
   TrainStore::serializeTrain(idx, staged, line, sizeof line);

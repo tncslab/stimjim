@@ -99,6 +99,19 @@ struct Plan {
   // Read mask of each group: bit (ch*2 + line). Group g fires on pulses where
   // pulseIdx % nGrp[p] == g; with nGrp[p] == 1, group 0 holds every read.
   uint8_t  grpMask[SJ_MEAS_POINTS][SJ_MEAS_GROUPS];
+  // Everything above is compiled from (slot, definition, CAL) and nothing else,
+  // so it survives an arm of the same unchanged slot: the tag below says which
+  // one it describes and armPlan skips the compile when it matches. Everything
+  // after the tag is per-train result state.
+  //
+  // planBuild zeroes the compiled region (242 bytes) and the accumulators of
+  // the points that exist (96 bytes each) instead of the whole 1224-byte
+  // struct, because that one memset cost 5-7 us inside the start latency
+  // (docs/timing.md §7). Entries past nPoints keep whatever they held; nothing
+  // reads them, every loop over points stops at nPoints.
+  bool     tagValid;
+  uint8_t  tagSlot;
+  uint32_t tagDefEpoch, tagCalEpoch;
   Accum    acc[SJ_MEAS_POINTS][2][2];   // [point][channel][line]
   uint8_t  next;                 // live: next point to fire in the current pulse
   uint32_t envSkipped;           // repetitions dropped by the envelope gate
@@ -106,7 +119,10 @@ struct Plan {
 
 // ------------------------------------------------------------ pure plan math
 
-// Compile `def`'s MeasDef against the geometry. Zeroes the accumulators.
+// Compile `def`'s MeasDef against the geometry, and zero the result state of
+// the points it produced (see the note in Plan). Leaves the tag fields cleared:
+// the caller owns the tag, because only the caller knows what the definition
+// and CAL epochs were when it read them.
 void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g);
 
 // First sample index k >= 0 whose Q32 phase has reached `target`:
@@ -123,11 +139,17 @@ bool accumStats(const Accum& a, double& mean, double& sd);
 void begin();
 void poll();   // deferred start notes, then the single drain of the MDATA ring
 
-// Compile engine `eng`'s plan at arm time; always overwrites the previous one
-// (an unmeasured train leaves a plan with on == false, so a stale plan can
-// never fire). A finished or manually stopped train keeps its accumulators
-// until the next arm, which is what lets `T-1` still print a summary.
-void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g);
+// Make engine `eng`'s plan describe this arm. The compile is skipped when the
+// plan already describes the same slot at the same definition and CAL epochs,
+// which is every re-arm of an unedited slot -- i.e. every trigger edge of an
+// experiment after the first. An unmeasured train leaves a plan with
+// on == false, so a stale plan can never fire. The result state is always
+// cleared here, so a finished or manually stopped train keeps its accumulators
+// until the *next* arm, which is what lets `T-1` still print a summary.
+// `defEpoch`/`calEpoch` are read by the caller under the same conditions as
+// the rest of the arm.
+void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
+             uint32_t defEpoch, uint32_t calEpoch);
 
 // --- player-ISR interface -------------------------------------------------
 // Absolute deadline of the next measurement point of the current pulse, or

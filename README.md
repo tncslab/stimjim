@@ -169,8 +169,9 @@ and names the value that would have covered it. No oscilloscope is needed for th
 
 [tests/host/](tests/host/) holds host-side C++ tests of the parser, the measurement planner, the
 sample generator and the calibration validator — no board required. [tests/device/](tests/device/)
-talks to a real Stimjim over USB (`smoke.py`) and, for the microsecond measurements, to a
-PicoScope (`capture.py`); its README documents the bench wiring.
+talks to a real Stimjim over USB (`smoke.py`, and `bench_arm.py` for the arm cost that sizes the
+trigger latency) and, for the microsecond measurements, to a PicoScope (`capture.py`); its README
+documents the bench wiring.
 
 ## Where things are
 

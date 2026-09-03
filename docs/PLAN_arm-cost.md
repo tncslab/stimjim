@@ -1,6 +1,9 @@
 # Plan — bring the arm cost under one latch interval
 
-Status: in progress, 2026-09-03
+Status: items 1–5 built and host-tested 2026-09-03; **awaiting the bench run** that turns the
+predictions into numbers and decides whether `CAL STARTLAT` can come down. Item 6 is deferred with
+its prerequisite in place. Current state and the predicted figures live in
+[timing.md](timing.md) §7; this file keeps the reasoning behind each decision.
 
 The goal is a start latency no longer than the interval between two consecutive DAC updates, so
 that a trigger-started train never needs a wider budget than the waveform itself already runs on.
@@ -173,6 +176,21 @@ by construction rather than by luck.
 `19.2 + 9 × 4.6 ≈ 61 µs`, i.e. above the 60 µs `STARTLAT` default, and ~65 µs with measurement on.
 `tests/device/bench_arm.py` now defines the representative slots and runs the sweep, so the
 projection can be replaced by a number, before and after items 1–5.
+
+## What was built
+
+| Item | State |
+|---|---|
+| 1 — zero only the plan a train uses | Done. `planCompile` zeroes 242 bytes of the struct's 1224; `planResetResults` clears 96 bytes per existing point. `tests/host/test_measure.cpp` poisons the struct with `0xAA` before `planBuild` so a field added after `acc` without a reset fails the test. |
+| 2 — compile the plan once per definition | Done. The plan carries `(tagValid, tagSlot, tagDefEpoch, tagCalEpoch)`; `TrainStore::epoch()` bumps on `commit`, `begin` and the EEPROM restore, `Cal::epoch()` inside `Cal::set`'s bus lock. |
+| 3 — derive the sine constants at definition | Done. `SampleGen::sineDerive` is the pure derivation, `Engine` caches one `SineConst` per slot (2 kB) keyed on the definition epoch, and `Engine::deriveSine` warms it from the `S`/`L`/`W` commit. The arm still derives on demand, so correctness never depends on the warm-up. |
+| 4 — 32-bit `UDIV` in `rampStageInit` | Done, with the exactness checked rather than argued: `testRampDivisionPaths` compares both paths against the 64-bit reference across six `dt` values and 21 durations up to `UINT32_MAX`, including both overflow guards, and re-checks that N Bresenham steps still land exactly on the stage end. |
+| 5 — `FASTRUN` | Done as `SJ_CODE_IN_RAM`, default on for Kinetis, covering `Engine::startTrain` and `Engine::playerRun`. Verified in the ELF: both are at `0x1fff…` in SRAM, and RAM rises 41 404 → 47 524 B, the 6120 B the two functions occupy. `IDN` reports `hot=RAM`/`flash`/`ITCM`. **Its effect on the arm is unmeasured** — that is the bench run. |
+| 6 — derive stage i+1 during stage i | Deferred. Prerequisite built: consecutive 0-duration `L` stages are refused at parse time, so look-ahead is bounded to one stage. |
+
+Not attempted, and deliberately: `ampToCode`'s `VDIV.F32` stays a division. Replacing it with a
+reciprocal multiply would risk a 1-LSB shift in delivered amplitude, and the claim that `S` trains
+are bit-exact against the legacy firmware rests on that exact expression.
 
 ## Done when
 

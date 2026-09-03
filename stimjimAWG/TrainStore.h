@@ -49,6 +49,15 @@ const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t
 
 void commit(uint8_t idx, const TrainDef& staged);   // atomic slot replacement
 
+// Bumped by every write to any slot — commit(), begin() and the EEPROM
+// restore, which are the only three. Anything caching a value derived from a
+// definition stores this alongside it and recomputes when it no longer matches
+// (the measurement plan and the sine constants both do). It is deliberately
+// one counter for all slots rather than one per slot: editing slot 7 then
+// costs the next arm of slot 3 one recompile, which is cheaper than the
+// bookkeeping that would avoid it.
+uint32_t epoch();
+
 // ------------------------------------------------------ round-trip serializers
 // Canonical one-line set-commands (protocol §1 query contract), no spaces.
 void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n);

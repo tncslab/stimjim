@@ -41,14 +41,19 @@ void slotDefault(TrainDef& t) {
   t.meas.fit    = SJ_FIT_ROTATE;  // rotate reads over repetitions rather than refuse a point
 }
 
+static uint32_t defEpoch = 1;   // 0 is reserved for "nothing cached yet"
+
+uint32_t epoch() { return defEpoch; }
+
 void begin() {
   for (auto& s : slots) slotDefault(s);
+  defEpoch++;
 }
 
 TrainDef&       slot(uint8_t idx)      { return slots[idx]; }
 const TrainDef& slotConst(uint8_t idx) { return slots[idx]; }
 
-void commit(uint8_t idx, const TrainDef& staged) { slots[idx] = staged; }
+void commit(uint8_t idx, const TrainDef& staged) { slots[idx] = staged; defEpoch++; }
 
 uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 
@@ -266,6 +271,18 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
       if (!scanLong(p, a0))                    { setMsg(err, errsz, "bad stage amplitude a0"); return false; }
       if (!expect(p, ',') || !scanLong(p, a1)) { setMsg(err, errsz, "bad stage amplitude a1"); return false; }
       if (!expect(p, ',') || !scanULong(p, d)) { setMsg(err, errsz, "bad stage dur_us"); return false; }
+      // A 0-duration `L` stage is the documented instant jump: "step to this
+      // level, then ramp on from it". Two in a row would ask for two levels at
+      // the same instant, so the first could never be delivered — the second
+      // overwrites it before any sample is latched. Refusing the pair keeps the
+      // meaning of the syntax honest, and it bounds how far ahead a future
+      // per-stage derivation has to look (docs/PLAN_arm-cost.md item 6).
+      if (staged.type == PIECEWISE_RAMP && d == 0 && staged.nStages > 0 &&
+          staged.stages[staged.nStages - 1].dur_us == 0) {
+        setMsg(err, errsz, "two 0-duration L stages in a row — one instant jump per "
+                           "level shift, and the second would overwrite the first");
+        return false;
+      }
       st.a0 = a0;
       st.a1 = a1;
       st.dur_us = (uint32_t)d;
@@ -514,6 +531,7 @@ bool eepromRestore(TriggerRoute trigOut[2], bool* calRejected) {
   if (eeImg.crc != crc16((const uint8_t*)&eeImg + offsetof(EepromImage, slots), EE_CRC_SPAN))
     return false;
   memcpy(slots, eeImg.slots, sizeof(eeImg.slots));
+  defEpoch++;                    // invalidate everything derived from a slot
   trigOut[0] = eeImg.trig[0];
   trigOut[1] = eeImg.trig[1];
   // A stored budget that no longer validates is dropped and the build defaults

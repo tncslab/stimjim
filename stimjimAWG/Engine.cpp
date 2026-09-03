@@ -9,6 +9,7 @@
 #include "Triggers.h"
 #include "Measure.h"
 #include "Cal.h"
+#include "TrainStore.h"   // slot definitions and the epoch the derived caches key on
 #include <string.h>
 #include <stdio.h>
 
@@ -259,7 +260,7 @@ static inline int16_t mkCode(int16_t off, int32_t delta, int32_t envq) {
 // preload-early (program-early/latch-on-deadline); events within
 // preload + MIN_SCHEDULE of now are processed inline in the same pass so
 // 0-duration jump chains and overlong pulses never re-enter through the NVIC.
-static void playerRun(uint8_t p) {
+static SJ_HOT void playerRun(uint8_t p) {
   Player& pl = player[p];
   pitStop(p);
   if (!pl.active) return;
@@ -418,6 +419,53 @@ static void playerRun(uint8_t p) {
 
 // ---------------------------------------------------------- start/stop (loop)
 
+// ------------------------------------------------- definition-derived cache
+//
+// A sine train's Fs, phase increments and start phases come from its
+// definition alone, so they are derived once per definition rather than on
+// every arm. One entry per slot (20 B each) with a single shared epoch: any
+// slot write bumps TrainStore::epoch(), which drops the whole table, and the
+// next arm of a sine slot re-derives that one entry. `deriveSine` warms an
+// entry from command context right after a slot is written, so in practice the
+// arm only ever reads.
+static SampleGen::SineConst sineCache[SJ_NUM_SLOTS];
+static uint32_t sineCacheEpoch = 0;                        // 0 = nothing derived yet
+static uint32_t sineCacheValid[(SJ_NUM_SLOTS + 31) / 32];  // bit per slot
+
+static void sineCacheCheckEpoch() {
+  const uint32_t e = TrainStore::epoch();
+  if (e == sineCacheEpoch) return;
+  sineCacheEpoch = e;
+  memset(sineCacheValid, 0, sizeof sineCacheValid);
+}
+
+// The channels a train's modes drive — needed before the Player exists,
+// because Fs must not be raised by an undriven channel's frequency.
+static inline uint8_t driveMask(const TrainDef& def) {
+  uint8_t m = (uint8_t)(((def.mode0 <= 1) ? 1 : 0) | ((def.mode1 <= 1) ? 2 : 0));
+  if (def.type != SINE && def.nStages == 0) m = 0;
+  return m;
+}
+
+static const SampleGen::SineConst& sineConst(uint8_t slot, const TrainDef& def, uint8_t mask) {
+  sineCacheCheckEpoch();
+  if (!(sineCacheValid[slot >> 5] & (1u << (slot & 31)))) {
+    SampleGen::sineDerive(sineCache[slot], def.sine, mask, SJ_CYC_PER_US,
+                          SJ_SINE_SAMPLES_PER_CYC, SJ_FS_MIN_HZ, SJ_FS_MAX_HZ);
+    sineCacheValid[slot >> 5] |= (uint32_t)(1u << (slot & 31));
+  }
+  return sineCache[slot];
+}
+
+void deriveSine(uint8_t slot) {
+  const TrainDef& def = TrainStore::slotConst(slot);
+  if (def.type != SINE) return;         // nothing to derive for S/L
+  sineCacheCheckEpoch();
+  SampleGen::sineDerive(sineCache[slot], def.sine, driveMask(def), SJ_CYC_PER_US,
+                        SJ_SINE_SAMPLES_PER_CYC, SJ_FS_MIN_HZ, SJ_FS_MAX_HZ);
+  sineCacheValid[slot >> 5] |= (uint32_t)(1u << (slot & 31));
+}
+
 // Identical float expression to the legacy pulse() conversion — bit-exact DAC
 // codes for in-range amplitudes; out-of-range (already WARNed at parse time)
 // saturates instead of wrapping. mode is 0 (voltage) or 1 (current) here.
@@ -429,7 +477,7 @@ static int16_t ampToCode(int32_t amp, uint8_t mode, uint8_t ch) {
   return (int16_t)v;
 }
 
-bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
+SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
                 char* err, size_t errsz, uint64_t anchorCyc) {
   Player& pl = player[eng];
   if (pl.active) {
@@ -441,8 +489,7 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   // used for the whole arm, so a `CAL` line that lands mid-arm cannot make one
   // train use two different budgets.
   const Cal::Def cal = Cal::live();
-  uint8_t mask = (uint8_t)(((def.mode0 <= 1) ? 1 : 0) | ((def.mode1 <= 1) ? 2 : 0));
-  if (def.type != SINE && def.nStages == 0) mask = 0;   // empty train: bookkeeping only
+  const uint8_t mask = driveMask(def);   // 0 = empty train: bookkeeping only
   // Programming budget of one latch on this train: the preload spin plus the
   // DAC write, which costs more when both channels are driven.
   const uint32_t progUs = (uint32_t)cal.us[Cal::PRELOAD] +
@@ -489,19 +536,17 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.off1 = (int16_t)(pl.outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
   if (pl.type == SINE) {
-    // Fs policy (plan §3.5): clamp(64*f_max, FS_MIN, FS_MAX), realized as an
-    // exact integer cycle count per sample; phaseInc is derived from the
-    // *actual* sample period so frequency never depends on Fs rounding.
-    uint64_t f0 = (mask & 1) ? def.sine.freq0_mHz : 0;
-    uint64_t f1 = (mask & 2) ? def.sine.freq1_mHz : 0;
-    uint64_t fs_mHz = (f0 > f1 ? f0 : f1) * SJ_SINE_SAMPLES_PER_CYC;
-    if (fs_mHz < (uint64_t)SJ_FS_MIN_HZ * 1000) fs_mHz = (uint64_t)SJ_FS_MIN_HZ * 1000;
-    if (fs_mHz > (uint64_t)SJ_FS_MAX_HZ * 1000) fs_mHz = (uint64_t)SJ_FS_MAX_HZ * 1000;
-    pl.sampleCyc  = (uint32_t)(((uint64_t)SJ_CYC_PER_US * 1000000000ull + fs_mHz / 2) / fs_mHz);
-    pl.phaseInc0  = SampleGen::sinePhaseInc(def.sine.freq0_mHz, pl.sampleCyc, SJ_CYC_PER_US);
-    pl.phaseInc1  = SampleGen::sinePhaseInc(def.sine.freq1_mHz, pl.sampleCyc, SJ_CYC_PER_US);
-    pl.phaseInit0 = SampleGen::sinePhaseInit(def.sine.phase0_mdeg);
-    pl.phaseInit1 = SampleGen::sinePhaseInit(def.sine.phase1_mdeg);
+    // The Fs choice and the phase coefficients depend only on the definition,
+    // and deriving them costs ~10 us — most of it soft-float double inside
+    // sinePhaseInc, which the M4F has no hardware for. Taking that out of the
+    // arm is worth more than anything else in this function, so it is derived
+    // when the slot is written and read from the cache here.
+    const SampleGen::SineConst& sc = sineConst(slotIdx, def, mask);
+    pl.sampleCyc  = sc.sampleCyc;
+    pl.phaseInc0  = sc.phaseInc[0];
+    pl.phaseInc1  = sc.phaseInc[1];
+    pl.phaseInit0 = sc.phaseInit[0];
+    pl.phaseInit1 = sc.phaseInit[1];
     pl.sAmp0 = (mask & 1) ? ampToCode(def.sine.amp0, pl.outMode0, 0) - pl.off0 : 0;
     pl.sAmp1 = (mask & 2) ? ampToCode(def.sine.amp1, pl.outMode1, 1) - pl.off1 : 0;
     pl.burstCyc = SJ_US_TO_CYC(def.sine.burst_us);
@@ -565,7 +610,9 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCSWITCH]);
   geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::GUARD]);
   geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::SETTLE]);
-  Measure::armPlan(eng, slotIdx, def, geo);
+  // The plan is compiled only when the (slot, definition, CAL) triple it was
+  // compiled for has changed, so a re-armed unedited slot pays nothing here.
+  Measure::armPlan(eng, slotIdx, def, geo, TrainStore::epoch(), Cal::epoch());
   pl.meas = Measure::hasPlan(eng);
 
   // t0 is taken *after* all precomputation so the arm->first-latch latency

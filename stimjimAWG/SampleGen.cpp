@@ -12,15 +12,38 @@ namespace SampleGen {
 void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,
                    uint32_t targetDt_us, int32_t start0, int32_t end0,
                    int32_t start1, int32_t end1) {
-  // 64-bit sum: dur_us near UINT32_MAX must not wrap when the rounding bias
-  // is added. N <= 2^32/targetDt so it fits int32 for targetDt >= 2.
-  uint32_t N = (uint32_t)(((uint64_t)dur_us + targetDt_us / 2) / targetDt_us);
+  // N <= 2^32/targetDt so it fits int32 for targetDt >= 2. Both operands are
+  // 32-bit, which is one hardware UDIV instead of a call into
+  // __aeabi_uldivmod -- but dur_us is only bounded by strtoul, so a duration
+  // within targetDt/2 of UINT32_MAX would wrap the rounding bias. That case
+  // keeps the 64-bit sum.
+  const uint32_t bias = targetDt_us / 2;
+  uint32_t N = (dur_us <= UINT32_MAX - bias)
+             ? (dur_us + bias) / targetDt_us
+             : (uint32_t)(((uint64_t)dur_us + bias) / targetDt_us);
   if (N == 0) N = 1;
   st.N = N;
 
-  uint64_t durCyc = (uint64_t)dur_us * cycPerUs;
-  st.qt = durCyc / N;
-  st.rt = (uint32_t)(durCyc % N);
+  // durCyc = dur_us * cycPerUs reaches 2.4e11, so durCyc/N and durCyc%N are a
+  // 64-bit division as written -- ~100-150 cycles in __aeabi_uldivmod, twice,
+  // and this runs per stage inside the start latency. Split it exactly instead:
+  // with a = dur_us/N and b = dur_us%N (so dur_us = a*N + b, b < N),
+  //   durCyc = a*N*cycPerUs + b*cycPerUs
+  //   qt = durCyc/N = a*cycPerUs + (b*cycPerUs)/N      (a*N*cycPerUs divides by N)
+  //   rt = durCyc%N =              (b*cycPerUs)%N
+  // Same integer quotient and remainder, no approximation, four 32-bit UDIVs.
+  // Valid while b*cycPerUs fits 32 bits (b < 2^32/120 ~ 35.8e6, i.e. any stage
+  // shorter than ~35 s); the 64-bit form stays as the fallback above that.
+  const uint32_t a = dur_us / N, b = dur_us % N;
+  if (b <= UINT32_MAX / cycPerUs) {
+    const uint32_t bc = b * cycPerUs;
+    st.qt = (uint64_t)a * cycPerUs + bc / N;
+    st.rt = bc % N;
+  } else {
+    const uint64_t durCyc = (uint64_t)dur_us * cycPerUs;
+    st.qt = durCyc / N;
+    st.rt = (uint32_t)(durCyc % N);
+  }
 
   // Code axis: floor division so the remainder is always in [0, N) and the
   // carry test stays unsigned — works for down-ramps (dc < 0) too.
@@ -117,6 +140,21 @@ uint32_t sinePhaseInit(int32_t mdeg) {
   int32_t m = mdeg % 360000;
   if (m < 0) m += 360000;
   return (uint32_t)(((uint64_t)m << 32) / 360000u);
+}
+
+void sineDerive(SineConst& out, const SineDef& s, uint8_t chMask,
+                uint32_t cycPerUs, uint32_t samplesPerCyc,
+                uint32_t fsMinHz, uint32_t fsMaxHz) {
+  const uint64_t f0 = (chMask & 1) ? s.freq0_mHz : 0;
+  const uint64_t f1 = (chMask & 2) ? s.freq1_mHz : 0;
+  uint64_t fs_mHz = (f0 > f1 ? f0 : f1) * samplesPerCyc;
+  if (fs_mHz < (uint64_t)fsMinHz * 1000) fs_mHz = (uint64_t)fsMinHz * 1000;
+  if (fs_mHz > (uint64_t)fsMaxHz * 1000) fs_mHz = (uint64_t)fsMaxHz * 1000;
+  out.sampleCyc    = (uint32_t)(((uint64_t)cycPerUs * 1000000000ull + fs_mHz / 2) / fs_mHz);
+  out.phaseInc[0]  = sinePhaseInc(s.freq0_mHz, out.sampleCyc, cycPerUs);
+  out.phaseInc[1]  = sinePhaseInc(s.freq1_mHz, out.sampleCyc, cycPerUs);
+  out.phaseInit[0] = sinePhaseInit(s.phase0_mdeg);
+  out.phaseInit[1] = sinePhaseInit(s.phase1_mdeg);
 }
 
 } // namespace SampleGen

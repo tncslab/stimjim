@@ -94,13 +94,20 @@ const Def& live()     { return liveDef; }
 const Def& defaults() { return buildDef; }
 bool       isDefault() { return memcmp(&liveDef, &buildDef, sizeof liveDef) == 0; }
 
+static uint32_t liveEpoch = 1;   // 0 is reserved for "nothing cached yet"
+
+uint32_t epoch() { return liveEpoch; }
+
 void set(const Def& c) {
   // A trigger edge can arm a train between two words of this assignment, and
   // Engine::startTrain would then copy half of one budget and half of another.
   // The bus lock masks the trigger and player ISRs for the few cycles it takes
-  // — the same reason Triggers::setRoute takes it.
+  // — the same reason Triggers::setRoute takes it. The epoch is bumped inside
+  // the same lock so no arm can read a new budget with an old epoch and keep a
+  // plan compiled against the old one.
   FastIO::busLock();
   liveDef = c;
+  liveEpoch++;
   FastIO::busUnlock();
 }
 

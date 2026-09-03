@@ -22,6 +22,7 @@
 #define STIMJIMAWG_SAMPLEGEN_H
 
 #include <stdint.h>
+#include "WaveformDef.h"   // SineDef, for the definition-derived sine constants
 
 namespace SampleGen {
 
@@ -124,6 +125,27 @@ uint32_t sinePhaseInc(uint32_t f_mHz, uint32_t sampleCyc, uint32_t cycPerUs);
 
 // Start phase: millidegrees (any sign) -> Q32 turns, exact integer math.
 uint32_t sinePhaseInit(int32_t mdeg);
+
+// Everything a sine train's playback needs that depends on its *definition*
+// alone — not on the channel calibration offsets, not on the CAL budget, not
+// on when it starts. Deriving it costs ~10 us, most of it soft-float double
+// inside sinePhaseInc, which is why it is derived once per definition and
+// cached rather than recomputed on every arm (docs/timing.md §7).
+struct SineConst {
+  uint32_t sampleCyc;      // exact CPU cycles per sample
+  uint32_t phaseInc[2];    // Q32 turns per sample, per channel
+  uint32_t phaseInit[2];   // Q32 start phase, per channel
+};
+
+// Fs policy (plan §3.5): Fs = clamp(samplesPerCyc * f_max, fsMin, fsMax),
+// realized as an exact integer number of CPU cycles per sample; the phase
+// increments are then derived from the *actual* sample period, so the played
+// frequency never depends on how Fs was rounded. chMask selects which
+// channels' frequencies bound f_max (bit0/bit1) — an undriven channel must not
+// raise the sample rate.
+void sineDerive(SineConst& out, const SineDef& s, uint8_t chMask,
+                uint32_t cycPerUs, uint32_t samplesPerCyc,
+                uint32_t fsMinHz, uint32_t fsMaxHz);
 
 } // namespace SampleGen
 
