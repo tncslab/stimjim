@@ -151,6 +151,7 @@ struct Player {
   uint32_t maxLateCyc;                 //   and the worst overrun, CPU cycles
   uint32_t overdueEvents;              // events already due when the player reached them
   uint32_t maxOverdueCyc;              //   and the worst, CPU cycles
+  uint16_t startNeedUs;                // 0, or the STARTLAT this arm needed (see Completion)
   volatile bool active;
   volatile uint32_t seq;               // seqlock: odd while the ISR updates
 };
@@ -173,6 +174,7 @@ static void pushCompletion(uint8_t eng) {
   compRing[h].maxLateCyc = player[eng].maxLateCyc;
   compRing[h].overdueEvents = player[eng].overdueEvents;
   compRing[h].maxOverdueCyc = player[eng].maxOverdueCyc;
+  compRing[h].startNeedUs   = player[eng].startNeedUs;
   compHead = next;
 }
 
@@ -530,6 +532,7 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.maxLateCyc  = 0;
   pl.overdueEvents = 0;
   pl.maxOverdueCyc = 0;
+  pl.startNeedUs   = 0;
   pl.evOverdue     = false;
   pl.prevEvDl      = ~(uint64_t)0;     // cannot match a real deadline
   pl.evIdx       = 0;
@@ -607,6 +610,20 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   // the intermediate wakeups keep the 64-bit CYCCNT extension alive.
   uint64_t wake = pl.t0 - pl.preloadCyc;
   uint64_t now  = FastIO::cycles64();
+  // Everything this function did since `base` was taken came out of STARTLAT.
+  // If the first latch's preload window has already opened, the latch cannot
+  // land on time and the delivered latency is no longer the fixed constant the
+  // trigger path promises. Report the STARTLAT that would have covered this
+  // arm instead of leaving the player's overdue counter as the only trace --
+  // it is one `CAL STARTLAT` line away from correct, and BENCHARM measures the
+  // arm directly. A slot delay counts as room, because it is: the check is
+  // against t0, which the delay pushes out.
+  if ((int64_t)(now - wake) > 0) {
+    uint64_t shortCyc = now - wake;
+    uint32_t shortUs  = (uint32_t)((shortCyc + SJ_CYC_PER_US - 1) / SJ_CYC_PER_US);
+    uint32_t needUs   = (uint32_t)cal.us[Cal::STARTLAT] + shortUs;
+    pl.startNeedUs = (needUs > 0xFFFFu) ? 0xFFFFu : (uint16_t)needUs;
+  }
   if ((int64_t)(wake - now) > (int64_t)SJ_US_TO_CYC(SJ_MAX_SLICE_US))
     wake = now + SJ_US_TO_CYC(SJ_MAX_SLICE_US);
   pitProgram(eng, wake, true);

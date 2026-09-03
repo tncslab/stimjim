@@ -41,7 +41,7 @@ enum Id : uint8_t {
   ADCREAD,       // adcRead with the line already selected
   ADCSWITCH,     // extra cost of a control-register line switch
   GUARD,         // margin between the last read and the next preload window
-  SETTLE,        // after a latch, before a reading means anything
+  SETTLE,        // after a latch, before a reading means anything (BENCHSETTLE)
   STARTLAT,      // fixed arm -> first-latch latency
   TRIGCOMP,      // pin edge -> trigger-ISR entry (0 = uncompensated)
   N_ID

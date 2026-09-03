@@ -4,6 +4,7 @@ One line per phase, newest first. Full handoff entries — decisions, rationale,
 questions, next entry point — live in `docs/progress/<NNN>-<topic>.md` (project convention,
 CLAUDE.md). To pick up work read this index, then at most the newest one or two entries.
 
+- 009 2026-09-03 measured-budgets — `STARTLAT` and `SETTLE` measured on silicon and both corrected (20 → 60 µs, 4 → 9 µs), `BENCHARM` and `BENCHSETTLE` added, latch contention quantified, timing and parametrization figures, README as a quick start, EEPROM v6 (progress/009-measured-budgets.md)
 - 008 2026-09-03 cal-coverage — timing budgets as runtime state (`CAL`, EEPROM v5), per-slot ramp interval (`DT`), reads rotated over repetitions (`MEAS` fit), trigger edge as the latency anchor; host-tested and four builds clean, not yet run on silicon (progress/008-cal-coverage.md)
 - 007 2026-09-03 measurement-sd-bench — MEAS execution with its window-fit rule, MSUM/MDATA, SD logging, the SD file group serving the card over serial, BENCH on silicon (42 ns latch jitter), per-latch deadline counters (progress/007-measurement-sd-bench.md)
 - 006 2026-09-02 hardware-bench-delay-ui — first hardware run (two boot-fatal PIT bugs fixed), Teensy 4 / portable backends, post-trigger delay, TRIG setters, OLED redesign (progress/006-hardware-bench-delay-ui.md)

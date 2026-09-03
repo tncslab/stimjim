@@ -94,6 +94,12 @@ struct Completion {
   // shape, not a timing failure. See progLatch/playerRun in Engine.cpp.
   uint32_t lateEvents,    maxLateCyc;
   uint32_t overdueEvents, maxOverdueCyc;
+  // 0 when the arm fitted CAL STARTLAT. Otherwise the smallest STARTLAT that
+  // would have covered *this* arm: every microsecond startTrain spends between
+  // the anchor and t0 comes out of the start latency, and a train armed with
+  // no room left has its first latch already due when the player reaches it.
+  // BENCHARM measures the arm on its own; this reports the arms that lost.
+  uint16_t startNeedUs;
 };
 bool popCompletion(Completion& out);
 

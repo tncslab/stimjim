@@ -173,26 +173,47 @@
   #define SJ_ADC_SWITCH_US   8
 #endif
 #define SJ_MEAS_GUARD_US     1   // margin between the last read and the next preload window
-// How long after a latch a reading means anything. Two things set the floor:
-// the AD5752 output settling (bench item 2) and the player's own post-latch
-// bookkeeping, measured at ~3.2 us on the register path -- a smaller value
-// would place the reads at an instant the ISR cannot reach, which is harmless
-// for the reading (zero derivative at a sine peak) but makes the schedule a
-// fiction. RECALIBRATE with a scope.
-#define SJ_DAC_SETTLE_US     4
+// How long after a latch a reading means anything: the AD5752 output settling
+// and the ADC's own aperture together, which is the composite the measurement
+// engine actually depends on. MEASURED with BENCHSETTLE, which needs no scope
+// -- it latches the same step repeatedly and reads it back at increasing
+// delays. On this board the reading is still climbing 4 us after the latch
+// (8.6 % short of the final value) and reaches it at 8-9 us, on either
+// channel, either polarity and at 2000 or 8000 DAC codes of step. 9 us is the
+// worst of those, and a budget carries the worst case.
+//
+// This is a property of the analog path, not of the MCU or the backend, so it
+// is not conditioned on either. RECALIBRATE with BENCHSETTLE on a new board.
+#define SJ_DAC_SETTLE_US     9
 
 #define SJ_MIN_SCHEDULE_US   3         // events closer than this are run inline in the same ISR pass
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
 // Fixed arm->first-latch latency, which is what makes the trigger latency
-// deterministic. It must cover a preload plus a dual-channel DAC program plus
-// SJ_MIN_SCHEDULE_US (Cal::validate refuses a set that does not), so the
-// portable route — whose program budget is twice the register path's — needs a
-// wider one. A trigger-started train subtracts the CAL TRIGCOMP parameter from
-// it, so the sum of the two is what the hardware actually has to cover.
+// deterministic. Two things have to fit inside it, and only the first is
+// checked by Cal::validate:
+//
+//   1. a preload plus a dual-channel DAC program plus SJ_MIN_SCHEDULE_US,
+//      because the first latch is programmed one preload window before t0;
+//   2. the whole of Engine::startTrain, because t0 is measured from the start
+//      request (a trigger edge timestamps itself) and every microsecond the
+//      arm spends comes out of the latency.
+//
+// Term 2 dominates and depends on the train: BENCHARM measures it per slot.
+// On a Teensy 3.5 at 120 MHz with the register backends it is 17 us for a
+// slot that drives nothing, 24 us for a measured two-channel `S` train, 29 us
+// for a ten-stage one and 38-42 us for a `W` sine. 60 us covers every
+// single-engine train type with margin, and also covers a TRIG independent
+// route -- which arms two engines from one edge, paying term 2 twice -- for
+// `S` and `L` slots. An independent route of two sine trains needs about
+// 100 us; the engine says so by name at train end when an arm did not fit,
+// and CAL sets it without a rebuild.
+//
+// A trigger-started train subtracts the CAL TRIGCOMP parameter from it, so the
+// sum of the two is what the hardware actually has to cover.
 #if SJ_TIMER_REGISTER && SJ_FASTIO_REGISTER
-  #define SJ_START_LATENCY_US 20
+  #define SJ_START_LATENCY_US 60
 #else
-  #define SJ_START_LATENCY_US 40       // RECALIBRATE with the other portable budgets
+  #define SJ_START_LATENCY_US 120      // RECALIBRATE with BENCHARM on the target board
 #endif
 #define SJ_TARGET_DT_US      20        // default ramp sample interval; per-train override: TrainDef.dt_us
 // SJ_MAX_DELAY_US (per-slot post-trigger delay ceiling) lives in WaveformDef.h:

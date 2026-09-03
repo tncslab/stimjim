@@ -106,7 +106,11 @@ struct TriggerRoute {
 // layout change can never mis-restore silently. v3: MeasDef gained the stage
 // field and modes returned to the original 0-3 numbering. v4: TrainDef gained
 // delay_us. v5: TrainDef gained dt_us, MeasDef gained fit, and the image
-// carries the CAL timing budget. An image of an older version is rejected
+// carries the CAL timing budget. v6: the layout is unchanged, but two CAL
+// defaults were corrected after being measured on hardware (SETTLE 4 -> 9 us,
+// STARTLAT 20 -> 60 us) and a v5 image would restore the wrong ones in
+// silence -- a stored budget that is merely wrong still validates, so nothing
+// else would have caught it. An image of an older version is rejected
 // outright and boot defaults apply — never re-interpreted.
 struct EepromImage {
   uint32_t     magic;    // 'S''J''A''W' = 0x534A4157
@@ -117,6 +121,6 @@ struct EepromImage {
   Cal::Def     cal;      // restored only if it still validates (Cal::validate)
 };
 #define SJ_EEPROM_MAGIC   0x534A4157u
-#define SJ_EEPROM_VERSION 5
+#define SJ_EEPROM_VERSION 6
 
 #endif // STIMJIMAWG_WAVEFORMDEF_H

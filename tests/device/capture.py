@@ -17,9 +17,16 @@ README.md for what each direction looks like and why.
 The AWG wire is not teed to a scope input, so trigger-to-output delay is
 measured differentially instead: the same trigger edge starts a zero-delay
 reference pulse on CH1 (engine 1) and the delayed pulse under test on CH0
-(engine 0), and the scope triggers on the reference. Subtracting the two
-engines' arming skew -- measured in the same way with the delay set to 0 --
-leaves the delay itself.
+(engine 0), and the scope triggers on the reference. Subtracting the constant
+engine-to-engine offset leaves the delay itself.
+
+That offset is measured with the delay set to 500 us, not to 0. At 0 the two
+engines' first latches fall on the same instant and the second player ISR has
+to wait for the first to return, which adds ~7 us that is absent at every
+other delay. The zero-delay case is captured separately and reported as latch
+contention, because it is the honest answer to "can two independently routed
+trains be sample-aligned?" -- they cannot, and a single train driving both
+channels is the construct that can.
 
     python capture.py delay      # trigger edge to first output sample
     python capture.py shapes     # S / L / W waveform shapes
@@ -91,13 +98,23 @@ def first_cross(samples, dt, level, start=0):
     return None
 
 
+# How long the reference pulse on CH1 stays high. Deliberately much shorter
+# than the DUT pulse: the resistor chain couples the channels, so the
+# reference's own *falling* edge lands on scope channel A as a step of a few
+# hundred millivolts. If it coincides with the DUT's rising edge it drags the
+# interpolated 2.5 V crossing by ~10 us, which is a bench-circuit artefact that
+# looks exactly like a firmware timing error. 300 us keeps the fall clear of
+# every delay this script measures.
+REF_HIGH_US = 300
+
+
 def measure_pair(scope, sj, delay_us, n=3900, want_dt=2e-6, settle=1.5):
     """Arm the trigger route, capture one shot, return (dt, chans, dA, dB)."""
     # DUT: CH0 voltage 5 V, 2 ms, one pulse per trigger (duration < period).
     sj.cmd1(f"S{SLOT_DUT},0,3,50000,1000,{delay_us};5000,0,2000")
     # Reference: CH1 voltage 8 V, no delay -- it marks the trigger instant.
     # 8 V because CH1 drives through 2 k plus the antiparallel LEDs.
-    sj.cmd1(f"S{SLOT_REF},3,0,50000,1000,0;0,8000,2000")
+    sj.cmd1(f"S{SLOT_REF},3,0,50000,1000,0;0,8000,{REF_HIGH_US}")
     # Independent routing: slot0 on engine 0, slot1 on engine 1, rising edge.
     sj.cmd1(f"TRIG0,2,{SLOT_DUT},{SLOT_REF},0")
 
@@ -121,18 +138,40 @@ def cmd_delay(scope, sj):
     scope.square(1.0, 2.0)              # 1 Hz, 0..2 V into IN0
     time.sleep(0.5)
 
-    # 1) Arming skew between the two engines, with the delay set to zero.
-    dt, chans, tA, tB = measure_pair(scope, sj, 0, want_dt=0.5e-6)
+    # 1) Engine-to-engine offset, measured at a delay large enough that the two
+    #    first latches do not fall on the same instant. At delay 0 they do, and
+    #    the two player ISRs run at equal NVIC priority, so the second engine's
+    #    latch waits for the first one's ISR to return -- a real effect worth
+    #    its own number (step 2) but not part of the offset the delay
+    #    measurements have to be corrected for.
+    SKEW_AT_US = 500
+    dt, chans, tA, tB = measure_pair(scope, sj, SKEW_AT_US, want_dt=0.5e-6)
     if tA is None or tB is None:
         print(f"       FAIL: no edges found (A={tA}, B={tB})")
         return 1
-    skew = tA - tB
-    print(f"       arming skew (delay=0): {skew*1e6:+.1f} us  [dt={dt*1e6:.2f} us]")
+    skew = (tA - tB) - SKEW_AT_US * 1e-6
+    print(f"       engine offset (measured at {SKEW_AT_US} us): "
+          f"{skew*1e6:+.2f} us  [dt={dt*1e6:.2f} us]")
     save("stimjim-trigger-skew", dt, chans,
-         f"Trigger with delay = 0: engine-to-engine arming skew {skew*1e6:+.1f} us",
+         f"Trigger with delay = {SKEW_AT_US} us: engine-to-engine offset "
+         f"{skew*1e6:+.2f} us",
          marks=[(tB, "ref edge"), (tA, "DUT edge")])
 
-    # 2) The delay itself.
+    # 2) Both engines started by one edge with no delay: they compete for the
+    #    same latch instant. This is the number that says why two channels that
+    #    must be sample-aligned belong in ONE train (joint mode), not in an
+    #    independent route.
+    dt0, chans0, tA0, tB0 = measure_pair(scope, sj, 0, want_dt=0.5e-6)
+    if tA0 is not None and tB0 is not None:
+        contention = (tA0 - tB0) - skew
+        print(f"       same-instant latch contention (delay=0): "
+              f"{contention*1e6:+.2f} us")
+        save("stimjim-trigger-contention", dt0, chans0,
+             f"Both engines on one edge, delay = 0: second engine's first latch "
+             f"{-contention*1e6:.1f} us late",
+             marks=[(tB0, "ref edge"), (tA0, "DUT edge")])
+
+    # 3) The delay itself.
     failures = 0
     for set_us in (2000, 5000, 20000):
         want_dt = max(0.5e-6, (set_us * 1e-6 + 4e-3) / 3900)

@@ -466,6 +466,11 @@ static void printTimingFaults(const Engine::Completion& c) {
     Serial.printf("WARN engine: %lu latch(es) overran their deadline by up to %lu ns — "
                   "a timing budget in Config.h is too small here (recalibrate with BENCH)\n",
                   (unsigned long)c.lateEvents, (unsigned long)cycToNs(c.maxLateCyc));
+  if (c.startNeedUs)
+    Serial.printf("WARN engine: arming this train took longer than CAL STARTLAT (%u us), "
+                  "so its first latch could not be on time — set CAL STARTLAT >= %u us "
+                  "(BENCHARM,<slot> measures the arm; a TRIG independent route arms twice)\n",
+                  (unsigned)Cal::live().us[Cal::STARTLAT], (unsigned)c.startNeedUs);
   if (c.overdueEvents)
     Serial.printf("# engine: %lu event(s) were already due when the player reached them, "
                   "worst by %lu ns — an earlier event ran long (events that share a "
@@ -922,6 +927,13 @@ static void handleSdDel(const char* args) {
 
 // -------------------------------------------------------------------- BENCH
 
+// Longest delay BENCHSETTLE will sweep. It sizes a stack array of means, and
+// nothing on this hardware settles anywhere near 64 us.
+#define SJ_SETTLE_DMAX 64
+#define STR_(x) #x
+#define STR(x) STR_(x)
+
+
 static void benchList() {
   Serial.printf("# BENCH group — timing in CPU cycles (%lu/us) and ns\n",
                 (unsigned long)SJ_CYC_PER_US);
@@ -933,9 +945,120 @@ static void benchList() {
   Serial.println("# BENCHMISO[,n]                alternating ch0/ch1 reads (MISO mux swap)");
   Serial.println("# BENCHCYC[,n]                 cycles64() overhead");
   Serial.println("# BENCHK[,n]                   K_RELOAD recalibration, residual stats");
+  Serial.println("# BENCHARM,slot[,n]            Engine::startTrain cost (what CAL STARTLAT must cover)");
+  Serial.println("# BENCHSETTLE,ch,code,dmax_us[,n]   ADC reading vs delay after a latch (CAL SETTLE)");
   Serial.println("# BENCHPIT,period_us,n[,preload_us]  PIT wake/latch jitter vs deadline");
   Serial.println("# BENCHSQ,ch,code,half_us,n    square wave, FastIO path (scope A/B)");
   Serial.println("# BENCHSQL,ch,code,half_us,n   square wave, legacy Stimjim.writeToDac path");
+  ok();
+}
+
+// BENCHARM,<slot>[,n] -- the cost of Engine::startTrain: every microsecond of
+// precomputation that happens before t0 is taken, which is exactly what
+// CAL STARTLAT has to cover for the first latch to land on time. A trigger
+// edge routed in independent mode pays it *twice* before the second engine's
+// first latch is due, so the two-engine case needs twice this number.
+//
+// The dominant term is Measure::armPlan, so bench a measured slot and an
+// unmeasured one (mode 90/91) to see what in-train measurement costs an arm.
+//
+// Nothing plays: the train is stopped again inside the same bus lock, which
+// also keeps a player ISR from landing in the middle of a measured interval.
+// The outputs stay parked at the calibration offsets throughout.
+// BENCHSETTLE,<ch>,<code>,<dmax_us>[,n] -- how long after a latch a reading
+// means anything, which is what CAL SETTLE budgets. Measured with the board's
+// own ADC rather than an oscilloscope: for each delay 0..dmax the same step is
+// latched n times and read that many microseconds later, so the delay at which
+// the readings stop moving IS the settling time as the instrument sees it --
+// DAC output settling and ADC aperture together, which is the quantity the
+// measurement engine actually depends on.
+//
+// The step is driven on the output, so the channel's mode has to be one the
+// bench is safe with; the outputs are restored to the calibration offsets at
+// the end. Reported in raw ADC codes: 2.4 mV or 1.6 uA per code.
+static void benchSettle(const char* args) {
+  long v[4];
+  uint8_t np = parseLongs(args, v, 4);
+  if (np < 3) { err("BENCHSETTLE", "need ch,code,dmax_us[,n]"); return; }
+  const uint8_t ch = (uint8_t)v[0];
+  const int16_t code = (int16_t)v[1];
+  const uint32_t dmax = (uint32_t)v[2];
+  const uint32_t n = (np >= 4 && v[3] > 0) ? (uint32_t)v[3] : 32;
+  if (ch > 1) { err("BENCHSETTLE", "ch must be 0/1"); return; }
+  if (dmax < 1 || dmax > SJ_SETTLE_DMAX) {
+    err("BENCHSETTLE", "dmax_us must be 1.." STR(SJ_SETTLE_DMAX));
+    return;
+  }
+  Serial.println("WARN BENCHSETTLE: drives the DAC - make sure the output mode is safe");
+
+  const uint8_t line = 0;                 // 0 = output voltage sense
+  const int16_t park = (int16_t)Stimjim.currentOffsets[ch];
+  int32_t mean[SJ_SETTLE_DMAX + 1];
+  FastIO::adcSelectLine(ch, line);        // pre-selected, as the player leaves it
+  for (uint32_t d = 0; d <= dmax; d++) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < n; i++) {
+      // Return to the parked level and let it settle fully, so every
+      // repetition of every delay starts from the same place.
+      FastIO::dacProgram(ch, park);
+      FastIO::dacLatch((uint8_t)(1u << ch));
+      delayMicroseconds(200);
+      FastIO::dacProgram(ch, code);       // programmed early, exactly as a latch event is
+      uint64_t t = FastIO::cycles64();
+      FastIO::dacLatch((uint8_t)(1u << ch));
+      spinUntil(t + SJ_US_TO_CYC(d));
+      sum += FastIO::adcRead(ch, line);
+    }
+    mean[d] = sum / (int32_t)n;
+    Serial.printf("BENCH,SETTLE,ch=%u,delay_us=%lu,raw=%ld\n",
+                  (unsigned)ch, (unsigned long)d, (long)mean[d]);
+  }
+  restoreDacOffsets((uint8_t)(1u << ch));
+
+  // The answer: the earliest delay from which every later reading stays within
+  // two ADC codes of the final one. Two codes rather than one because the ADC
+  // itself is not noise-free at this averaging depth.
+  uint32_t first = dmax;
+  for (uint32_t d = 0; d <= dmax; d++) {
+    bool flat = true;
+    for (uint32_t e = d; e <= dmax; e++)
+      if (mean[e] - mean[dmax] > 2 || mean[dmax] - mean[e] > 2) { flat = false; break; }
+    if (flat) { first = d; break; }
+  }
+  Serial.printf("# settled to within 2 codes of %ld after %lu us "
+                "(CAL SETTLE is %u us)\n",
+                (long)mean[dmax], (unsigned long)first,
+                (unsigned)Cal::live().us[Cal::SETTLE]);
+  ok();
+}
+
+static void benchArm(const char* args) {
+  long v[2];
+  uint8_t np = parseLongs(args, v, 2);
+  if (np < 1) { err("BENCHARM", "need slot[,n]"); return; }
+  if (v[0] < 0 || v[0] >= (long)SJ_NUM_SLOTS) { err("BENCHARM", "slot out of range"); return; }
+  const uint8_t slot = (uint8_t)v[0];
+  const uint32_t n = (np >= 2 && v[1] > 0) ? (uint32_t)v[1] : 200;
+  const TrainDef& def = TrainStore::slotConst(slot);
+  char scratch[SJ_MSG_MAX];
+  uint32_t mn = UINT32_MAX, mx = 0;
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    FastIO::busLock();
+    uint32_t t0 = ARM_DWT_CYCCNT;
+    bool started = Engine::startTrain(0, slot, def, scratch, sizeof scratch, 0);
+    uint32_t dt = ARM_DWT_CYCCNT - t0;
+    Engine::stopTrain(0);
+    FastIO::busUnlock();
+    if (!started) { err("BENCHARM", scratch); return; }
+    if (dt < mn) mn = dt;
+    if (dt > mx) mx = dt;
+    sum += dt;
+  }
+  printStat("ARM", n, mn, sum, mx);
+  Serial.printf("# CAL STARTLAT is %u us; one engine needs the max above, "
+                "a TRIG independent route twice it\n",
+                (unsigned)Cal::live().us[Cal::STARTLAT]);
   ok();
 }
 
@@ -1066,6 +1189,10 @@ static void benchDispatch(const char* sub, const char* args) {
                   (unsigned long)n, (long)mn, (long)med, (long)mx,
                   (unsigned long)Engine::kReloadCycles());
     ok();
+  } else if (!strcmp(sub, "ARM")) {
+    benchArm(args);
+  } else if (!strcmp(sub, "SETTLE")) {
+    benchSettle(args);
   } else if (!strcmp(sub, "PIT")) {
     benchPit(args);
   } else if (!strcmp(sub, "SQ")) {

@@ -291,8 +291,9 @@ def main():
         if mdata:
             eq(len(mdata[0].split(",")), 8, "MDATA field count")
 
-        # A stage too short for its measurement window is refused, not squeezed
-        # -- with fit = 0, which is what the 7th MEAS field selects.
+        # A stage too short for its measurement window (20 us against the 47 us
+        # four reads need) is refused, not squeezed -- with fit = 0, which is
+        # what the 7th MEAS field selects.
         sj.cmd1("MEAS4,3,3,0,-1,0,0")
         sj.cmd1("S5,0,1,10000,30000;5000,1000,20;0,0,1000")
         sj.cmd1("MEAS5,3,3,0,-1,0,0")
@@ -303,15 +304,16 @@ def main():
         check(bool(skipped), f"refused point still reports an MSUM line: {skipped}")
 
         print("\n[measurement coverage: reads rotated over repetitions]")
-        # Stage 0 is 25 us: too short for four reads in one gap (42 us needed)
-        # but long enough for one (21 us), so fit = 1 measures all four lines
-        # over four consecutive pulses. Stage 1 is long and does not rotate.
-        # 20 pulses, so each line of stage 0 accumulates about five samples.
-        sj.cmd1("S6,0,1,10000,200000;5000,1000,25;-5000,-1000,1000")
+        # Stage 0 is 30 us: too short for four reads in one gap (47 us needed
+        # with the measured 9 us SETTLE) but long enough for one (26 us), so
+        # fit = 1 measures all four lines over four consecutive pulses. Stage 1
+        # is long and does not rotate. 20 pulses, so each line of stage 0
+        # accumulates about five samples.
+        sj.cmd1("S6,0,1,10000,200000;5000,1000,30;-5000,-1000,1000")
         sj.cmd1("MEAS6,3,3,0,-1,0,0")
         r = run_train(sj, "T6", 1.6)
         check(any(l.startswith("WARN MEAS:") and "not measured" in l for l in r),
-              "fit=0: the 25 us stage is refused")
+              "fit=0: the 30 us stage is refused")
         sj.cmd1("MEAS6,3,3,0,-1,0,1")
         r = run_train(sj, "T6", 1.6)
         check(not any(l.startswith("WARN MEAS:") for l in r),
@@ -334,16 +336,16 @@ def main():
               "the summary repeats how the point was measured")
 
         # The same coverage on an L ramp, where the free gap is the sample
-        # interval: refused at the default 20 us, measured at 25 us.
+        # interval: refused at the default 20 us, measured at 30 us.
         sj.cmd1("L7,0,1,10000,100000;4095,1000,1000")
         sj.cmd1("MEAS7,3,3,0,-1,0,1")
         r = run_train(sj, "T7", 1.0)
         check(any(l.startswith("WARN MEAS:") for l in r),
               "L at the default 20 us interval: not even one read fits")
-        sj.cmd1("DT7,25")
+        sj.cmd1("DT7,30")
         r = run_train(sj, "T7", 1.0)
         check(not any(l.startswith("WARN MEAS:") for l in r),
-              "L at a 25 us interval: rotated and measured")
+              "L at a 30 us interval: rotated and measured")
         check(any(l.startswith("MSUM,7,") for l in r), "ramp point summarised")
 
         print("\n[SD: log, listing and framed retrieval]")

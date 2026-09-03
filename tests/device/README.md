@@ -20,6 +20,23 @@ python capture.py all
 
 `smoke.py` exits with the number of failed checks.
 
+## What needs no oscilloscope
+
+Three of the four things a scope used to be needed for are now serial commands, so a board can be
+qualified over USB alone:
+
+| Question | Command | What to look for |
+|---|---|---|
+| Does a latch make its deadline? | any train, then read the completion | `WARN engine: … latch(es) overran their deadline` |
+| How long after a latch does a reading mean anything? (`CAL SETTLE`) | `M0,0` then `BENCHSETTLE,0,8000,20,64` | the delay at which the readings stop moving; 8–9 µs here |
+| How long does arming cost? (`CAL STARTLAT`) | `BENCHARM,<slot>,200` | the max; `STARTLAT` needs that plus `PRELOAD + DACPROG2 + 3 µs`, doubled for a two-engine trigger route |
+| How much does one DAC/ADC operation cost? | `BENCHDAC`, `BENCHDAC2`, `BENCHADC`, `BENCHSW`, `BENCHPIT` | the max, not the average |
+
+`BENCHSETTLE` and `BENCHSQ`/`BENCHSQL` drive the output; everything else leaves it parked.
+
+What still needs an oscilloscope, and how to wire it, is in
+[../../docs/bench-wiring.md](../../docs/bench-wiring.md).
+
 ## Bench wiring
 
 ```
@@ -46,9 +63,21 @@ polarities. Where a capture or an `MSUM` line shows the positive and negative ex
 clipping at unequal voltages, that is the diodes, not the instrument.
 
 The AWG wire is not teed to a scope input, so `capture.py` measures the trigger-to-output delay
-differentially: the same edge starts a zero-delay reference pulse on CH1 and the delayed pulse
-under test on CH0, the scope triggers on the reference, and the two engines' arming skew
-(measured the same way with the delay set to 0, ~7.5 µs) is subtracted.
+differentially: the same edge starts a reference pulse on CH1 and the delayed pulse under test on
+CH0, the scope triggers on the reference, and the constant engine-to-engine offset is subtracted.
+
+That offset is calibrated with the delay set to **500 µs, not to 0**. At 0 both engines' first
+latches fall on the same instant and the second player ISR has to wait for the first to return,
+which adds about 10 µs that is absent at every other delay. `capture.py` reports that case
+separately as *latch contention* (`figs/stimjim-trigger-contention.png`) because it is a real
+property worth knowing: two independently routed trains cannot be sample-aligned, and two
+channels that must be belong in one train that drives both.
+
+The reference pulse is deliberately short (`REF_HIGH_US`, 300 µs). The resistor chain couples the
+channels, so the reference's own falling edge lands on scope channel A as a step of a few hundred
+millivolts; if it coincides with the pulse under test it drags the interpolated threshold
+crossing by ~10 µs and looks exactly like a firmware timing error. Keeping the reference short
+keeps its fall clear of every delay the script measures.
 
 The resistor network couples the channels, and the captures show it in both directions. That is
 the circuit, not the instrument, and neither trace is an output of the channel it appears on:

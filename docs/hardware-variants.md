@@ -106,18 +106,24 @@ in this order:
 |---|---|---|
 | `BENCHDAC` / `BENCHDAC2` | `DACPROG1` / `DACPROG2` | round up; the portable route pays an extra `beginTransaction`/`endTransaction` per word |
 | `BENCHADC` / `BENCHSW` | `ADCREAD` / `ADCSWITCH` — the measurement budget (plan §3.6) | carry the **maximum**, not the average: one outlying read pushes the next latch late. `BENCHSW` also answers bench-verify item 1, first-conversion validity after a line switch |
-| a scope on one output | `SETTLE`, `GUARD` | how long after a latch a reading means anything; the floor is also the player's own post-latch bookkeeping, ~3.2 µs on the register path |
+| `BENCHSETTLE,<ch>,<code>,20` | `SETTLE` — how long after a latch a reading means anything | needs no scope: the board latches the same step over and over and reads it back at increasing delays, so the delay at which the readings stop moving is the answer. On the Teensy 3.5 it is 8–9 µs, and the 4 µs this firmware shipped with read 8–9 % short |
 | `BENCHMISO` | confirms the mux swap does not glitch the first bit | on the portable route this covers `SPI.setMISO` instead of the PORT mux |
 | `BENCHPIT,1000,5000` | `PRELOAD` — raw ISR wake latency | the portable route wakes later: `IntervalTimer::begin()` is slower than writing `LDVAL` |
 | `BENCHPIT,1000,5000,<preload>` | acceptance: residual latch jitter must stay < 200 ns | if it does not, raise `PRELOAD` |
 | `BENCHK` | spread of the boot `K_RELOAD` calibration | the constant itself is self-calibrated; this only checks it is stable |
 | `BENCHSQ` vs `BENCHSQL` | scope A/B of the FastIO path against `Stimjim.writeToDac` | the shape check for a new FastIO backend |
-| a scope on the trigger input and one output | `TRIGCOMP` — pin edge to ISR entry | the delivered latency is `STARTLAT` once this is set; everything from the ISR's first instruction onwards is already compensated |
+| `BENCHARM,<slot>` | `STARTLAT` — see below | run it on the most complex slot the board will actually be triggered with |
+| a scope on the trigger input and one output | `TRIGCOMP` — pin edge to ISR entry | the delivered latency is `STARTLAT` once this is set; everything from the ISR's first instruction onwards is already accounted for inside `STARTLAT` |
 
-`STARTLAT` has to cover `PRELOAD + DACPROG2 + 3 µs` beyond `TRIGCOMP`, which is why the portable
-default is 40 µs against the register path's 20: its programming budgets are twice as wide.
-`Cal::validate` refuses a set that breaks the relation, and reports it at boot if a build's own
-defaults do.
+`STARTLAT` has two floors. The one `Cal::validate` enforces is `PRELOAD + DACPROG2 + 3 µs` beyond
+`TRIGCOMP`. The one that actually sizes it is **the cost of `Engine::startTrain`**, because `t0`
+is measured from the start request and every microsecond of arming is spent inside the latency
+rather than added to it. `BENCHARM` measures that per slot: 19–24 µs for `S` and `L` trains on
+the Teensy 3.5 register build, 42 µs for a measured sine, roughly double on the portable route.
+The defaults are 60 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one
+edge and so needs twice the arm; when an arm does not fit, the train's completion says so and
+names the `STARTLAT` that would have covered it, so this is one of the values a board can be
+qualified for over the serial port alone.
 
 Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
 which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the
