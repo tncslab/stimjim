@@ -28,7 +28,12 @@ StimJim CH0(+) -> PicoScope channel A ("channel 1")
 StimJim CH1(+) -> PicoScope channel B ("channel 2")
 StimJim CH0(-) -> PicoScope ground
 
-A(CH1+) --1k-- B(CH0+) --1k-- C(CH0-) --[two antiparallel LEDs]-- D(CH1-)
+load chain, four nodes in series (node names spelled out: the scope's own
+channels are also called A and B, and mixing the two up is easy):
+
+    CH1(+) ---- 1k ---- CH0(+) ---- 1k ---- CH0(-) ---[antiparallel LEDs]--- CH1(-)
+      |                    |                   |
+   scope B              scope A            scope gnd
 ```
 
 The AWG wire is not teed to a scope input, so `capture.py` measures the trigger-to-output delay
@@ -36,9 +41,20 @@ differentially: the same edge starts a zero-delay reference pulse on CH1 and the
 under test on CH0, the scope triggers on the reference, and the two engines' arming skew
 (measured the same way with the delay set to 0, ~7.5 µs) is subtracted.
 
-The resistor network couples the channels, and the captures show it: while CH0 is grounded a
-CH1 pulse divides down onto B, and a CH0 pulse is clamped onto A at the LEDs' forward drop
-(~2.2 V). That is the circuit, not the instrument.
+The resistor network couples the channels, and the captures show it in both directions. That is
+the circuit, not the instrument, and neither trace is an output of the channel it appears on:
+
+- **A CH0 pulse shows up on scope channel B**, because a channel that no train is driving is
+  *grounded* (mode 3, the state `Stimjim.begin()` and every train end leave behind), which ties
+  CH1(+) to CH1(−) and hence to the LED branch. Below the LEDs' turn-on that branch carries no
+  current, so scope B simply sits at CH0(+)'s potential (within a few per cent up to ~1.8 V);
+  above it the LEDs clamp, and scope B saturates at +2.2 V one way, −2.9 V the other.
+- **A CH1 pulse divides down onto scope channel A**: with CH0 grounded, its 8 V reference pulse
+  reads about 0.5 V there, roughly 11 %.
+
+A scope input measures voltage at high impedance and needs no return current of its own, so
+these readings are well defined whether the quiet channel is grounded or hi-Z — the two
+resistors alone give CH1(+) a path to scope ground.
 
 ## Gotchas found on this bench
 

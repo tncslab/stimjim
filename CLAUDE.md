@@ -35,7 +35,7 @@ in @docs/PROGRESS.md (newest first). To pick up work, read the index and then at
 one or two entry files, never the whole log. If all objectives are fulfilled, commit to the
 existing git repo; then stop.
 
-Development story and historic references live exclusively in the progress reports and git messages.
+Development story and historic references live exclusively in the progress reports and git messages. The report files shall be self-contained and interpretable on their own with all relevant information written down.
 All other documents describe current state, rationale, known limitaions and remaining tasks without referring to history.
 
 # GPU notes (this project: OpenMM MD)

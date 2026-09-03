@@ -122,23 +122,50 @@ StimJim CH0(+)  ->  PicoScope channel A
 StimJim CH1(+)  ->  PicoScope channel B
 StimJim CH0(-)  ->  PicoScope ground       (the common reference for both scope inputs)
 
-load chain:   A(CH1+) --1k-- B(CH0+) --1k-- C(CH0-) --[two antiparallel LEDs]-- D(CH1-)
+load chain, four nodes in series:
+
+    CH1(+) ---- 1k ---- CH0(+) ---- 1k ---- CH0(-) ---[antiparallel LEDs]--- CH1(-)
+      |                    |                   |      (one red, one blue)
+   scope B              scope A            scope gnd
 ```
 
 Both scope inputs sit on the ±10 V range. The four load nodes are one series chain, not two
 independent loads, and that is deliberate: the isolated outputs need *some* return path, and a
-shared chain gives one with two useful properties. It also puts its own signature on every
-trace, which is worth recognising before reading a figure as a fault:
+shared chain gives one. (The original wiring note labelled the chain nodes A–D, which collides
+with the scope's own channel names A and B — the labels above are explicit instead, because the
+collision is easy to trip over.)
 
-- **Cross-talk onto the idle channel.** While CH0 is grounded, a CH1 pulse divides across the two
-  1 k resistors, so channel A shows roughly half of it. A trace where the "idle" channel is not
-  flat is showing the divider, not a firmware bug.
-- **The ~2.2 V clamp.** A CH0 pulse is clamped at the antiparallel LEDs' forward drop, so channel
-  A does not reach the programmed 5 V. Amplitude accuracy is not what these captures test —
-  shape and timing are.
+**Both channels are grounded, not hi-Z, whenever a train is not driving them.** `mode = 3` is
+`GROUND` and `mode = 2` is `HIGH-Z` in the output-enable decoder, and `Stimjim.begin()` ends by
+setting both channels to 3, as does the end of every train. A `mode1 = 3` in a *train
+definition* means only "this train does not drive channel 1 — leave its pins alone", so what
+channel 1 is actually doing during a CH0-only capture is holding the standing state: grounded.
 
-The antiparallel pair conducts in both directions, so biphasic and sine outputs are clamped
-symmetrically.
+That matters for the question of whether scope channel B has a reference at all, and the answer
+is that it always does, for two independent reasons. A scope input is a high-impedance voltage
+measurement and needs no return current of its own — only a defined potential — and CH1(+)
+reaches scope ground through 1 k + 1 k whatever the output stage does. Grounding CH1 adds a
+second path: it ties CH1(+) to CH1(−), which reaches scope ground through the LED branch. Had
+CH1 been left hi-Z (`M1,2`) the measurement would still have been defined, through the two
+resistors alone.
+
+**What the circuit puts on the traces.** Both signatures are worth recognising before reading a
+figure as a fault, and both were checked against the captured samples in `tmp/`:
+
+- **A CH0 pulse appears on scope channel B, LED-clamped.** With CH1 grounded, CH1(+) is tied to
+  CH1(−), which reaches scope ground only through the antiparallel LEDs. Below their turn-on no
+  current flows in that branch, so none flows through the 1 k beside it either and CH1(+) simply
+  sits at CH0(+)'s potential: in the `L` ramp capture scope B tracks scope A within 1–4 % up to
+  about 1.8 V. Above turn-on the LEDs conduct and clamp it — scope B saturates at **+2.2 V one
+  way and −2.9 V the other**, the two antiparallel devices not being identical. So the flat tops
+  on scope B in the shape figures are the LED drop, and the channel is *not* emitting.
+- **A CH1 pulse divides down onto scope channel A.** The other direction, visible in the delay
+  captures: while CH1 drives its 8 V reference pulse and CH0 is grounded, scope A reads
+  **0.49–0.58 V, about 11 %** of it — the residue across CH0's grounded output stage and the
+  divider, not an output.
+
+Neither signature affects amplitude accuracy, which is not what these captures test: scope A
+reads about 4.1–4.2 V for a programmed 5 V on CH0. Shape and timing are what they test.
 
 ### What each figure actually played
 
@@ -146,9 +173,10 @@ Slot numbers 10–14 are reserved for the bench so nothing a user stored gets ov
 `capture.py` resets them afterwards.
 
 **The three shape figures — CH0 only.** All three are defined with `mode0 = 0` (voltage) and
-`mode1 = 3` (not driven), so **only channel 0 emits**; channel B in those figures is the idle
-channel showing divider cross-talk. Each train repeats every 20 ms and runs for 3 s, and the
-scope triggers on the stimulus itself:
+`mode1 = 3`, so **only channel 0 emits** and channel 1 stays grounded throughout. The scope B
+trace in those figures is therefore not an output at all: it is CH0's own waveform reaching
+CH1(+) through the load chain, clamped by the LEDs as described above. Each train repeats every
+20 ms and runs for 3 s, and the scope triggers on the stimulus itself:
 
 | Figure | Slot line | In words |
 |---|---|---|

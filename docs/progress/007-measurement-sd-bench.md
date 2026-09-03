@@ -172,15 +172,23 @@ connected. The StimJim outputs still drove the Phase-6 load chain, which is what
 readings describe:
 
 ```
-StimJim CH0(+) --1k-- ... the chain, from CH1(+) round to CH1(-):
-  A(CH1+) --1k-- B(CH0+) --1k-- C(CH0-) --[two antiparallel LEDs]-- D(CH1-)
+load chain, four nodes in series:
+
+    CH1(+) ---- 1k ---- CH0(+) ---- 1k ---- CH0(-) ---[antiparallel LEDs]--- CH1(-)
 ```
 
-A programmed 5 V on CH0 therefore reads back around 4.49 V, because the antiparallel LED pair
-clamps at its ~2.2 V forward drop and the two 1 k resistors divide what is left; a programmed
-1000 µA on CH1 reads back 988–1103 µA. **Amplitude accuracy is not what these checks test** —
-what matters is that the readings are stable (spreads of 2–8 mV and < 1 µA over 300
-repetitions), correctly signed per stage, and taken at the right instants.
+The numbers below are what the StimJim's *own* ADC reports through the calibrated `E`/`READ`
+path, so they describe the outputs into that load, not into an open circuit. A CH0 voltage
+stage programmed to 5000 mV reads back about 4486 mV and delivers 1103 µA; a CH1 current stage
+programmed to 1000 µA delivers 989 µA and develops 8028 mV of compliance voltage across its
+share of the chain. Which part of the voltage shortfall is loaded output droop, which is the
+ADC's calibration and which is the LED branch was **not** separated — nothing in this phase
+needed it.
+
+**Amplitude accuracy is not what these checks test.** What matters is that the readings are
+stable (spreads of 2–8 mV and under 1 µA over 300 repetitions), correctly signed per stage, and
+taken at the intended instants — a current source delivering 989 of a commanded 1000 µA is the
+sanity check that the reads land on the stage they claim to.
 
 | Case | Result |
 |---|---|

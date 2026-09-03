@@ -6,7 +6,13 @@ Wiring this assumes (the bench as built):
     StimJim CH0(+) --> PicoScope channel A ("channel 1")
     StimJim CH1(+) --> PicoScope channel B ("channel 2")
     StimJim CH0(-) --> PicoScope ground
-    A(CH1+) -1k- B(CH0+) -1k- C(CH0-) -[two antiparallel LEDs]- D(CH1-)
+
+    load chain:  CH1(+) -1k- CH0(+) -1k- CH0(-) -[antiparallel LEDs]- CH1(-)
+                    |           |           |
+                 scope B     scope A    scope gnd
+
+The chain couples the channels, so a quiet channel's trace is not flat -- see
+README.md for what each direction looks like and why.
 
 The AWG wire is not teed to a scope input, so trigger-to-output delay is
 measured differentially instead: the same trigger edge starts a zero-delay
