@@ -74,6 +74,15 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
   ≈2 µs when the input line is already selected.
 - AD5752 power-up quirk: range register written twice ("first write may be ignored"), 10 µs delay
   after the power-control write (`Stimjim.cpp:71-81`).
+- **The AD5752 is double-buffered**: an SPI write lands in the input register and does nothing at
+  the output until `NLDAC` is pulsed low (≥20 ns; `FastIO::dacLatch` holds ~100 ns and costs
+  0.44 µs measured). A code can therefore be programmed arbitrarily long before it is executed, and
+  two channels latched a couple of CPU cycles apart. `stimjimAWG` uses this for every event
+  (program during the preload window, latch on the deadline) and could use it to preload a first
+  sample before a trigger edge — see [timing.md](timing.md) §3.
+- Output settling after a latch: **8–9 µs** to the final value, measured with `BENCHSETTLE` on
+  either channel, either polarity, at 2000 and 8000 codes of step. This is the analog floor under
+  every latency figure in the firmware.
 - Calibration routines allow 30–50 µs settling after DAC steps before averaging ADC reads; first
   ADC reads after reconfiguration can show a transient (first 50 of 150 reads discarded).
 

@@ -129,6 +129,11 @@ schedules against, not an average.
 Expect a few hundred nanoseconds. `attachInterrupt` on a Kinetis port ISR plus the dispatch to the
 handler is the whole of it, and the value is a property of the MCU and the core, not of the board.
 
+This is also the only configuration that measures the instrument's **absolute** trigger-to-output
+latency. Everything else on this bench is differential (the same edge starts a reference pulse on
+the other engine), so until this runs, the 60 µs of [timing.md](timing.md) §1 is a budget the
+engine schedules against rather than a captured figure.
+
 ---
 
 ## Configuration C — the two channels compared against each other

@@ -2,7 +2,8 @@
 //
 //    Arbitrary-waveform-generator firmware for the StimJim board.
 //    Design documents: docs/awg-implementation-plan.md, docs/serial-protocol.md,
-//    docs/hardware-notes.md, docs/hardware-variants.md.
+//    docs/timing.md (what the budgets below deliver as latency), docs/hardware-notes.md,
+//    docs/hardware-variants.md.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by

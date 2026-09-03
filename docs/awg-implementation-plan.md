@@ -1,7 +1,7 @@
 # stimjimAWG — implementation plan
 
 Status: in progress. Target folder `stimjimAWG/` (branch `arbitrary_waveform`).
-Companion documents: [serial-protocol.md](serial-protocol.md), [hardware-notes.md](hardware-notes.md), [hardware-variants.md](hardware-variants.md), [PROGRESS.md](PROGRESS.md).
+Companion documents: [serial-protocol.md](serial-protocol.md), [timing.md](timing.md), [hardware-notes.md](hardware-notes.md), [hardware-variants.md](hardware-variants.md), [PROGRESS.md](PROGRESS.md).
 License: GPL-3.0-or-later (same as the rest of the project).
 
 ## 1. Context and goals
@@ -69,6 +69,12 @@ Timebase: DWT `CYCCNT` extended to 64 bits in software (`cycles64()`, 8.33 ns re
   wakeups (also keeps the 64-bit CYCCNT extension alive; PIT max load at 60 MHz is ~71 s).
 - The PIT reload constant `K_RELOAD` (cycles between CYCCNT read and timer re-enable) is
   self-calibrated at boot, not hard-coded — no compiler-profile-dependent magic numbers.
+- **This is not a busy loop.** The CPU is occupied only for `PRELOAD + program ≈ 7 µs` per event
+  (the spin covers the residue between the early wakeup and the deadline); between events the PIT
+  is armed and `loop()` runs serial, SD and display work. A 20 µs event grid therefore costs about
+  a third of the CPU. The two exceptions are inline-processed event clusters (above) and a
+  measurement point, which spins to its instant before reading. The legacy firmware, by contrast,
+  busy-waits every stage with `delayMicroseconds` in ISR context for the whole pulse.
 
 ### 3.2 No DMA — optimized register-level ISR engine
 
@@ -342,6 +348,16 @@ still does.
   measures nothing), the 64-bit divisions of the ramp and sine setup, and `ampToCode`'s float
   division per stage per channel. Pre-building the measurement plan when the `TRIG` route is set
   rather than when the edge arrives would remove another 4.3 µs.
+- **A pre-armed trigger path could reach single-digit microseconds.** The AD5752 already separates
+  program from execute, and `dacLatch` costs 0.44 µs, so if the *whole* arm moved before the edge —
+  armed when the `TRIG` route is set, or at the end of the previous train — the edge ISR would only
+  pulse `NLDAC`, switch the output enable out of ground and program the PIT for the second event:
+  an estimated 1–3 µs delivered latency instead of 60. The costs are that copy-on-arm would then
+  happen at route-set time (slot edits would need a re-arm to take effect) and that the preloaded
+  input register would have to be rewritten after every `V`/`A`/`B`/`C`/`READ` and after each park.
+  Worth it only for waveforms whose first sample is a jump away from the parked level (`S`, a
+  0-duration first `L` stage, a `W` with nonzero start phase); the 8–9 µs analog settling is the
+  floor either way. See [timing.md](timing.md) §3.
 - **The first `adcSelectLine` could be issued inside the `SETTLE` window.** A control-register
   write samples nothing, so it can overlap the settling; that would return `ADCSWITCH` = 4 µs of
   the 9 µs every measurement point now pays.

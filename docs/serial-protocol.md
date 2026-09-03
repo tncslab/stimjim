@@ -7,7 +7,8 @@ persistence (`P`), in-train measurement (`MEAS` execution with its `MSUM` summar
 `MDATA` stream), SD logging (`LOG`) with serial access to the card (the `SD` group), and
 `STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`, and the runtime timing budget (`CAL`).
 **Not implemented:** the button menu editor.
-See [awg-implementation-plan.md](awg-implementation-plan.md) for what remains, and
+See [awg-implementation-plan.md](awg-implementation-plan.md) for what remains,
+[timing.md](timing.md) for latency and CPU-occupancy figures gathered in one place, and
 [bench-wiring.md](bench-wiring.md) for the measurements that still need an oscilloscope. The legacy
 sections below double as documentation of the sibling `stimjimPulser` firmware in this
 repository; the "hardened" notes describe where stimjimAWG deliberately differs from it.
@@ -496,6 +497,15 @@ form above. Only `loop()` touches the card, on the Teensy's native SDIO — neve
 bus — so a write-latency spike cannot disturb a waveform. Data is flushed at each train end,
 every 64 rows, or once a second, whichever comes first.
 
+**What a write-latency spike does cost** is measurement records, never waveform timing: the player
+ISR (priority 64, preempting `loop()` unconditionally) only pushes a record into the 128-entry
+`MDATA` ring, and `loop()` formats it and hands it to SdFat, which buffers into a 512-byte block.
+A stall therefore loses records once it exceeds `128 / (measurement points per second)` — 64 ms at
+2000 rows/s — and says so with `WARN MEAS: MDATA ring overflowed`. SD write latency itself has
+never been timed on this board (there is no `BENCHSD`); cards are typically well under a
+millisecond per buffered block with occasional stalls of tens of milliseconds. See
+[timing.md](timing.md) §6.
+
 A log has to be readable on its own, including when the trains were fired by trigger edges with
 no host attached, so the file carries:
 
@@ -563,6 +573,15 @@ TRIG<t>?  → canonical line
   the fixed `START_LATENCY` plus the slot's `delay_us`, not something that depends on how busy
   `loop()` is. Loop-context `T`/`U` takes the bus lock around `startTrain` so a trigger edge
   cannot interleave with it.
+- **The latency is 60 µs** on a Teensy 3.5 with the register backends (`CAL STARTLAT`; 120 µs on
+  the portable build), repeatable to the 42 ns residual latch jitter, and 16–42 µs of it is the arm
+  itself rather than the 2.75 µs DAC write. **The edge ISR emits no sample**: it timestamps the
+  edge, arms, computes `t0 = edge − TRIGCOMP + STARTLAT + delay_us`, and programs its player's PIT
+  channel to wake one `PRELOAD` before `t0`. The first latch, like every later one, happens in the
+  player ISR — the interrupt supplies the time reference, the clock emits the samples, which is
+  what makes the latency independent of the train's complexity. Preloading the DAC input register
+  before the edge (the AD5752 latches on a 0.44 µs `NLDAC` pulse) would only help if the arm moved
+  before the edge too; [timing.md](timing.md) §3 works through what that would cost and buy.
 - In mode 2 the two engines are armed one after the other inside the same ISR, which puts
   engine 1 about **7.5 µs** behind engine 0 (measured). Trains that must be sample-
   synchronous belong in one slot driving both channels (mode 1), not in two.

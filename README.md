@@ -111,6 +111,15 @@ port before anything is wired.
 independent route: two engines started by one edge cannot latch at the same instant and the
 second one lands ~9 µs late. See [docs/serial-protocol.md §4](docs/serial-protocol.md).
 
+A trigger edge puts signal on the output **60 µs later** (`CAL STARTLAT`, adjustable), repeatable
+to 42 ns, plus whatever `DELAY` asks for. The 60 µs is almost all the arm — the copy and
+precomputation the edge ISR does before it hands the train to the timer — not the DAC write, which
+is 2.75 µs. The edge ISR itself emits nothing: it timestamps the edge, computes `t0` and programs
+a timer, and every sample is latched from the timer ISR, which is why the latency does not depend
+on the train, on `loop()`, or on interrupt entry.
+[docs/timing.md](docs/timing.md) works through that, the comparison with the original firmware,
+whether a preloaded DAC could fire faster, and what SD logging costs.
+
 ## Measure what was delivered
 
 Measurement is on by default: every train summarises what it put out.
@@ -171,6 +180,7 @@ PicoScope (`capture.py`); its README documents the bench wiring.
 | [stimjimPulser/](stimjimPulser/) | the original firmware, kept for reference |
 | [lib/](lib/) | the `Stimjim` hardware library (pins, DAC/ADC helpers) |
 | [docs/serial-protocol.md](docs/serial-protocol.md) | every command, with defaults and measured timing |
+| [docs/timing.md](docs/timing.md) | trigger latency, ISR-vs-busy-loop, DAC preloading, SD cost and content |
 | [docs/hardware-variants.md](docs/hardware-variants.md) | Teensy 3.5 / 4.x differences and what to recalibrate |
 | [docs/hardware-notes.md](docs/hardware-notes.md) | board-level notes and known hardware limits |
 | [docs/bench-wiring.md](docs/bench-wiring.md) | how to wire board and scope for each remaining measurement |
