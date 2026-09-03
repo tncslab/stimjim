@@ -12,8 +12,8 @@ Build status (Teensyduino 1.62.0, `--warnings more`, zero warnings):
 
 | Target | Command | Result |
 |---|---|---|
-| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 169 716 B flash, 47 524 B RAM (`hot=RAM`) |
-| Teensy 3.5 (register, code in flash) | as above `-DSJ_CODE_IN_RAM=0` | 169 536 B flash, 41 404 B RAM — the 6120 B difference is the two hot functions |
+| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 169 700 B flash, 47 820 B RAM (`hot=RAM`) |
+| Teensy 3.5 (register, code in flash) | as above `-DSJ_CODE_IN_RAM=0` | 169 536 B flash, 41 404 B RAM — the 6416 B difference is the four hot functions |
 | Teensy 3.5 (portable backends) | as above `-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | 170 808 B flash, 47 764 B RAM |
 | Teensy 4.1 | `--fqbn teensy:avr:teensy41` | FLASH code 144 588 B, RAM1 variables 63 680 B |
 | Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | FLASH code 100 708 B — no SD, see below |
@@ -53,14 +53,15 @@ the build:
 |---|---|---|
 | `SJ_FASTIO_REGISTER` | SPI0 driven through its DSPI registers, CTAR0/CTAR1 preconfigured for DAC and ADC, MISO swapped by writing the PORT mux | `SPI.beginTransaction()` per DAC word or ADC frame, `SPI.setMISO()` for the mux |
 | `SJ_TIMER_REGISTER` | two PIT channels claimed through `IntervalTimer`, then their vectors and NVIC priorities taken over one by one | `IntervalTimer::begin()` re-armed per event, with the core's own dispatcher |
-| `SJ_CODE_IN_RAM` | `Engine::startTrain` and `Engine::playerRun` are placed in `.fastrun`, which the core copies into SRAM at boot, so they execute without flash wait states — 5.9 kB of RAM, `IDN` says `hot=RAM` | the two functions execute from flash (`hot=flash`). On Teensy 4.x the switch is off because the core runs *all* code from ITCM already (`hot=ITCM`) |
+| `SJ_CODE_IN_RAM` | `Engine::startTrain`, `Engine::playerRun`, `SampleGen::rampStageInit` and `SampleGen::rampStep` are placed in `.fastrun`, which the core copies into SRAM at boot, so they execute without flash wait states — 6.3 kB of RAM, `IDN` says `hot=RAM`, and it is worth 13–17 % of the arm ([timing.md](timing.md) §7) | the four functions execute from flash (`hot=flash`). On Teensy 4.x the switch is off because the core runs *all* code from ITCM already (`hot=ITCM`) |
 
 Forcing the portable backends on a Teensy 3.5 (`-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0`)
 is the intended way to measure the portable route's constants: it isolates the backend change
-on hardware whose behaviour is already known. `SJ_CODE_IN_RAM` is meant to be A/B-ed the same way,
-with `BENCHARM` and `tests/device/bench_arm.py`: the two functions it moves are the ones whose cost
-*is* a latency, and how much the flash controller was costing them has never been measured
-([timing.md](timing.md) §7).
+on hardware whose behaviour is already known. `SJ_CODE_IN_RAM` is A/B-ed the same way,
+with `BENCHARM` and `tests/device/bench_arm.py`: the functions it moves are the ones whose cost
+*is* a latency. Measured, it saves 1.4–4.3 µs of the arm depending on the train — 13–17 % — and the
+saving tracks function size, because the K64's flash cache is 512 bytes and `startTrain` and
+`playerRun` are 2.8 and 3.2 kB ([timing.md](timing.md) §7).
 
 ## 2. Why Teensy 4 does not reuse the register path
 

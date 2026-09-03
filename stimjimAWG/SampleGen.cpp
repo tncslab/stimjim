@@ -5,11 +5,24 @@
 #include "SampleGen.h"
 #include <math.h>
 
+// rampStageInit and rampStep are the only SampleGen functions on a latency
+// path — the first inside the start latency, once per ramp stage, the second
+// inside the player ISR, once per sample. SJ_HOT places them in the same RAM
+// section as Engine::startTrain and Engine::playerRun, so a call from RAM into
+// flash does not give back what moving the callers there bought
+// (docs/timing.md §7). Config.h pulls Arduino.h in, so the host tests — which
+// compile this file on its own — take the empty definition instead.
+#ifdef ARDUINO
+  #include "Config.h"
+#else
+  #define SJ_HOT
+#endif
+
 namespace SampleGen {
 
 // -------------------------------------------------------------------- ramps
 
-void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,
+SJ_HOT void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,
                    uint32_t targetDt_us, int32_t start0, int32_t end0,
                    int32_t start1, int32_t end1) {
   // N <= 2^32/targetDt so it fits int32 for targetDt >= 2. Both operands are
@@ -58,7 +71,7 @@ void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,
   st.end1 = end1;
 }
 
-void rampStep(RampCursor& c, const RampStage& st) {
+SJ_HOT void rampStep(RampCursor& c, const RampStage& st) {
   c.k++;
   c.t += st.qt;
   c.tAcc += st.rt;

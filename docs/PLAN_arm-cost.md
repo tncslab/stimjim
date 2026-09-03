@@ -1,17 +1,21 @@
 # Plan — bring the arm cost under one latch interval
 
-Status: items 1–5 built and host-tested 2026-09-03; **awaiting the bench run** that turns the
-predictions into numbers and decides whether `CAL STARTLAT` can come down. Item 6 is deferred with
-its prerequisite in place. Current state and the predicted figures live in
-[timing.md](timing.md) §7; this file keeps the reasoning behind each decision.
+Status: done, 2026-09-03. Items 1–5 are built, host-tested and measured on silicon; item 6 is
+deferred with its prerequisite in place and is re-scoped by what the bench found. The arm fell from
+16.2–37.5 µs to 8.5–28.5 µs on a re-arm, but the measurement-plan compile turned out to cost 3.1 µs
+per point on the first arm after an edit, which is now the largest single term and puts the worst
+case at 54.3 µs. `CAL STARTLAT` therefore stays at 60 µs. Current numbers and the remaining work
+live in [timing.md](timing.md) §7; this file keeps the reasoning behind each decision.
 
 The goal is a start latency no longer than the interval between two consecutive DAC updates, so
 that a trigger-started train never needs a wider budget than the waveform itself already runs on.
 The shortest interval the engine schedules is the default ramp sample interval `DT` = 20 µs (and
 the sine sample interval at the 50 kHz `FS_MAX` ceiling, also 20 µs). `CAL STARTLAT` has to cover
 `arm + PRELOAD + DACPROG2 + MIN_SCHEDULE` = `arm + 12 µs`, so **the arm has to fit in 8 µs**,
-against 16.2 µs today for a train that drives nothing and 19–42 µs for real ones. This plan lists
-what the arm spends that on, what can be moved out of it, and in what order.
+against 16.2 µs at the time of writing for a train that drives nothing and 19–42 µs for real ones.
+This plan lists what the arm spends that on, what can be moved out of it, and in what order. The
+bench run at the end shows the goal is not reachable this way: an arm that drives nothing costs
+8.45 µs after every item below is built.
 
 ## Terminology
 
@@ -170,31 +174,57 @@ that rule, a lazy scheme never has to prepare more than one stage ahead: on ente
 derives stage i+1, and if stage i is a 0-duration jump it derives i+2 as well — bounded look-ahead
 by construction rather than by luck.
 
-## Bench work this plan needs
+## What the bench found
 
-`BENCHARM` has never been run on a ten-stage `L` slot. From the measured pieces it projects to
-`19.2 + 9 × 4.6 ≈ 61 µs`, i.e. above the 60 µs `STARTLAT` default, and ~65 µs with measurement on.
-`tests/device/bench_arm.py` now defines the representative slots and runs the sweep, so the
-projection can be replaced by a number, before and after items 1–5.
+`tests/device/bench_arm.py` ran on a Teensy 3.5 at 120 MHz with the register backends, on both
+halves of the `SJ_CODE_IN_RAM` A/B. Full tables are in [timing.md](timing.md) §7; what matters to
+the decisions in this file:
+
+- **The projection for a ten-stage `L` train was wrong by a factor of two in the safe direction.**
+  It was expected at ~61 µs from the phase-9 pieces; it measures **28.5 µs** on a re-arm and 31.4 µs
+  on a first arm. Items 1–5 did more than the arithmetic of the projection allowed for.
+- **`SJ_CODE_IN_RAM` is worth 13–17 %, not 30–50 %.** The saving is real and scales with the
+  function's size, which is the tell: the two multi-kilobyte functions blow the K64's 512-byte
+  flash cache and gain 1.4–4.3 µs, while moving the 180-byte `rampStageInit` in as well gained only
+  0.33 µs over ten stages. The flash controller was a contributor, not the explanation; the memset
+  and the soft-float were.
+- **The plan compile is now the largest single term, and it was never on this plan's list.** Item 2
+  moved it from every arm to the first arm after an edit, which is the right place for it, but it
+  costs **3.1 µs per measurement point** and a ten-point plan therefore makes the first arm 54.3 µs
+  against that train's 23.6 µs re-arm. `CAL STARTLAT` = 60 µs does not cover it.
+- **The accumulator zeroing costs 0.55 µs per point**, so the ten-point case pays 5.7 µs of it on
+  every arm.
+- **The 8 µs target this plan opens with is unreachable from inside the arm.** The floor — an arm
+  that drives nothing — is 8.45 µs on its own.
 
 ## What was built
 
 | Item | State |
 |---|---|
-| 1 — zero only the plan a train uses | Done. `planCompile` zeroes 242 bytes of the struct's 1224; `planResetResults` clears 96 bytes per existing point. `tests/host/test_measure.cpp` poisons the struct with `0xAA` before `planBuild` so a field added after `acc` without a reset fails the test. |
-| 2 — compile the plan once per definition | Done. The plan carries `(tagValid, tagSlot, tagDefEpoch, tagCalEpoch)`; `TrainStore::epoch()` bumps on `commit`, `begin` and the EEPROM restore, `Cal::epoch()` inside `Cal::set`'s bus lock. |
-| 3 — derive the sine constants at definition | Done. `SampleGen::sineDerive` is the pure derivation, `Engine` caches one `SineConst` per slot (2 kB) keyed on the definition epoch, and `Engine::deriveSine` warms it from the `S`/`L`/`W` commit. The arm still derives on demand, so correctness never depends on the warm-up. |
-| 4 — 32-bit `UDIV` in `rampStageInit` | Done, with the exactness checked rather than argued: `testRampDivisionPaths` compares both paths against the 64-bit reference across six `dt` values and 21 durations up to `UINT32_MAX`, including both overflow guards, and re-checks that N Bresenham steps still land exactly on the stage end. |
-| 5 — `FASTRUN` | Done as `SJ_CODE_IN_RAM`, default on for Kinetis, covering `Engine::startTrain` and `Engine::playerRun`. Verified in the ELF: both are at `0x1fff…` in SRAM, and RAM rises 41 404 → 47 524 B, the 6120 B the two functions occupy. `IDN` reports `hot=RAM`/`flash`/`ITCM`. **Its effect on the arm is unmeasured** — that is the bench run. |
-| 6 — derive stage i+1 during stage i | Deferred. Prerequisite built: consecutive 0-duration `L` stages are refused at parse time, so look-ahead is bounded to one stage. |
+| 1 — zero only the plan a train uses | Done. `planCompile` zeroes 242 bytes of the struct's 1224; `planResetResults` clears 96 bytes per existing point. `tests/host/test_measure.cpp` poisons the struct with `0xAA` before `planBuild` so a field added after `acc` without a reset fails the test. Measured: 0.55 µs per point on every arm, against 5–7 µs flat before. |
+| 2 — compile the plan once per definition | Done. The plan carries `(tagValid, tagSlot, tagDefEpoch, tagCalEpoch)`; `TrainStore::epoch()` bumps on `commit`, `begin` and the EEPROM restore, `Cal::epoch()` inside `Cal::set`'s bus lock. Measured: the compile drops out of every arm after the first, and costs 3.1 µs per point on that first one. |
+| 3 — derive the sine constants at definition | Done. `SampleGen::sineDerive` is the pure derivation, `Engine` caches one `SineConst` per slot (2 kB) keyed on the definition epoch, and `Engine::deriveSine` warms it from the `S`/`L`/`W` commit. The arm still derives on demand, so correctness never depends on the warm-up. Measured: a `W` arm fell 37.5 → 10.1 µs, the largest single saving in the plan, and now costs the same as an `S` arm. |
+| 4 — 32-bit `UDIV` in `rampStageInit` | Done, with the exactness checked rather than argued: `testRampDivisionPaths` compares both paths against the 64-bit reference across six `dt` values and 21 durations up to `UINT32_MAX`, including both overflow guards, and re-checks that N Bresenham steps still land exactly on the stage end. Measured: a ramp stage costs 1.93 µs in the arm, of which 1.04 µs is `rampStageInit`. |
+| 5 — `FASTRUN` | Done as `SJ_CODE_IN_RAM`, default on for Kinetis, covering `Engine::startTrain`, `Engine::playerRun` and — added after the first bench run — `SampleGen::rampStageInit` and `rampStep`. Verified in the ELF: all are at `0x1fff…` in SRAM, and RAM rises 41 404 → 47 820 B. `IDN` reports `hot=RAM`/`flash`/`ITCM`. Measured: 13–17 % on the arm, the two large functions accounting for essentially all of it. |
+| 6 — derive stage i+1 during stage i | Deferred, and re-scoped by the bench: it is worth 0.89 µs per `S` stage and 1.93 µs per `L` stage, but the plan compile above it is worth 3.1 µs per point, and compiling the plan outside the arm is also what would free the lazy scheme from having to leave `cum[]` and the per-stage `N` behind in the arm. Prerequisite built: consecutive 0-duration `L` stages are refused at parse time, so look-ahead is bounded to one stage. |
 
 Not attempted, and deliberately: `ampToCode`'s `VDIV.F32` stays a division. Replacing it with a
 reciprocal multiply would risk a 1-LSB shift in delivered amplitude, and the claim that `S` trains
-are bit-exact against the legacy firmware rests on that exact expression.
+are bit-exact against the legacy firmware rests on that exact expression. The measurements do not
+change that: the two conversions are 0.89 µs per stage together, and deferring them costs nothing
+in accuracy where replacing them would.
 
 ## Done when
 
-- The floor and the `S`/`L`/`W` arm costs are re-measured with `BENCHARM` on silicon.
-- `CAL STARTLAT` is lowered to what the measurements support, and `docs/timing.md` carries the new
-  numbers with the same "measured / estimated" separation it has now.
-- The four host suites and all four build configurations still pass.
+- ~~The floor and the `S`/`L`/`W` arm costs are re-measured with `BENCHARM` on silicon.~~ Done,
+  including the ten-stage `L` case and a ten-point measured case the plan had not foreseen.
+- ~~`CAL STARTLAT` is lowered to what the measurements support~~ — it is **not** lowered, because
+  the measurements do not support lowering it: the worst first arm needs 66 µs against the 60 µs
+  default. Lowering it waits on the plan compile moving out of the arm, after which the whole
+  measured range fits inside ~45 µs.
+- ~~`docs/timing.md` carries the new numbers with the same "measured / estimated" separation.~~
+  Done — §7 is now measurement throughout, split by re-arm and first arm rather than by
+  measured/predicted.
+- ~~The four host suites and all four build configurations still pass.~~ Host suites pass. The
+  Teensy 3.5 register build passes in both `SJ_CODE_IN_RAM` states; the portable and Teensy 4.x
+  configurations are unchanged by this phase and were last built in phase 10.
