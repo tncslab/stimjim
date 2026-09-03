@@ -97,12 +97,144 @@ the measurement is of the real outputs and not of an artefact.
 | [stimjim-shape-L-ramp.png](../../figs/stimjim-shape-L-ramp.png) | `L`: a clean triangle, 4 ms up and 4 ms down, with the 20 µs Bresenham steps visible |
 | [stimjim-shape-W-sine.png](../../figs/stimjim-shape-W-sine.png) | `W`: 500 Hz sine burst with the 32 kHz sample staircase (Fs = 64·f) |
 
-**Bench notes worth keeping:** the 2204A is 8-bit, so on the ±10 V range one code is 78 mV and a
-trigger threshold within a few codes of ground sits inside the trigger hysteresis and never
-fires — scope trigger levels here are kept ≥1 V clear of the baseline. Its capture buffer is
-3968 samples with both channels enabled. A one-shot train cannot be started *after* arming the
-scope from the host: the serial round trip alone is tens of milliseconds, so shape captures run
-against a multi-second train.
+## Addendum: what was measured, on what circuit, and how
+
+Written after the fact, because the table above names the figures without saying what produced
+them. Nothing here changes the results; it makes them reproducible.
+
+### Where the traces come from
+
+**Every trace in the table is oscilloscope data. The firmware reports no waveform samples of its
+own, and none of these figures contain anything it said about itself.** A PicoScope 2204A
+digitises the two StimJim outputs; `tests/device/capture.py` writes the samples to `tmp/<name>.csv`
+and the plot to `figs/<name>.png`. The CSV columns are `t_s`, `chA_V`, `chB_V` — seconds and volts
+at the scope's inputs, nothing else.
+
+The firmware's own reports are a separate and much coarser thing: `STAT` counters polled over
+USB, good to roughly ±200 ms because one poll costs 60–150 ms. `smoke.py` uses them as a sanity
+check and never as a measurement. That is the whole reason a scope is on this bench.
+
+### The test circuit
+
+```
+PicoScope AWG   ->  StimJim IN0            (trigger input)
+StimJim CH0(+)  ->  PicoScope channel A
+StimJim CH1(+)  ->  PicoScope channel B
+StimJim CH0(-)  ->  PicoScope ground       (the common reference for both scope inputs)
+
+load chain:   A(CH1+) --1k-- B(CH0+) --1k-- C(CH0-) --[two antiparallel LEDs]-- D(CH1-)
+```
+
+Both scope inputs sit on the ±10 V range. The four load nodes are one series chain, not two
+independent loads, and that is deliberate: the isolated outputs need *some* return path, and a
+shared chain gives one with two useful properties. It also puts its own signature on every
+trace, which is worth recognising before reading a figure as a fault:
+
+- **Cross-talk onto the idle channel.** While CH0 is grounded, a CH1 pulse divides across the two
+  1 k resistors, so channel A shows roughly half of it. A trace where the "idle" channel is not
+  flat is showing the divider, not a firmware bug.
+- **The ~2.2 V clamp.** A CH0 pulse is clamped at the antiparallel LEDs' forward drop, so channel
+  A does not reach the programmed 5 V. Amplitude accuracy is not what these captures test —
+  shape and timing are.
+
+The antiparallel pair conducts in both directions, so biphasic and sine outputs are clamped
+symmetrically.
+
+### What each figure actually played
+
+Slot numbers 10–14 are reserved for the bench so nothing a user stored gets overwritten, and
+`capture.py` resets them afterwards.
+
+**The three shape figures — CH0 only.** All three are defined with `mode0 = 0` (voltage) and
+`mode1 = 3` (not driven), so **only channel 0 emits**; channel B in those figures is the idle
+channel showing divider cross-talk. Each train repeats every 20 ms and runs for 3 s, and the
+scope triggers on the stimulus itself:
+
+| Figure | Slot line | In words |
+|---|---|---|
+| `stimjim-shape-S-biphasic` | `S12,0,3,20000,3000000;5000,0,2000;-5000,0,2000` | Two rectangular steps back to back: +5 V held for 2 ms, then −5 V held for 2 ms, then the output parks and grounds. Repeats every 20 ms. |
+| `stimjim-shape-L-ramp` | `L13,0,3,20000,3000000;5000,0,4000;0,0,4000` | A triangle: a straight climb from 0 to +5 V over 4 ms, then a straight fall back to 0 over 4 ms. The 20 µs Bresenham sample steps are visible on the slopes. |
+| `stimjim-shape-W-sine` | `W14,0,3,20000,3000000;5000,0,10000;500,0,0;0,0,0;0,0,0` | A 500 Hz sine at 5 V amplitude, starting at phase 0, burst-gated: 10 ms of sine (five cycles) per 20 ms period, output parked and grounded in between. No envelope. Sampled at Fs = 64 × 500 Hz = 32 kHz, so the staircase in the figure is 32 kHz. |
+
+**The four delay figures — both channels, one per engine.** These need two simultaneous outputs,
+so each engine drives one channel:
+
+- **Channel 0 (engine 0) is the pulse under test**: `S10,0,3,50000,1000,<delay>;5000,0,2000` —
+  voltage, +5 V, a single 2 ms pulse per trigger, started `<delay>` µs after the trigger edge.
+  (The train's `duration` of 1000 µs is shorter than one period, so exactly one pulse runs; its
+  2 ms stage then plays to completion, which is the legacy stage semantics.)
+- **Channel 1 (engine 1) is the zero-delay reference**: `S11,3,0,50000,1000,0;0,8000,2000` —
+  voltage, +8 V, a single 2 ms pulse with no delay. 8 V rather than 5 V because CH1 drives
+  through both 1 k resistors *and* the LEDs, so it arrives at the scope smaller.
+- One trigger edge starts both, through `TRIG0,2,10,11,0` (mode 2 = independent, rising edge).
+- The trigger stimulus is the scope's own AWG: a 1 Hz, 0–2 V square wave into IN0.
+
+`stimjim-trigger-skew` is this same pair with the delay set to 0, which is what isolates the
+engine-to-engine arming skew.
+
+### Measuring a delay when you cannot see the trigger, and cannot trigger on it either
+
+Two constraints shaped the method, and both are ordinary bench constraints rather than anything
+specific to this instrument:
+
+1. **The trigger source is not observable.** The AWG wire runs to IN0 and is not teed into a
+   scope input, so there is no trace of the edge whose delay is being measured. (Teeing it would
+   have been the easy answer; the scope has only two inputs and both were needed for the
+   outputs.)
+2. **Triggering near ground does not work.** The 2204A is 8-bit, so on the ±10 V range one code
+   is 78 mV. A trigger threshold set within a few codes of the baseline sits inside the trigger
+   hysteresis and the scope simply never fires. Thresholds have to stand ≥1 V clear of the
+   baseline, which rules out catching a signal at the instant it leaves zero.
+
+The way around both is to **stop trying to time against the trigger, and time against a second
+output instead** — a differential measurement:
+
+1. Route the same trigger edge to both engines (`TRIG` mode 2). Engine 1 plays a **reference
+   pulse with zero delay**; engine 0 plays the **pulse under test** with the delay being checked.
+   The reference pulse is now a proxy for the trigger instant, and unlike the trigger it is a
+   several-volt edge on a scope input.
+2. **Trigger the scope on the reference pulse**, not on the trigger signal — at 4.0 V on an 8 V
+   pulse, far outside the hysteresis. Set 5 % pre-trigger so the baseline before the edge is
+   visible and the crossing can be interpolated from both sides.
+3. Find both edges in the captured trace by linear interpolation between the two samples that
+   straddle a threshold (`first_cross`): 4.0 V on the reference, 2.5 V on the pulse under test.
+   Interpolating recovers timing well below one sample interval, which matters because the
+   buffer is only 3968 samples for both channels together.
+4. **Calibrate away the systematic offset.** The two engines are not armed at the same instant —
+   the trigger ISR arms them one after the other — so the raw difference contains a fixed skew.
+   Measure it by running the identical capture with the delay set to 0 (`stimjim-trigger-skew`:
+   7.5 µs, engine 1 behind engine 0), then subtract it from every subsequent reading:
+
+   ```
+   delay = (t_test − t_reference) − skew
+   ```
+
+   This is the standard trick of measuring a difference and removing it with a null measurement
+   taken through the same signal path: whatever is common to both — cable lengths, scope channel
+   skew, threshold placement, the DAC's own settling — cancels, and only the quantity under test
+   is left.
+
+What survives after the subtraction is the sample interval, which is why the residuals in the
+table are a fraction of a µs: 2000 µs set → 1999.3 measured, 5000 → 5000.2, 20000 → 20002.7.
+`capture.py` chooses the timebase per delay so the whole interval plus 4 ms of margin fits the
+3900-sample capture, so the longest delay is also the one with the coarsest samples — the 2.7 µs
+residual at 20 ms is one sample interval, not an instrument error.
+
+The same "no usable trigger source" problem appears in the shape captures, where it has a
+simpler answer: there is no trigger routing at all (`TRIG0,0,-1,-1,0`), the train is started over
+the serial port, and **the scope triggers on the stimulus itself** at 2.0 V (S), 1.5 V (L) and
+2.0 V (W) — again ≥1 V clear of the baseline. That only works because the train is long: a
+one-shot train cannot be armed against, since the serial round trip that starts it is tens of
+milliseconds, far longer than the capture. So the shape trains run for 3 s and repeat every
+20 ms, and the capture is armed calmly inside one and catches a whole pulse.
+
+**Bench notes worth keeping** (the addendum above explains what each one forced): the 2204A is
+8-bit, so on the ±10 V range one code is 78 mV and a trigger threshold within a few codes of
+ground sits inside the trigger hysteresis and never fires. Its capture buffer is 3968 samples
+with both channels enabled. A one-shot train cannot be started *after* arming the scope from the
+host, because the serial round trip alone is tens of milliseconds. Close the PicoScope
+application before running `capture.py`: it holds the USB device exclusively and `ps2000_open_unit`
+then returns 0.
 
 **Open questions / still owed:**
 

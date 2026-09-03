@@ -16,8 +16,10 @@
 //    coexist so the same source runs on Teensy 3.x and 4.x — see
 //    docs/hardware-variants.md.
 //
-//    Not implemented: in-train measurement (`MEAS` execution, MSUM/MDATA),
-//    SD logging (`LOG`), and the button menu editor.
+//    It measures V and I inside the train (`MEAS`/MSUM/MDATA), logs the results
+//    to the onboard SD card and serves the card back over the serial port.
+//
+//    Not implemented: the button menu editor.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -109,7 +111,7 @@ void loop() {
   Engine::poll();            // cycles64 keep-alive
   Commands::poll();          // completion-ring drain: train result summaries
   Triggers::poll();          // deferred trigger-reject WARNs (ISRs never print)
-  Measure::poll();           // MDATA ring drain (no-op until MEAS execution exists)
-  SdLog::poll();             // SD row writer (no-op until SD logging exists)
+  Measure::poll();           // MDATA ring drain: streaming and SD rows
+  SdLog::poll();             // periodic log flush
   UiMenu::tick();            // event drain + throttled render
 }

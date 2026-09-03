@@ -77,8 +77,22 @@ struct Completion {
   uint8_t  slot;
   uint8_t  chMask;       // channels that were driven (now grounded)
   uint32_t nPulses;
+  // Two distinct timing faults, both normally zero. `late` = the DAC
+  // programming of an event that was still in the future overran its deadline,
+  // i.e. a Config.h budget is too small on this board. `overdue` = the event
+  // was already due when the player reached it because an earlier event ran
+  // long. Events that share a deadline by definition (an `L` train's park sits
+  // on its last ramp sample; a `W` burst with burst_us == period_us puts the
+  // off event on a sample) are excluded from both — that is the waveform's
+  // shape, not a timing failure. See progLatch/playerRun in Engine.cpp.
+  uint32_t lateEvents,    maxLateCyc;
+  uint32_t overdueEvents, maxOverdueCyc;
 };
 bool popCompletion(Completion& out);
+
+// The same counters for a train that is still running or was stopped by hand
+// (a manual stop pushes no completion record).
+void timingFaults(uint8_t eng, Completion& out);
 
 // Re-run the K_RELOAD calibration (BENCHK): schedules the *real* programming
 // path with a known deadline and measures fire-time error by polling TFLG.

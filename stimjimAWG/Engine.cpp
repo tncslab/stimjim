@@ -7,6 +7,7 @@
 #include "FastIO.h"
 #include "SampleGen.h"
 #include "Triggers.h"
+#include "Measure.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -142,6 +143,13 @@ struct Player {
   uint32_t ph0, ph1;                   // SINE: live phase accumulators
   uint32_t sampK;                      // SINE: sample index within the burst
   uint64_t sampT;                      // SINE: absolute deadline of the next sample
+  bool     meas;                       // this train has measurement points to fire
+  bool     evOverdue;                  // the event being emitted was already due on arrival
+  uint64_t prevEvDl;                   // previous emitted deadline (spots coincident events)
+  uint32_t lateEvents;                 // latches whose programming overran (see progLatch)
+  uint32_t maxLateCyc;                 //   and the worst overrun, CPU cycles
+  uint32_t overdueEvents;              // events already due when the player reached them
+  uint32_t maxOverdueCyc;              //   and the worst, CPU cycles
   volatile bool active;
   volatile uint32_t seq;               // seqlock: odd while the ISR updates
 };
@@ -160,7 +168,18 @@ static void pushCompletion(uint8_t eng) {
   compRing[h].slot    = player[eng].slot;
   compRing[h].chMask  = player[eng].chMask;
   compRing[h].nPulses = player[eng].nPulses;
+  compRing[h].lateEvents = player[eng].lateEvents;
+  compRing[h].maxLateCyc = player[eng].maxLateCyc;
+  compRing[h].overdueEvents = player[eng].overdueEvents;
+  compRing[h].maxOverdueCyc = player[eng].maxOverdueCyc;
   compHead = next;
+}
+
+void timingFaults(uint8_t eng, Completion& out) {
+  out.lateEvents    = player[eng].lateEvents;
+  out.maxLateCyc    = player[eng].maxLateCyc;
+  out.overdueEvents = player[eng].overdueEvents;
+  out.maxOverdueCyc = player[eng].maxOverdueCyc;
 }
 
 bool popCompletion(Completion& out) {
@@ -176,12 +195,35 @@ static inline void groundClaimed(uint8_t chMask) {
   Triggers::marker(false);   // a train that ends mid-pulse must not leave it high
 }
 
+static inline void spinTo(uint64_t dl) {
+  while ((int64_t)(FastIO::cycles64() - dl) < 0) ;
+}
+
 // Program during the preload window, spin, latch exactly on the deadline.
-static inline void progLatch(const Player& pl, uint64_t dl, int16_t c0, int16_t c1) {
+//
+// If programming has already overrun the deadline the spin is skipped and the
+// latch happens as soon as it can, late. That is counted rather than hidden:
+// the count is the timing design's acceptance measurement and it needs no
+// oscilloscope. It counts only events that were still in the future when the
+// player reached them, so what it measures is exactly "the programming budget
+// was too small" -- most often a measurement window (SJ_ADC_*) or a DAC
+// programming estimate (SJ_DAC_PROG*) that has not been recalibrated. Events
+// that were *already* due on arrival are a different fault (coincident
+// deadlines) and are counted separately in playerRun.
+static inline void progLatch(Player& pl, uint64_t dl, int16_t c0, int16_t c1) {
   if (pl.chMask == 0b11)  FastIO::dacProgramBoth(c0, c1);
   else if (pl.chMask & 1) FastIO::dacProgram(0, c0);
   else                    FastIO::dacProgram(1, c1);
-  while ((int64_t)(FastIO::cycles64() - dl) < 0) ;
+  uint64_t now = FastIO::cycles64();
+  if ((int64_t)(now - dl) > 0) {
+    if (!pl.evOverdue) {
+      pl.lateEvents++;
+      uint32_t by = (uint32_t)(now - dl);
+      if (by > pl.maxLateCyc) pl.maxLateCyc = by;
+    }
+  } else {
+    while ((int64_t)(FastIO::cycles64() - dl) < 0) ;
+  }
   FastIO::dacLatch(pl.chMask);
 }
 
@@ -245,6 +287,17 @@ static void playerRun(uint8_t p) {
       dl = pl.pulseStart + pl.cum[pl.evIdx];
     }
 
+    // A measurement point due before the next latch takes the slot. The plan
+    // placed it so its ADC reads finish before this latch's preload window
+    // opens, so handling it here delays nothing (plan §3.6). Absolute 64-bit
+    // deadlines never wrap, so a plain compare is safe against the UINT64_MAX
+    // "no more points" sentinel.
+    bool isMeas = false;
+    if (pl.meas) {
+      uint64_t mdl = Measure::nextDeadline(p, pl.pulseStart);
+      if (mdl < dl) { dl = mdl; isMeas = true; }
+    }
+
     uint64_t now = FastIO::cycles64();
     if ((int64_t)(dl - now) > (int64_t)(pl.preloadCyc + SJ_US_TO_CYC(SJ_MIN_SCHEDULE_US))) {
       // genuinely future: wake preload-early; chunk long gaps (keeps the
@@ -255,6 +308,35 @@ static void playerRun(uint8_t p) {
       pitProgram(p, wake, true);
       return;
     }
+
+    // ---- measurement point: spin to the instant, read, accumulate
+    if (isMeas) {
+      int32_t q = pl.env.on ? SampleGen::envQ15(pl.env, dl) : 32768;
+      spinTo(dl);
+      Measure::fire(p, pl.nPulses, dl, q);
+      continue;
+    }
+
+    // A latch whose deadline has already passed cannot be put back on time by
+    // anything downstream, so it is separated from a programming-budget miss
+    // (counted in progLatch) and reported on its own. Measurement events are
+    // above this point deliberately: they latch nothing, and a read that
+    // starts a microsecond late only shifts a sample instant where the
+    // waveform's derivative is zero (plan §3.6).
+    //
+    // Two events *sharing* a deadline are excluded: that is a property of the
+    // waveform, not a timing failure. An `L` train latches its last ramp
+    // sample and then parks at the same stage boundary, and a `W` burst with
+    // burst_us == period_us puts the off event on top of a sample — both are
+    // defined that way (protocol §2), and the second latch of such a pair is
+    // necessarily a few microseconds behind the first.
+    pl.evOverdue = ((int64_t)(dl - now) < 0);
+    if (pl.evOverdue && dl != pl.prevEvDl) {
+      pl.overdueEvents++;
+      uint32_t by = (uint32_t)(now - dl);
+      if (by > pl.maxOverdueCyc) pl.maxOverdueCyc = by;
+    }
+    pl.prevEvDl = dl;
 
     // ---- emit the event, advance per-type state
     if (pl.type == PIECEWISE_RAMP) {   // chMask != 0 guaranteed (see startTrain)
@@ -317,6 +399,7 @@ static void playerRun(uint8_t p) {
     pl.nPulses = pl.nPulses + 1;
     pl.evIdx = 0;
     pl.pulseStart += pl.periodCyc;
+    if (pl.meas) Measure::pulseDone(p);   // rewind to the plan's first point
     if (pl.type == SINE) {             // next burst: restart phase on the new grid
       pl.evPhase = EV_SAMP;
       pl.sampK = 0;
@@ -425,8 +508,45 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.preloadCyc  = (uint32_t)SJ_US_TO_CYC(SJ_PRELOAD_US +
                      (mask == 0b11 ? SJ_DAC_PROG2_US : SJ_DAC_PROG1_US));
   pl.nPulses     = 0;
+  pl.lateEvents  = 0;
+  pl.maxLateCyc  = 0;
+  pl.overdueEvents = 0;
+  pl.maxOverdueCyc = 0;
+  pl.evOverdue     = false;
+  pl.prevEvDl      = ~(uint64_t)0;     // cannot match a real deadline
   pl.evIdx       = 0;
   pl.evPhase     = EV_INIT;
+
+  // Compile the measurement plan from the geometry computed above. This is
+  // precomputation, so it must stay on this side of the t0 assignment below:
+  // anything done after t0 is taken is subtracted from START_LATENCY, and a
+  // plan build is not cheap enough to hide there (it cost the first latch of
+  // every measured train ~1.5 us of lateness until it moved here). stageN is
+  // read only during the build, so a stack copy of the ramp sample counts is
+  // enough — the Player does not need to carry it.
+  uint32_t stageN[SJ_MAX_STAGES];
+  for (uint8_t i = 0; i < pl.nStages; i++)
+    stageN[i] = (pl.type == PIECEWISE_RAMP) ? pl.rst[i].N : 1;
+  Measure::Geometry geo;
+  geo.type         = pl.type;
+  geo.chMask       = mask;
+  geo.nStages      = pl.nStages;
+  geo.cum          = pl.cum;
+  geo.stageN       = (pl.type == PIECEWISE_RAMP) ? stageN : nullptr;
+  geo.sampleCyc    = pl.sampleCyc;
+  geo.burstCyc     = pl.burstCyc;
+  geo.phaseInit[0] = pl.phaseInit0;
+  geo.phaseInit[1] = pl.phaseInit1;
+  geo.phaseInc[0]  = pl.phaseInc0;
+  geo.phaseInc[1]  = pl.phaseInc1;
+  geo.preloadCyc   = pl.preloadCyc;
+  geo.adcReadCyc   = (uint32_t)SJ_US_TO_CYC(SJ_ADC_READ_US);
+  geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(SJ_ADC_SWITCH_US);
+  geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(SJ_MEAS_GUARD_US);
+  geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(SJ_DAC_SETTLE_US);
+  Measure::armPlan(eng, slotIdx, def, geo);
+  pl.meas = Measure::hasPlan(eng);
+
   // t0 is taken *after* all precomputation so the arm->first-latch latency
   // stays the fixed START_LATENCY regardless of train complexity. The slot's
   // delay_us is added on top: the train's whole timebase (pulse grid, envelope,
@@ -447,6 +567,7 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   SampleGen::envInit(pl.env, pl.t0, pl.durationCyc,
                      SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
   if (!mask) pl.env.on = false;
+
 
   if (mask & 1) digitalWriteFast(LED0, HIGH);   // lit from arm, i.e. through the delay
   if (mask & 2) digitalWriteFast(LED1, HIGH);

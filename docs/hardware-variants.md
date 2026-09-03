@@ -12,13 +12,36 @@ Build status (Teensyduino 1.62.0, `--warnings more`, zero warnings):
 
 | Target | Command | Result |
 |---|---|---|
-| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 107 KB flash, 30.6 KB RAM |
-| Teensy 3.5 (portable backends) | `--fqbn teensy:avr:teensy35 -DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | builds clean |
-| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | 88 KB flash, RAM1 44.8 KB |
-| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | 87 KB flash (see EEPROM below) |
+| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 157 KB flash, 37.7 KB RAM |
+| Teensy 3.5 (portable backends) | `--fqbn teensy:avr:teensy35 -DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | builds clean, 159 KB flash |
+| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | 136 KB flash, RAM1 56.5 KB |
+| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | 93 KB flash — no SD, see below |
 
 Only the Teensy 3.5 register build has been run on hardware. The others compile and are
 structurally correct; they are untested silicon until someone runs the bench list in §4.
+
+Build-time defines go through the Teensy platform's optimisation flag variable, which is where
+the compile recipe puts them:
+
+```
+arduino-cli --config-file tmp/arduino-cli.yaml compile --fqbn teensy:avr:teensy35 \
+  --warnings more --build-property "build.flags.optimize=-O2 -DSJ_EEPROM_SLOTS=6" stimjimAWG
+```
+
+`compiler.cpp.extra_flags` does *not* work here — the Teensy recipe does not reference it, so the
+defines are silently dropped and the build behaves as if they were never passed.
+
+## 0. SD card support
+
+`SJ_USE_SD` selects the SD logging and the `SD` file-access group. It defaults to 1 everywhere
+except a Teensy 4.0, which has no card socket; there it defaults to 0 and every `LOG`/`SD`
+command answers `ERR … no SD support in this build (Teensy4.x)` instead of failing to link. The
+Teensy 3.5, 3.6 and 4.1 all carry a socket on native SDIO, which never touches the DAC/ADC SPI
+bus. `IDN` reports `sd=yes` or `sd=no` so a session can tell without probing.
+
+Cost of having it: about 50 KB of flash for SdFat, which is why the Teensy 4.0 build is so much
+smaller than the 4.1 one. Setting `-DSJ_USE_SD=0` on a board that has a socket is a legitimate
+way to reclaim that space.
 
 ## 1. Backend selection
 
@@ -79,7 +102,8 @@ nothing else going on, in this order:
 | Command | Sets | Note |
 |---|---|---|
 | `BENCHDAC` / `BENCHDAC2` | `SJ_DAC_PROG1_US` / `SJ_DAC_PROG2_US` | round up; the portable route pays an extra `beginTransaction`/`endTransaction` per word |
-| `BENCHADC` / `BENCHSW` | the measurement budget (plan §3.6) | `BENCHSW` also answers bench-verify item 1, first-conversion validity after a line switch |
+| `BENCHADC` / `BENCHSW` | `SJ_ADC_READ_US` / `SJ_ADC_SWITCH_US` — the measurement budget (plan §3.6) | carry the **maximum**, not the average: one outlying read pushes the next latch late. `BENCHSW` also answers bench-verify item 1, first-conversion validity after a line switch |
+| a scope on one output | `SJ_DAC_SETTLE_US`, `SJ_MEAS_GUARD_US` | how long after a latch a reading means anything; the floor is also the player's own post-latch bookkeeping, ~3.2 µs on the register path |
 | `BENCHMISO` | confirms the mux swap does not glitch the first bit | on the portable route this covers `SPI.setMISO` instead of the PORT mux |
 | `BENCHPIT,1000,5000` | `SJ_PRELOAD_US` — raw ISR wake latency | the portable route wakes later: `IntervalTimer::begin()` is slower than writing `LDVAL` |
 | `BENCHPIT,1000,5000,<preload>` | acceptance: residual latch jitter must stay < 200 ns | if it does not, raise `SJ_PRELOAD_US` |
@@ -88,12 +112,24 @@ nothing else going on, in this order:
 
 Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
 which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the
-register backend and starts at 25 kHz for the portable one — both provisional until measured.
+register backend and starts at 25 kHz for the portable one — both still provisional, though a
+single unmeasured sine train on a Teensy 3.5 does meet every deadline right up to Fs = 49.9 kHz.
+
+**Acceptance without an oscilloscope.** Every latch compares itself against its own deadline, so
+a recalibrated board can be qualified over the serial port alone: run a train of each type with
+measurement on and read the lines that follow the completion. `WARN engine: … latch(es) overran
+their deadline` means a budget above is still too small; silence means every event in that train
+met its deadline. This is the cheapest possible regression test for a new backend, and it is
+what caught two of the numbers in the table above.
+
+The figures the Teensy 3.5 register backend actually measured are tabulated in
+[serial-protocol.md](serial-protocol.md) §4, next to the `BENCH` command list — that is the
+reference a new board's numbers should be compared against.
 
 `IDN` prints which backends the running binary uses, so a measurement can always be attributed:
 
 ```
-# build: Teensy3.5, F_CPU=120 MHz, fastio=registers, timer=raw-PIT
+# build: Teensy3.5, F_CPU=120 MHz, fastio=registers, timer=raw-PIT, sd=yes
 # engine: PIT channels 0/1, K_RELOAD=96 cycles
 ```
 

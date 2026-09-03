@@ -66,15 +66,18 @@ class StimJim:
     ASYNC = ("Train #", "Note: no measurement", "WARN trigger:", "MSUM,", "MDATA,")
 
     def cmd1(self, line, **kw):
-        """Send a command expected to answer with exactly one line.
+        """Send a command expected to answer with exactly one record line.
 
-        Asynchronous notices are collected into `self.async_lines` rather than
-        confusing the reply, so a train finishing mid-command is not an error.
+        Asynchronous notices go to `self.async_lines` and `#` comments to
+        `self.comments` rather than confusing the reply, so neither a train
+        finishing mid-command nor an explanatory note is an error. Skipping `#`
+        is the machine-parse rule the protocol states in §1.
         """
         r = self.cmd(line, **kw)
-        keep = [x for x in r if not x.startswith(self.ASYNC)]
+        keep = [x for x in r if not x.startswith(self.ASYNC) and not x.startswith("#")]
         self.async_lines = [x for x in r if x.startswith(self.ASYNC)]
-        assert len(keep) == 1, f"{line!r} -> expected 1 line, got {r}"
+        self.comments = [x for x in r if x.startswith("#")]
+        assert len(keep) == 1, f"{line!r} -> expected 1 record line, got {r}"
         return keep[0]
 
     def reset(self):

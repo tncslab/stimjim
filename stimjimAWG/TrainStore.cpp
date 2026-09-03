@@ -363,8 +363,6 @@ const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t
   // non-zero what there is meaningless: accepted with WARN per protocol §4.
   if ((t.mode0 >= 2 && m.what0 != 0) || (t.mode1 >= 2 && m.what1 != 0))
     addWarn(warn, warnsz, "channel not driven (mode 2/3) — nothing to measure");
-  if (m.report & 1)
-    addWarn(warn, warnsz, "MDATA streaming is deferred (format frozen); summary/SD only in v1");
   return nullptr;
 }
 

@@ -23,7 +23,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.6.0"
+#define SJ_FW_VERSION    "0.7.0"
 #define SJ_PROTO_VERSION 1
 
 // ---------------------------------------------------------- hardware variant
@@ -79,7 +79,17 @@
 
 // ------------------------------------------------------------ feature switches
 #define SJ_USE_DISPLAY   1   // SSD1306 128x32 on Wire @0x3C (geometry below)
-#define SJ_USE_SD        0   // SD logging is not implemented
+
+// SD logging + the SD file-access group. The Teensy 3.5/3.6 and 4.1 carry a
+// micro-SD socket on native SDIO (BUILTIN_SDCARD); a Teensy 4.0 has none, so
+// the group is compiled out there and answers ERR instead of failing to link.
+#ifndef SJ_USE_SD
+  #if defined(ARDUINO_TEENSY40)
+    #define SJ_USE_SD    0
+  #else
+    #define SJ_USE_SD    1
+  #endif
+#endif
 
 // ---------------------------------------------------------------- clocking
 // 1 us must be an exact whole number of CPU cycles -- every us<->cycle
@@ -135,6 +145,35 @@
 #else
   #define SJ_PRELOAD_US      8   // RECALIBRATE: IntervalTimer re-arm is slower than a raw LDVAL
 #endif
+// Measurement budget (plan §3.6). One in-train ADC value costs a control-
+// register write selecting the input line plus the conversion read; GUARD is
+// the margin left before the next latch event starts programming the DAC, and
+// SETTLE is how long the AD5752 output needs after a latch before a reading
+// means anything. Together they decide whether a measurement point fits its
+// stage (S), its ramp sample interval (L) or its sine sample interval (W) --
+// Measure::planBuild refuses the point rather than delaying a latch.
+// These are *budgets*, so they carry the measured worst case, not the average:
+// a single outlying read that overruns its window pushes the next latch late,
+// and Engine::progLatch counts exactly that. BENCHADC measured adcRead at
+// 2.22 us avg / 3.81 us max and BENCHSW measured select+read at 4.70 / 6.10 on
+// a Teensy 3.5; 3 + 4 covers the maximum outright instead of leaning on GUARD.
+// RECALIBRATE with BENCHADC / BENCHSW (item 1) and a scope (item 2).
+#if SJ_FASTIO_REGISTER
+  #define SJ_ADC_READ_US     3   // adcRead, line pre-selected (measured 2.22 avg, 3.81 max)
+  #define SJ_ADC_SWITCH_US   4   // the extra cost of a line switch (measured 2.5 avg, 2.3 max)
+#else
+  #define SJ_ADC_READ_US     6   // RECALIBRATE: SPI-library transaction overhead included
+  #define SJ_ADC_SWITCH_US   8
+#endif
+#define SJ_MEAS_GUARD_US     1   // margin between the last read and the next preload window
+// How long after a latch a reading means anything. Two things set the floor:
+// the AD5752 output settling (bench item 2) and the player's own post-latch
+// bookkeeping, measured at ~3.2 us on the register path -- a smaller value
+// would place the reads at an instant the ISR cannot reach, which is harmless
+// for the reading (zero derivative at a sine peak) but makes the schedule a
+// fiction. RECALIBRATE with a scope.
+#define SJ_DAC_SETTLE_US     4
+
 #define SJ_MIN_SCHEDULE_US   3         // events closer than this are run inline in the same ISR pass
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
 #define SJ_START_LATENCY_US  20        // fixed arm->first-latch latency: trigger latency is deterministic

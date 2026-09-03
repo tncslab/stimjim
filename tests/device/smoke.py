@@ -2,9 +2,13 @@
 
 Covers what can be checked without an oscilloscope: identity, backward
 compatibility of the command grammar, the new per-slot start delay (set both
-ways, queried, and timed end-to-end against STAT), and the OLED framebuffer in
-each of its three views. Waveform shape and microsecond-accurate delay timing
-need the scope -- see capture.py.
+ways, queried, and timed end-to-end against STAT), in-train measurement
+(MSUM/MDATA and the refusal of a point whose ADC window does not fit), SD
+logging with length-framed retrieval over the serial port, and the OLED
+framebuffer in each of its three views. Waveform shape and microsecond-accurate
+delay timing need the scope -- see capture.py.
+
+The SD section is skipped, with a note, when no card is in the socket.
 
     python smoke.py [COM4] [--screens DIR]
 
@@ -13,8 +17,10 @@ Exit code is the number of failed checks.
 
 import argparse
 import pathlib
+import re
 import sys
 import time
+import zlib
 
 from sjcon import StimJim
 
@@ -53,6 +59,49 @@ def screen(sj, name, outdir):
         p.write_text("\n".join(text + art) + "\n", encoding="ascii")
         print(f"       -> {p}")
     return art
+
+
+def run_train(sj, cmd, wait):
+    """Start a train and collect everything it prints, completion included."""
+    r = sj.cmd(cmd, quiet=min(wait, 1.0))
+    time.sleep(wait)
+    r += sj.drain(quiet=0.6)
+    return r
+
+
+def sdget(sj, name, offset=None, length=None):
+    """Read a file through SDGET's length-framed transfer.
+
+    Returns (payload, crc32_from_device, file_size). The byte count in the
+    header is what makes the payload unambiguous whatever the file contains, so
+    the transfer runs on the raw port rather than through the line helper.
+    """
+    line = "SDGET," + name
+    if offset is not None:
+        line += f",{offset}"
+        if length is not None:
+            line += f",{length}"
+    ser = sj.ser
+    ser.reset_input_buffer()
+    ser.write((line + "\n").encode())
+    ser.flush()
+    hdr = b""
+    deadline = time.time() + 5.0
+    while not hdr.endswith(b"\n") and time.time() < deadline:
+        hdr += ser.read(1) or b""
+    fields = hdr.strip().decode("utf-8", "replace").split(",")
+    if len(fields) != 5 or fields[0] != "SDGET":
+        return None, None, None
+    want, total = int(fields[3]), int(fields[4])
+    body = b""
+    deadline = time.time() + 30.0
+    while len(body) < want and time.time() < deadline:
+        body += ser.read(want - len(body))
+    tail = ser.read(400).decode("utf-8", "replace")
+    m = re.search(r"crc32=([0-9a-f]{8})", tail)
+    if len(body) != want or not m:
+        return None, None, total
+    return body, int(m.group(1), 16), total
 
 
 def stat(sj):
@@ -162,6 +211,99 @@ def main():
         check(any("complete" in l for l in done), f"completion line printed: {done}")
         eq(stat(sj)["slot0"], -1, "engine idle again after the train")
 
+        print("\n[measurement: MSUM, MDATA and the fit refusal]")
+        # 2 ms stages, V+I on both channels: the widest measurement point there
+        # is, and it must fit without pushing a latch late.
+        sj.cmd1("S4,0,1,10000,50000;5000,1000,2000;-5000,-1000,2000")
+        r = run_train(sj, "T4", 1.2)
+        msum = [l for l in r if l.startswith("MSUM,")]
+        check(len(msum) == 2, f"one MSUM line per stage: {len(msum)}")
+        check(not any(l.startswith("WARN engine") for l in r),
+              "no latch missed its deadline while measuring")
+        if len(msum) == 2:
+            f0 = msum[0].split(",")
+            eq(len(f0), 12, "MSUM field count")
+            eq(f0[3], "0", "first MSUM point is stage 0")
+            eq(msum[1].split(",")[3], "1", "second MSUM point is stage 1")
+            eq(f0[2], "5", "MSUM n = pulses delivered")
+            # 5 V into the bench divider reads a few hundred mV low, so only the
+            # sign and the order of magnitude are checked here.
+            check(1000.0 < float(f0[4]) < 6000.0, f"stage 0 V0 plausible: {f0[4]}")
+            check(float(msum[1].split(",")[4]) < -1000.0,
+                  "stage 1 V0 is the negative phase")
+
+        # report bit 0 streams one MDATA line per point per pulse.
+        sj.cmd1("MEAS4,3,3,0,-1,1")
+        r = run_train(sj, "T4", 1.2)
+        mdata = [l for l in r if l.startswith("MDATA,")]
+        eq(len(mdata), 10, "MDATA lines = pulses x points")
+        if mdata:
+            eq(len(mdata[0].split(",")), 8, "MDATA field count")
+
+        # A stage too short for its measurement window is refused, not squeezed.
+        sj.cmd1("MEAS4,3,3,0,-1,0")
+        sj.cmd1("S5,0,1,10000,30000;5000,1000,20;0,0,1000")
+        r = run_train(sj, "T5", 1.0)
+        check(any(l.startswith("WARN MEAS:") and "not measured" in l for l in r),
+              "short stage: measurement refused with a reason")
+        skipped = [l for l in r if l.startswith("MSUM,5,0,0,")]
+        check(bool(skipped), f"refused point still reports an MSUM line: {skipped}")
+
+        print("\n[SD: log, listing and framed retrieval]")
+        info = sj.cmd1("SDINFO").split(",")
+        eq(info[0], "SD", "SDINFO record word")
+        if info[1] != "1":
+            notes.append("no SD card in the socket - SD checks skipped")
+        else:
+            name = "SMOKE.CSV"
+            sj.cmd("SDDEL," + name)                     # ignore "does not exist"
+            opened = sj.cmd1("LOG1," + name).split(",")
+            eq(opened[0], "LOG", "LOG record word")
+            eq(opened[1], "1", "log reports itself open")
+            eq(opened[2], name, "log file name")
+            check(int(opened[3]) > 0, f"header written: {opened[3]} bytes")
+
+            sj.cmd1("MEAS4,3,3,0,-1,2")                 # report bit 1: rows to SD
+            run_train(sj, "T4", 1.2)
+            closed = sj.cmd1("LOG0").split(",")
+            eq(closed[1], "0", "log reports itself closed")
+            rows_bytes = int(closed[3]) - int(opened[3])
+            check(rows_bytes > 0, f"rows appended: {rows_bytes} bytes")
+
+            listing = sj.cmd("SDLIST", quiet=0.6, limit=15)
+            check(any(l.startswith("SDLIST," + name + ",") for l in listing),
+                  f"{name} appears in SDLIST")
+            eq(listing[-1], "OK", "SDLIST ends with OK")
+
+            body, crc, total = sdget(sj, name)
+            check(body is not None, "SDGET returned its announced byte count")
+            if body is not None:
+                eq(zlib.crc32(body) & 0xFFFFFFFF, crc, "SDGET crc32 matches the payload")
+                eq(len(body), total, "default SDGET length is the whole file")
+                text = body.decode("utf-8", "replace")
+                check(text.startswith("# stimjimAWG log"), "log starts with its own header")
+                check("IDN,stimjimAWG" in text, "log header carries the identity line")
+                check("# train: S4," in text, "log records the waveform each train played")
+                check("# columns: timestamp_us,slot,pulse,point," in text,
+                      "log header carries the column names")
+                data = [l for l in text.splitlines() if l and l[0].isdigit()]
+                check(len(data) == 10, f"one CSV row per point per pulse: {len(data)}")
+                if data:
+                    eq(len(data[0].split(",")), 8, "CSV row field count")
+
+                # A partial read must frame and check the chunk, not the file.
+                chunk, crc2, total2 = sdget(sj, name, 0, 40)
+                eq(len(chunk or b""), 40, "40-byte chunk length honoured")
+                eq(total2, total, "chunk header still reports the full size")
+                if chunk:
+                    eq(zlib.crc32(chunk) & 0xFFFFFFFF, crc2, "chunk crc32 matches")
+
+            eq(sj.cmd("SDDEL," + name)[-1], "OK", "SDDEL removes the file")
+            check(not any(l.startswith("SDLIST," + name + ",")
+                          for l in sj.cmd("SDLIST", quiet=0.6, limit=15)),
+                  f"{name} is gone from SDLIST")
+        sj.cmd1("MEAS4,3,3,0,-1,0")
+
         print("\n[screens: waiting and running views]")
         # A long train, so each ~0.6 s framebuffer dump lands well inside the
         # phase it is meant to show.
@@ -177,7 +319,7 @@ def main():
 
         print("\n[cleanup]")
         sj.cmd("T-1")
-        for slot in (0, 1, 2, 3):
+        for slot in (0, 1, 2, 3, 4, 5):
             sj.cmd1(f"S{slot},3,3,10000,500000")
 
     print()

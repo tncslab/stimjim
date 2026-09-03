@@ -1,8 +1,8 @@
 //    stimjimAWG — command handlers: S/L/W definition with atomic staging, `?`
 //    queries + round-trip serializers, DELAY/ENV/MEAS, T/U start-stop with the
 //    completion-ring drain, TRIG/R routing, byte-exact M/V/A/E (BIST contract),
-//    READ, B/C/D/P, STAT, SCREEN, DUMP and the BENCH group. `MEAS` execution
-//    and `LOG` are not implemented. GPL-3.0-or-later.
+//    READ, B/C/D/P, STAT, SCREEN, DUMP, LOG, the SD file group and the BENCH
+//    group. GPL-3.0-or-later.
 
 #include "Protocol.h"
 #include "Config.h"
@@ -11,6 +11,8 @@
 #include "TrainStore.h"
 #include "Triggers.h"
 #include "UiMenu.h"
+#include "Measure.h"
+#include "SdLog.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -338,6 +340,22 @@ static void handleMeas(const char* args) {
 // Completed trains per boot — the legacy `Train #<n> complete.` counter.
 static uint32_t trainCount = 0;
 
+// Silent when the train met every deadline, which is the expected case.
+// The two faults have different fixes, so they are reported separately: a late
+// latch is a budget to recalibrate, an overdue event is a waveform whose own
+// deadlines collide. Only the first is a defect.
+static void printTimingFaults(const Engine::Completion& c) {
+  if (c.lateEvents)
+    Serial.printf("WARN engine: %lu latch(es) overran their deadline by up to %lu ns — "
+                  "a timing budget in Config.h is too small here (recalibrate with BENCH)\n",
+                  (unsigned long)c.lateEvents, (unsigned long)cycToNs(c.maxLateCyc));
+  if (c.overdueEvents)
+    Serial.printf("# engine: %lu event(s) were already due when the player reached them, "
+                  "worst by %lu ns — an earlier event ran long (events that share a "
+                  "deadline by definition are not counted)\n",
+                  (unsigned long)c.overdueEvents, (unsigned long)cycToNs(c.maxOverdueCyc));
+}
+
 static void handleStart(char letter, const char* args) {
   const char cmd[2] = {letter, '\0'};
   uint8_t eng = (letter == 'U') ? 1 : 0;
@@ -349,10 +367,22 @@ static void handleStart(char letter, const char* args) {
   }
   if (v < 0) {
     uint8_t mask = Engine::claimedMask(eng);
+    int16_t stopped = Engine::activeSlot(eng);
     Engine::stopTrain(eng);
     if (mask & 1) modeShadow[0] = 3;
     if (mask & 2) modeShadow[1] = 3;
     Serial.print("Forcing "); Serial.print(letter); Serial.println(" train to stop");
+    // A stop pushes no completion record (legacy `T-1` printed only its own
+    // line), so whatever the plan accumulated is summarized here instead of
+    // being discarded.
+    if (stopped >= 0) {
+      Measure::poll();                     // stream what is still in the ring first
+      Engine::Completion f;
+      Engine::timingFaults(eng, f);
+      printTimingFaults(f);
+      Measure::printSummary(eng, (uint8_t)stopped);
+      SdLog::flushNow();
+    }
     return;
   }
   if (v >= SJ_NUM_SLOTS) {
@@ -388,11 +418,17 @@ void poll() {
   Engine::Completion c;
   while (Engine::popCompletion(c)) {
     trainCount++;
+    // Drain the ring first: the train's last repetitions are still in it, and a
+    // log or a streaming host should see them before the completion line rather
+    // than after it (protocol §4).
+    Measure::poll();
     Serial.print("Train #"); Serial.print(trainCount);
     Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
     Serial.println(" pulses.");
-    // MSUM summary lines replace this note once `MEAS` execution exists (protocol §4)
-    Serial.println("Note: no measurement carried out.");
+    printTimingFaults(c);
+    if (Measure::hasPlan(c.eng)) Measure::printSummary(c.eng, c.slot);
+    else                         Serial.println("Note: no measurement carried out.");
+    SdLog::flushNow();
     if (c.chMask & 1) modeShadow[0] = 3;
     if (c.chMask & 2) modeShadow[1] = 3;
   }
@@ -657,32 +693,108 @@ static void handleR(const char* args) {
 
 // --------------------------------------------------------------------- DUMP
 
-static void handleDump() {
-  Serial.printf("# %s fw=%s proto=%d session dump — paste back to restore\n",
-                SJ_FW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);
+// The sink is explicit because the SD log header carries the same block: a log
+// must identify the waveforms that produced it even when the train was started
+// by a trigger edge with no host listening.
+void writeDump(Print& out) {
+  out.printf("# %s fw=%s proto=%d session dump — paste back to restore\n",
+             SJ_FW_NAME, SJ_FW_VERSION, SJ_PROTO_VERSION);
   char line[SJ_SERIALIZE_MAX];
   for (uint8_t idx = 0; idx < SJ_NUM_SLOTS; idx++) {
     const TrainDef& t = TrainStore::slotConst(idx);
     if (!TrainStore::isDefaultTrain(t)) {
       TrainStore::serializeTrain(idx, t, line, sizeof line);
-      Serial.println(line);
+      out.println(line);
     }
     // a W line already carries its envelope; S/L need a separate ENV line
     if (t.type != SINE && !TrainStore::isDefaultEnv(t.env)) {
       TrainStore::serializeEnv(idx, t.env, line, sizeof line);
-      Serial.println(line);
+      out.println(line);
     }
     if (!TrainStore::isDefaultMeas(t)) {
       TrainStore::serializeMeas(idx, t.meas, line, sizeof line);
-      Serial.println(line);
+      out.println(line);
     }
   }
   // Real lines now that TRIG is a setter: a dump pastes back complete.
   for (uint8_t t = 0; t < 2; t++) {
     serializeTrig(t, line, sizeof line);
-    Serial.println(line);
+    out.println(line);
   }
+}
+
+static void handleDump() {
+  writeDump(Serial);
   ok();
+}
+
+// ------------------------------------------------------- LOG and the SD group
+
+// Copy the comma-delimited token at *p (skipping one leading comma) into buf
+// and leave p on the delimiter. File names carry dots and digits, so they
+// cannot go through parseFields.
+static bool nextToken(const char*& p, char* buf, size_t n) {
+  while (*p == ' ') p++;
+  if (*p == ',') p++;
+  while (*p == ' ') p++;
+  size_t i = 0;
+  while (*p && *p != ',' && i + 1 < n) buf[i++] = *p++;
+  while (i && buf[i - 1] == ' ') i--;
+  buf[i] = '\0';
+  return i != 0;
+}
+
+static void handleLog(const char* args) {
+  const char* p = args;
+  while (*p == ' ') p++;
+  if (*p == '\0' || *p == '?') { SdLog::status(); return; }
+  if (*p == '0' && p[1] == '\0') { SdLog::closeLog(); return; }
+  if (*p == '1') {
+    p++;
+    while (*p == ' ') p++;
+    if (*p == '\0') { SdLog::openLog(nullptr); return; }
+    char name[80];
+    if (*p == ',' && nextToken(p, name, sizeof name)) { SdLog::openLog(name); return; }
+    err("LOG", "expected LOG1[,<name>]");
+    return;
+  }
+  err("LOG", "need LOG? (status), LOG1[,<name>] (open) or LOG0 (close)");
+}
+
+static void sdGroupList() {
+  Serial.println("# SD group — the socket is under the cover, so the card is served over serial");
+  Serial.println("# SDINFO[,1]                   card present, size in KiB, open log; 1 also");
+  Serial.println("#                                scans for used space (slow on a big card)");
+  Serial.println("# SDLIST[,<dir>]               one SDLIST,<name>,<size> line per entry");
+  Serial.println("# SDGET,<name>[,<off>[,<len>]] header line, exactly <len> bytes, then crc32");
+  Serial.println("# SDDEL,<name>                 delete one file (not the open log)");
+  Serial.println("# LOG? / LOG1[,<name>] / LOG0  status / open / close the measurement log");
+  ok();
+}
+
+static void handleSdGet(const char* args) {
+  const char* p = args;
+  char name[80];
+  if (!nextToken(p, name, sizeof name)) {
+    err("SDGET", "need SDGET,<name>[,<offset>[,<len>]]");
+    return;
+  }
+  if (*p == ',') p++;
+  long v[2] = {0, 0};
+  int8_t n = parseFields(p, v, 2);
+  if (n < 0) { err("SDGET", "offset and length must be integers"); return; }
+  if ((n >= 1 && v[0] < 0) || (n >= 2 && v[1] < 0)) {
+    err("SDGET", "offset and length must not be negative");
+    return;
+  }
+  SdLog::get(name, (uint64_t)v[0], (uint64_t)v[1]);   // length 0 = to end of file
+}
+
+static void handleSdDel(const char* args) {
+  const char* p = args;
+  char name[80];
+  if (!nextToken(p, name, sizeof name)) { err("SDDEL", "need SDDEL,<name>"); return; }
+  SdLog::del(name);
 }
 
 // -------------------------------------------------------------------- BENCH
@@ -865,8 +977,10 @@ static void help() {
   Serial.println("#   TRIG<t>,<mode>,<s0>,<s1>,<edge> route input 0/1: 0 off, 1 joint, 2 independent,");
   Serial.println("#                                   3 stimulus marker out; edge 0 rising, 1 falling");
   Serial.println("#   R<t>,<slot>[,<out>]             legacy alias of TRIG; TRIG<t>? / R<t>? query");
+  Serial.println("#   LOG? / LOG1[,<name>] / LOG0     SD measurement log: status / open / close");
+  Serial.println("#   SD?                             SD file access over serial (SDLIST, SDGET, ...)");
   Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("# Not implemented: MEAS execution, LOG (SD logging), the button menu editor");
+  Serial.println("# Not implemented: the button menu editor");
   ok();
 }
 
@@ -905,7 +1019,7 @@ void handleLine(const char* line) {
   word[wl] = '\0';
 
   if (!strcmp(word, "IDN")) {
-    Protocol::printIdentity();
+    Protocol::printIdentity(Serial);
   } else if (!strcmp(word, "HELP")) {
     help();
   } else if (!strcmp(word, "STAT")) {
@@ -932,11 +1046,36 @@ void handleLine(const char* line) {
   } else if (!strcmp(word, "DUMP")) {
     handleDump();
   } else if (!strcmp(word, "LOG")) {
-    err("LOG", "SD logging is not implemented");
+    handleLog(args);
+  } else if (!strcmp(word, "SD")) {
+    sdGroupList();
+  } else if (!strcmp(word, "SDINFO")) {
+    long v;
+    bool withUsed = (parseFields(args, &v, 1) == 1) && v != 0;
+    if (withUsed && Engine::anyActive())
+      err("SDINFO", "the used-space scan takes seconds — not while a train runs");
+    else
+      SdLog::info(withUsed);
+  } else if (!strcmp(word, "SDLIST")) {
+    const char* p = args;
+    char dir[80];
+    SdLog::list(nextToken(p, dir, sizeof dir) ? dir : nullptr);
+  } else if (!strcmp(word, "SDGET")) {
+    handleSdGet(args);
+  } else if (!strcmp(word, "SDDEL")) {
+    handleSdDel(args);
   } else if (!strncmp(word, "BENCH", 5)) {
-    const char* sub = word + 5;
-    // allow "BENCH?" — the '?' lands in args, sub is empty
-    benchDispatch(sub, args);
+    // `BENCHDAC2` is the one command word carrying a digit, and the leading
+    // alphabetic run above stopped in front of it — so the sub-command is
+    // re-scanned over alphanumerics. Without this, BENCHDAC2,2000 ran BENCHDAC
+    // with a repetition count of 2 and said so only in its own reply.
+    // "BENCH" and "BENCH?" leave sub empty, which lists the group.
+    char sub[16];
+    size_t sl = 0;
+    const char* q = line + 5;
+    while (isalnum((unsigned char)*q) && sl + 1 < sizeof sub) sub[sl++] = *q++;
+    sub[sl] = '\0';
+    benchDispatch(sub, q);
   } else {
     Serial.printf("ERR %s: unknown command\n", word);
   }

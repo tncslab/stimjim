@@ -298,35 +298,55 @@ Per project convention (CLAUDE.md), each phase ends with a commit and a handoff 
 atomic staging, `?` queries and round-trip serializers; the deadline scheduler and both channel
 players, playing `S`, `L` and `W` slots with the `ENV` envelope, copy-on-arm, the completion ring
 and `STAT`; the per-slot post-trigger delay; `TRIG`/`R` routing with edge ISRs and the stimulus
-marker; EEPROM persistence; the OLED status display with `SCREEN` capture; and the register /
-portable backend split that lets the same source run on Teensy 3.x and 4.x
-([hardware-variants.md](hardware-variants.md)).
+marker; the measurement engine (`MeasurePlan` compilation with its window-fit rule, stage-end and
+sine-peak events, Σv/Σv² accumulation, `MSUM` summaries and the `MDATA` ring); `SdLog` with `LOG`
+and the `SD` file group that serves the card over the serial port; EEPROM persistence; the OLED
+status display with `SCREEN` capture; and the register / portable backend split that lets the same
+source run on Teensy 3.x and 4.x ([hardware-variants.md](hardware-variants.md)).
+
+The `BENCH` group has been run on silicon and the measured figures are tabulated in
+[serial-protocol.md](serial-protocol.md) §4. The two headline acceptance numbers hold: residual
+latch jitter is **42 ns** against a 200 ns target, and every latch of every waveform type meets
+its deadline with measurement enabled — checked by the engine's own per-latch deadline
+comparison rather than by a scope, so any board can be re-qualified over the serial port alone.
 
 **Remaining work.**
 
-- **Bench constants.** Run the `BENCH` group on hardware and replace the estimated
-  `SJ_DAC_PROG*_US`, `SJ_PRELOAD_US` and `SJ_FS_MAX_HZ`; the dual-channel collision-jitter
-  benchmark and a measured FsMax table with ~30 % margin. This also settles the acceptance
-  numbers the design targets: latch jitter < 200 ns, ≤ 1 µs cumulative over a 10 s train,
-  trigger latency = `START_LATENCY` ± 1 µs.
-- **Measurement engine + SD.** `MeasurePlan` execution (stage-end and sine-peak events, per-stage
-  selection, Σv/Σv² accumulation), `MSUM` summaries, `SdLog` + `LOG`, and the MDATA ring (record
-  format already fixed; live streaming optional).
-- **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`), long-run drift
-  measurement, and the full trigger-latency battery.
+- **Sine ceiling and dual-channel collisions.** `SJ_FS_MAX_HZ` is still the desk estimate. A
+  single unmeasured sine train keeps every deadline up to Fs = 49.9 kHz, so the ceiling is not
+  obviously wrong, but the *dual-channel* collision case (two independent trains contending for
+  the SPI bus) has not been measured, and that is what sets the published FsMax table with its
+  ~30 % margin. The remaining scope work is long-run drift (≤ 1 µs cumulative over a 10 s train)
+  and the full trigger-latency battery.
+- **Measurement coverage.** A V+I measurement on both channels needs 42 µs of free gap, which an
+  `L` train at the default 20 µs ramp interval cannot give at all and a `W` train gives only
+  below 372 Hz (the full table is in [serial-protocol.md](serial-protocol.md) §4). Two ways out,
+  neither built: a per-train ramp sample interval, and splitting a point's reads across
+  consecutive sample gaps (the fallback §7 already anticipated).
+- **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`).
 
 ## 7. Bench-verify, don't guess
 
-1. AD7321 first-conversion validity right after a control-register line switch (sets the true
-   `lineSwitch` budget; the legacy 4.5 µs calibration bundles it).
-2. AD5752 output settling vs NLDAC (defines `GUARD` and the minimum useful stage duration).
-3. MISO PORT-mux swap at register level: no glitch/wrong first bit after swap (must match the SPI
-   library's `setMISO` teardown order).
+1. AD7321 first-conversion validity right after a control-register line switch — **measured**:
+   `BENCHSW` puts select+read at 4.58 µs average, 6.10 µs worst, against 2.22 µs for a read with
+   the line already selected. The switch therefore costs ~2.4 µs and the conversion following it
+   is valid; the budget carries 7 µs so the worst case is covered outright.
+2. AD5752 output settling vs NLDAC — **still open on the scope**, and it is the one number that
+   bounds the shortest useful measured stage. `SJ_DAC_SETTLE_US` is 4 µs, chosen because that is
+   what the player's own post-latch bookkeeping costs anyway; whether the DAC needs more is
+   unknown.
+3. MISO PORT-mux swap at register level — **measured**: `BENCHMISO` alternates channels at
+   2.29 µs per read, statistically the same as a same-channel read, and the readings are
+   plausible on both channels, so the swap costs nothing and glitches nothing.
 4. Real GPIO header pins — `lib/stimjim/src/Stimjim.h:52-62` defines all `GPIO_x` as pin 36
    (`GPIO_7` twice, `GPIO_8` missing); check the PCB netlist before wiring activity outputs.
+   **Still open**; nothing built so far needs those pins.
 5. Teensyduino core source inspection: CYCCNT enabled at reset on 3.5; `IntervalTimer` allocates
-   PIT channels low-to-high.
-6. `K_RELOAD` boot-calibration variance.
+   PIT channels low-to-high. **Done in phase 6** (and both assumptions were wrong in ways that
+   stopped the board from booting).
+6. `K_RELOAD` boot-calibration variance — **measured**: `BENCHK` residuals span 11 cycles
+   (92 ns) over 200 repetitions, and boot-to-boot values sit between 84 and 98 cycles. The
+   closed-loop calibration is what makes that spread irrelevant.
 
 Fallbacks: latch jitter too high → increase `PRELOAD`; ISR cost too high → lower FsMax and/or
 split measurement into a follow-up event; raw-register SPI troublesome → temporary SPI-library

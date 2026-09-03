@@ -3,13 +3,12 @@
 Status: protocol version 1. Implemented: waveform definition and queries (`S`/`L`/`W`,
 `DELAY`, `ENV`/`MEAS`), `T`/`U` playback of all three slot types with the `ENV` envelope,
 `TRIG`/`R` trigger routing, the immediate commands (`M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`),
-persistence (`P`), and `STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`. **Not implemented:** the
-in-train measurement engine (`MEAS` execution and its `MSUM`/`MDATA` output — the config is
-stored and validated, but nothing measures yet) and `LOG` SD logging; both are specified below
-so their record formats are fixed. See [awg-implementation-plan.md](awg-implementation-plan.md)
-for what remains. The legacy sections below double as documentation of the sibling
-`stimjimPulser` firmware in this repository; the "hardened" notes describe where stimjimAWG
-deliberately differs from it.
+persistence (`P`), in-train measurement (`MEAS` execution with its `MSUM` summaries and
+`MDATA` stream), SD logging (`LOG`) with serial access to the card (the `SD` group), and
+`STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`. **Not implemented:** the button menu editor.
+See [awg-implementation-plan.md](awg-implementation-plan.md) for what remains. The legacy
+sections below double as documentation of the sibling `stimjimPulser` firmware in this
+repository; the "hardened" notes describe where stimjimAWG deliberately differs from it.
 
 Backward-compatibility contract: every command of `stimjimPulser` keeps its syntax and semantics;
 `M`/`V`/`A`/`E` keep **byte-compatible single-line replies** because StimJimBIST performs exactly
@@ -216,7 +215,6 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>
   the stage count below a stored selection → `ERR` (reset `MEAS` first) — same policy as a
   preserved `ENV` that no longer fits.
 - `report` bitmask: 0 end-of-train summary (always kept), +1 stream `MDATA` lines, +2 log to SD.
-  v1 implements summary + SD; streaming format is fixed now, implementation deferred.
 - Repetitions (one measurement point per pulse/burst) accumulate `n`, Σv and Σv² per point,
   line and channel; the summary reports the mean **and the sample standard deviation** derived
   from those sums. This is the single-pass estimator — numerically simplified by design
@@ -224,18 +222,85 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>
   reach), chosen so a waveform averaged over many repetitions also yields a spread estimate.
 - Defaults: `what0=what1=3`, `when=0` for `S`/`L` slots / `3` for `W` slots, `stage=-1`,
   `report=0` — measure everything, summary only (reproduces legacy averaging behavior).
-- Stages too short to fit their measurement get it skipped and flagged in the summary.
+
+**How much time a measurement point needs, and when it is refused.** Each ADC value costs a
+control-register write to select the input line plus the conversion itself. The reads must end
+before the next latch event starts *programming* the DAC, which happens `SJ_PRELOAD_US +
+SJ_DAC_PROG*_US` early, and they cannot start until the previous latch has settled. So a point
+needs
+
+```
+room = (SJ_PRELOAD_US + SJ_DAC_PROG*_US)
+     + nReads * (SJ_ADC_READ_US + SJ_ADC_SWITCH_US)
+     + SJ_MEAS_GUARD_US + SJ_DAC_SETTLE_US
+```
+
+`nReads` counts the values actually taken — one per selected line per driven channel — and the
+DAC programming term is `SJ_DAC_PROG1_US` when the train drives one channel, `SJ_DAC_PROG2_US`
+when it drives two. That room must fit the free gap the point lives in:
+
+| Slot type | The free gap is |
+|---|---|
+| `S` | the stage duration |
+| `L` | the stage's *ramp sample interval* (stage duration / N, 20 µs by default) — not the stage |
+| `W` | the sine sample interval `1/Fs`, which is never shorter than 20 µs because Fs is capped |
+
+On a Teensy 3.5 with the constants above that works out to:
+
+| What is measured | `nReads` | room | Fits an `L` train at the default 20 µs? | Highest `W` frequency |
+|---|---|---|---|---|
+| one line, one channel | 1 | 19 µs | yes | any (the 20 µs sample floor is enough) |
+| V+I, one channel | 2 | 26 µs | no | 601 Hz |
+| one line, both channels | 2 | 28 µs | no | 558 Hz |
+| V+I, both channels | 4 | 42 µs | no | 372 Hz |
+
+A point that does not fit is **refused, not squeezed**: a `WARN MEAS:` line at start names the
+required and available times, the point never fires, and the summary still emits its `MSUM`
+line with `n = 0` plus a `#` line repeating the reason. Stretching the waveform to make room
+for the instrumentation would change the delivered stimulus, so it is not done. The remedies,
+in order: measure one line (`MEAS<i>,1,1,…`), measure one channel, use `S` instead of `L`, or
+rebuild with a larger `SJ_TARGET_DT_US`.
+
+**The envelope gates measurement.** A reading taken while the `ENV` envelope is ramping
+describes an attenuated waveform, and averaging it with full-amplitude repetitions gives a mean
+that describes neither. So when a slot has a non-zero `ENV`, points fire only where the
+envelope is fully on; the skipped repetitions are counted and reported as a `#` line with the
+summary. Without an envelope every repetition is measured, so legacy behaviour is unchanged.
+
+**Where the reads sit.** For `S`/`L` the window ends just before the next latch's programming
+window opens (`when = 0`, "near stage end"). For `W` the reads start `SJ_DAC_SETTLE_US` *after*
+the peak sample latches — that sample is the value being measured — with the peak sample index
+solved at arm time from the phase accumulator. When both channels are measured but carry
+different frequencies or phases, the peaks follow the lower-numbered channel and a `WARN MEAS:`
+line says so.
 
 **MDATA record** (per-repetition stream and SD CSV, format frozen in v1):
 `MDATA,<slot>,<pulse>,<point>,<V0_mV>,<I0_uA>,<V1_mV>,<I1_uA>` — empty field where not measured.
-SD rows are prefixed with `<timestamp_us>` (µs since boot) instead of the `MDATA` word.
+SD rows are prefixed with `<timestamp_us>` (µs since boot) instead of the `MDATA` word. The
+records go through one ring buffer drained in `loop()`; if a host stops reading long enough to
+fill it, records are dropped and the count is reported as a `WARN MEAS:` line — the waveform
+is never delayed to keep the stream intact.
 
 **MSUM record** (end-of-train summary, format frozen in v1, emitted from `loop()` after the
 legacy `Train #<n> complete…` line):
 `MSUM,<slot>,<n>,<point>,<V0_mV>,<V0_sd>,<I0_uA>,<I0_sd>,<V1_mV>,<V1_sd>,<I1_uA>,<I1_sd>`
 — one line per measured point; means and sd in mV/µA. `<point>` is the stage index for `S`/`L`
 and the peak phase in degrees (`90` / `270`) for `W`. `<n>` = repetitions accumulated; sd is
-empty when `n < 2`; fields are empty where not measured.
+empty when `n < 2`; fields are empty where not measured. A train stopped by hand (`T-1`) also
+prints its summary, so a long averaging run can be ended when it has enough repetitions.
+
+**Timing self-check.** Every latch compares itself against its own deadline, so no oscilloscope
+is needed to tell whether a train's budgets held. Two lines can follow a completion, both
+normally absent:
+
+- `WARN engine: <n> latch(es) overran their deadline by up to <t> ns` — DAC programming for an
+  event that was still in the future finished after its deadline. This is a defect: a timing
+  budget in `Config.h` is too small for this board, and `BENCH` (§4) is how to resize it.
+- `# engine: <n> event(s) were already due when the player reached them` — an earlier event ran
+  long. Events that share a deadline *by definition* are excluded, because that is the
+  waveform's shape and not a fault: an `L` train latches its last ramp sample and then parks at
+  the same stage boundary, and a `W` burst with `burst_us == period_us` puts the off event on
+  top of a sample. In both cases the second latch of the pair is a few µs behind the first.
 
 ### `READ` — manual averaged measurement (immediate)
 
@@ -250,6 +315,64 @@ standard deviation in mV/µA with two decimals (sub-LSB resolution is meaningful
 Complements `E`, which stays the single raw read with the BIST-frozen reply. Refused with `ERR`
 while any train runs — a long averaging burst under the bus lock would stall the players;
 in-train measurement is `MEAS`'s job.
+
+### `LOG` — measurement logging to the SD card
+
+```
+LOG?           →  LOG,<open>,<name>,<bytes>        status (bare `LOG` is the same)
+LOG1[,<name>]  →  same record                      open; no name = next free LOGnnnn.CSV
+LOG0           →  same record                      close and flush
+```
+
+Rows are written only for slots whose `MEAS` `report` has bit 1 set (`+2`), in the frozen CSV
+form above. Only `loop()` touches the card, on the Teensy's native SDIO — never the DAC/ADC SPI
+bus — so a write-latency spike cannot disturb a waveform. Data is flushed at each train end,
+every 64 rows, or once a second, whichever comes first.
+
+A log has to be readable on its own, including when the trains were fired by trigger edges with
+no host attached, so the file carries:
+
+1. its own header line, the `IDN` block and the whole session configuration — the same
+   paste-back-able lines `DUMP` prints — written when the file is opened;
+2. the `# columns:` names;
+3. a `# train:` block for every train that arms while the file is open, giving that slot's
+   canonical `S`/`L`/`W` line plus its `ENV`/`MEAS` lines. This is what records configuration
+   changes made *after* the file was opened.
+
+Auto names are `LOG0000.CSV` upwards, the lowest free index — the board has no clock, so the
+index is all that distinguishes runs, and it is never reused.
+
+### The `SD` group — reading the card over the serial port
+
+The card socket is inside the instrument, so nothing written to it may depend on opening the
+case. `SD?` lists the group.
+
+| Cmd | Reply / notes |
+|---|---|
+| `SDINFO[,1]` | `SD,<present>,<total_KiB>,<used_KiB>,<log_open>,<log_name>,<log_bytes>`. `used_KiB` is `-1` unless the optional `1` asks for it: measuring used space walks the whole free-cluster chain, which takes seconds on a large card and blocks `loop()` for that long, so it is refused while a train runs. |
+| `SDLIST[,<dir>]` | one `SDLIST,<name>,<size>` line per entry (directories get a trailing `/`), then `OK`. Default directory is the root. |
+| `SDGET,<name>[,<offset>[,<len>]]` | length-framed transfer, below. `len` defaults to the rest of the file. |
+| `SDDEL,<name>` | delete one file; refused for the open log file (close it with `LOG0` first). |
+
+**`SDGET` framing.** File content is arbitrary bytes and must never be mistaken for protocol,
+so the payload is announced by byte count rather than escaped:
+
+```
+SDGET,<name>,<offset>,<len>,<total>     header line
+<exactly len bytes, verbatim>           payload — no framing, no escaping
+                                        one newline the host discards
+# crc32=<8 hex digits>                  CRC-32/ISO-HDLC of the bytes actually sent
+OK
+```
+
+A host reads the header, then exactly `<len>` bytes, then lines again. The CRC covers the
+transferred chunk, not the whole file, so a chunked download can be verified piece by piece.
+Reading the log file while it is still open is the normal case and works: it is flushed first
+and served through the same handle. A transfer calls the 64-bit timebase every 512 bytes, so a
+host that stops reading mid-transfer cannot stall the engine's clock extension.
+
+On a board without a card socket (a Teensy 4.0, where `SJ_USE_SD` defaults to 0) the whole
+group and `LOG` answer `ERR <cmd>: no SD support in this build (<board>)`.
 
 ### `TRIG` — trigger routing (per input 0/1)
 
@@ -281,11 +404,12 @@ TRIG<t>?  → canonical line
 | Cmd | Reply |
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
-| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>` and `# engine: …, K_RELOAD=<n> cycles`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)). |
+| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>` and `# engine: …, K_RELOAD=<n> cycles`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)). |
 | `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
 | `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, `OK`. Paste-back restores the configuration, `TRIG` lines included (they are real set-commands). |
-| `LOG` | SD logging: `LOG?` status (card present, open file, bytes); `LOG1[,name]` open new file; `LOG0` close/flush. |
+| `LOG` | SD logging: status / open / close — see above. |
+| `SD` | SD file access over the serial port: `SDINFO`, `SDLIST`, `SDGET`, `SDDEL` — see above. |
 | `BENCH` | hardware benchmark group, see below. |
 
 **`BENCH` group.** Timing results are printed in CPU cycles (120/µs on a Teensy 3.5) and ns; multi-line
@@ -305,6 +429,23 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 | `BENCHPIT,period_us,n[,preload_us]` | PIT wake (preload 0) or post-spin latch jitter vs absolute deadline, histogram in 0.5 µs bins |
 | `BENCHSQ,ch,code,half_us,n` | square wave via FastIO program+latch — scope A/B vs |
 | `BENCHSQL,ch,code,half_us,n` | the same square wave via legacy `Stimjim.writeToDac` |
+
+**Measured on a Teensy 3.5 at 120 MHz, register backends, n = 2000** (these are the numbers the
+`Config.h` budgets are sized against; the budgets carry the *maximum*, not the average, because
+one outlying event is enough to push the next latch late):
+
+| Bench | min / avg / max | What it sizes |
+|---|---|---|
+| `BENCHDAC` | 1.41 / 1.43 / 2.88 µs | `SJ_DAC_PROG1_US` = 3 |
+| `BENCHDAC2` | 2.74 / 2.75 / 4.23 µs | `SJ_DAC_PROG2_US` = 5 |
+| `BENCHLATCH` | 0.44 / 0.44 / 1.93 µs | the NLDAC pulse itself |
+| `BENCHADC` | 2.21 / 2.22 / 3.81 µs | `SJ_ADC_READ_US` = 3 |
+| `BENCHSW` | 4.53 / 4.58 / 6.10 µs | `SJ_ADC_READ_US + SJ_ADC_SWITCH_US` = 7 |
+| `BENCHMISO` | 2.27 / 2.29 / 3.29 µs | the PORT-mux swap is nearly free |
+| `BENCHCYC` | 0.27 µs | `cycles64()` overhead |
+| `BENCHK` | residual −23 / −16 / −12 cycles | `K_RELOAD` spread ≈ 11 cycles (92 ns) |
+| `BENCHPIT,1000,2000` | 0.37 / 0.41 / 0.58 µs late | raw PIT wake latency ⇒ `SJ_PRELOAD_US` = 4 is 7× the worst case |
+| `BENCHPIT,1000,2000,4` | 0.117 / 0.133 / 0.158 µs late | **residual latch jitter: 42 ns spread**, against a design target of < 200 ns |
 
 ## 5. Defaults (authoritative table)
 
@@ -365,7 +506,13 @@ Deliberate behavior changes (documented compat risk, all fail-loudly):
     that a waveform line *without* the field clears any delay the slot had — the header is
     defined by the line, never inherited.
 12. `R` now writes the routing table instead of erroring, and `DUMP` emits `TRIG` lines as real
-    set-commands rather than `#` comments, so a dump pastes back complete. `R<t>,<slot>` with
+    set-commands rather than `#` comments, so a dump pastes back complete.
+13. `MEAS` with a non-zero `report` no longer warns that streaming is deferred — both `MDATA`
+    streaming (bit 0) and SD logging (bit 1) now do what they say.
+14. `BENCHDAC2` reaches the dual-channel bench. The command word is the leading *alphabetic*
+    run of a line, which stopped in front of the `2`, so `BENCHDAC2,2000` used to run
+    `BENCHDAC` with a repetition count of 2 — visible only in its own reply. `BENCH`
+    sub-commands are now scanned across digits too. `R<t>,<slot>` with
     `slot = -1` disables the input (mode 0) rather than routing nothing.
 
 Corrections to stale legacy documentation:

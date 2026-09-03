@@ -4,6 +4,7 @@ One line per phase, newest first. Full handoff entries — decisions, rationale,
 questions, next entry point — live in `docs/progress/<NNN>-<topic>.md` (project convention,
 CLAUDE.md). To pick up work read this index, then at most the newest one or two entries.
 
+- 007 2026-09-03 measurement-sd-bench — MEAS execution with its window-fit rule, MSUM/MDATA, SD logging, the SD file group serving the card over serial, BENCH on silicon (42 ns latch jitter), per-latch deadline counters (progress/007-measurement-sd-bench.md)
 - 006 2026-09-02 hardware-bench-delay-ui — first hardware run (two boot-fatal PIT bugs fixed), Teensy 4 / portable backends, post-trigger delay, TRIG setters, OLED redesign (progress/006-hardware-bench-delay-ui.md)
 - 005 2026-07-11 sine-playback — W sine playback, Q32 phase accumulator, per-train Fs (progress/005-sine-playback.md)
 - 004 2026-07-11 ramp-envelope — L ramp playback via Bresenham, 0-duration jumps, ENV envelope (progress/004-ramp-envelope.md)

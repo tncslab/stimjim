@@ -209,8 +209,11 @@ int main() {
   CHECK(TrainStore::validateMeas(cur, {3, 3, 1, -1, 0}, warn, sizeof warn) != nullptr);  // sine-peak code on S slot
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 4}, warn, sizeof warn) != nullptr);  // report > 3
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  0, 0}, warn, sizeof warn) != nullptr);  // stage 0 on a 0-stage slot
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1}, warn, sizeof warn) == nullptr);  // streaming: warn
-  CHECK(strstr(warn, "stream") != nullptr);
+  // Both report bits are implemented now, so neither warns any more.
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1}, warn, sizeof warn) == nullptr);  // stream MDATA
+  CHECK(warn[0] == '\0');
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 3}, warn, sizeof warn) == nullptr);  // stream + SD
+  CHECK(warn[0] == '\0');
   cur.nStages = 2;                                                     // per-stage selection in range
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  1, 0}, warn, sizeof warn) == nullptr);
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  2, 0}, warn, sizeof warn) != nullptr);
