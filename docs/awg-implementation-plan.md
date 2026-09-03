@@ -315,7 +315,11 @@ by `P` and reported by `IDN`), the ramp sample interval is per slot (`L`'s 7th h
 `DT`), and a measurement point whose reads do not fit its free gap rotates them over consecutive
 repetitions instead of being refused (`MEAS` `fit`). The trigger ISRs timestamp the edge and the
 engine measures the start latency from that timestamp, so interrupt entry and the arm-time
-precomputation no longer land on the delivered trigger-to-output latency.
+precomputation are spent *inside* `CAL STARTLAT` rather than added to it — which is why
+`STARTLAT` has to be wide enough to hold the arm, is 60 µs rather than 20, and is reported by
+name when a train's arm does not fit it. `BENCHARM` measures the arm and `BENCHSETTLE` measures
+the settling time, so of the four budgets that once needed an oscilloscope only `TRIGCOMP`
+still does.
 
 **Remaining work.**
 
@@ -325,11 +329,22 @@ precomputation no longer land on the delivered trigger-to-output latency.
   the SPI bus) has not been measured, and that is what sets the published FsMax table with its
   ~30 % margin. The remaining scope work is long-run drift (≤ 1 µs cumulative over a 10 s train)
   and the full trigger-latency battery.
-- **Two numbers still guessed, both now one serial line from correct.** `CAL SETTLE` (the AD5752
-  settling time, bench-verify item 2) and `CAL TRIGCOMP` (the pin-edge-to-ISR-entry delay of the
-  trigger path) need a scope. Until then `SETTLE` carries the player's own post-latch bookkeeping
-  cost and `TRIGCOMP` is 0.
-- **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`).
+- **One number still guessed.** `CAL TRIGCOMP`, the pin-edge-to-ISR-entry delay of the trigger
+  path, is 0 because software cannot see the physical edge. It is the only budget left that
+  needs an oscilloscope; [bench-wiring.md](bench-wiring.md) describes the wiring and the
+  procedure. `CAL SETTLE`, which used to sit beside it, was measured in phase 9 with
+  `BENCHSETTLE` and needed no scope at all.
+- **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`). This is the last
+  unbuilt item of the requested-feature list in `firmware-spec.md`.
+- **The arm costs 16.6 µs before it does anything train-specific**, and since that cost sits
+  inside `STARTLAT` it is the trigger latency. It has not been profiled. The candidates visible
+  from `BENCHARM` are `Measure::planBuild`'s `memset` of a ~1 kB plan (paid even by a train that
+  measures nothing), the 64-bit divisions of the ramp and sine setup, and `ampToCode`'s float
+  division per stage per channel. Pre-building the measurement plan when the `TRIG` route is set
+  rather than when the edge arrives would remove another 4.3 µs.
+- **The first `adcSelectLine` could be issued inside the `SETTLE` window.** A control-register
+  write samples nothing, so it can overlap the settling; that would return `ADCSWITCH` = 4 µs of
+  the 9 µs every measurement point now pays.
 
 ## 7. Bench-verify, don't guess
 
@@ -337,10 +352,12 @@ precomputation no longer land on the delivered trigger-to-output latency.
    `BENCHSW` puts select+read at 4.58 µs average, 6.10 µs worst, against 2.22 µs for a read with
    the line already selected. The switch therefore costs ~2.4 µs and the conversion following it
    is valid; the budget carries 7 µs so the worst case is covered outright.
-2. AD5752 output settling vs NLDAC — **still open on the scope**, and it is the one number that
-   bounds the shortest useful measured stage. `CAL SETTLE` is 4 µs, chosen because that is
-   what the player's own post-latch bookkeeping costs anyway; whether the DAC needs more is
-   unknown. Measuring it now costs one `CAL,SETTLE,<us>` line instead of a rebuild.
+2. AD5752 output settling vs NLDAC — **measured in phase 9, and it needed no scope**:
+   `BENCHSETTLE` latches the same step repeatedly and reads it back at increasing delays, so the
+   delay at which the readings stop moving is the answer. It is 8–9 µs on either channel, at
+   either polarity and at 2000 or 8000 codes of step; the 4 µs the firmware had assumed reads
+   8–9 % short. `CAL SETTLE` is now 9 µs, which is the number that bounds the shortest useful
+   measured stage: 24 µs of free gap for one reading, 47 µs for V+I on both channels.
 3. MISO PORT-mux swap at register level — **measured**: `BENCHMISO` alternates channels at
    2.29 µs per read, statistically the same as a same-channel read, and the readings are
    plausible on both channels, so the swap costs nothing and glitches nothing.
