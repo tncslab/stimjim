@@ -32,6 +32,69 @@ bool accumStats(const Accum& a, double& mean, double& sd) {
   return true;
 }
 
+// ADC window `nr` reads need: the conversions themselves plus the margin
+// before the next latch starts programming the DAC.
+static inline uint32_t windowCyc(uint8_t nr, const Geometry& g) {
+  return nr * (g.adcReadCyc + g.adcSwitchCyc) + g.guardCyc;
+}
+
+// Free gap `nr` reads need: the window, the settling time that has to pass
+// after the latch before the first read, and the next latch's programming.
+static inline uint32_t roomCyc(uint8_t nr, const Geometry& g) {
+  return g.preloadCyc + windowCyc(nr, g) + g.settleCyc;
+}
+
+// Most reads (1..nReads) that fit one `gap`; 0 when not even one does.
+static uint8_t readsPerGap(uint8_t nReads, uint64_t gap, const Geometry& g) {
+  for (uint8_t r = nReads; r >= 1; r--)
+    if (roomCyc(r, g) <= gap) return r;
+  return 0;
+}
+
+// Decide how point p reads its lines inside a free gap of `gap` cycles: all of
+// them in one gap, in `nGrp` groups one per repetition (fit = rotate), or not
+// at all. Fills nGrp/grpMask/budCyc and returns false when the point has to be
+// refused, having recorded the arithmetic of the first such point.
+static bool groupPoint(Plan& pl, uint8_t p, uint64_t gap, const Geometry& g, uint8_t fit) {
+  const uint8_t rpg = readsPerGap(pl.nReads, gap, g);
+  const bool rotate = (fit == SJ_FIT_ROTATE);
+  if (rpg == 0 || (rpg < pl.nReads && !rotate)) {
+    if (pl.needCyc == 0) {
+      // What to report as "needed" is what this `fit` would have asked for:
+      // the full window in strict mode, a single read when rotating (the only
+      // way rotation fails is that not even one read fits).
+      pl.needCyc = roomCyc(rotate ? 1 : pl.nReads, g);
+      pl.roomCyc = (uint32_t)gap;
+    }
+    return false;
+  }
+  const uint8_t nGrp = (uint8_t)((pl.nReads + rpg - 1) / rpg);
+  // Balanced groups: ceil(nReads / nGrp) <= rpg reads each, so the placement
+  // budget below covers every group and the last one may be smaller.
+  const uint8_t per = (uint8_t)((pl.nReads + nGrp - 1) / nGrp);
+  pl.nGrp[p]   = nGrp;
+  pl.budCyc[p] = windowCyc(per, g);
+  uint8_t gi = 0, cnt = 0;
+  for (uint8_t ch = 0; ch < 2; ch++)
+    for (uint8_t ln = 0; ln < 2; ln++) {
+      if (!(pl.lines[ch] & (1u << ln))) continue;
+      pl.grpMask[p][gi] |= (uint8_t)(1u << (ch * 2 + ln));
+      if (++cnt == per) { cnt = 0; gi++; }
+    }
+  if (nGrp > 1) pl.rotMask |= (uint16_t)(1u << p);
+  return true;
+}
+
+// True when a rotating plan will not deliver enough repetitions for every
+// group to fire once — some lines then have no reading at all.
+static bool rotationShort(const Plan& pl) {
+  if (!pl.rotMask) return false;
+  uint8_t maxGrp = 1;
+  for (uint8_t p = 0; p < pl.nPoints; p++)
+    if (pl.nGrp[p] > maxGrp) maxGrp = pl.nGrp[p];
+  return pl.reps < maxGrp;
+}
+
 void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
   memset(&pl, 0, sizeof pl);
   pl.slot   = slot;
@@ -43,14 +106,16 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
   // not drive is never measured, whatever MEAS says (protocol §4).
   pl.lines[0] = (g.chMask & 1) ? (uint8_t)(def.meas.what0 & 3) : 0;
   pl.lines[1] = (g.chMask & 2) ? (uint8_t)(def.meas.what1 & 3) : 0;
-  uint8_t nReads = (uint8_t)(bitCount2(pl.lines[0]) + bitCount2(pl.lines[1]));
-  if (nReads == 0) return;                 // on stays false
+  pl.nReads = (uint8_t)(bitCount2(pl.lines[0]) + bitCount2(pl.lines[1]));
+  if (pl.nReads == 0) return;              // on stays false
 
-  pl.budgetCyc = nReads * (g.adcReadCyc + g.adcSwitchCyc) + g.guardCyc;
-  // Room a point needs inside its free gap: the reads themselves, the settling
-  // time before them and the next latch's programming window after them.
-  const uint32_t room = g.preloadCyc + pl.budgetCyc + g.settleCyc;
+  pl.budgetCyc = windowCyc(pl.nReads, g);  // every read in one gap
   pl.envGate = (def.env.rampIn_us != 0 || def.env.rampOut_us != 0);
+  // Repetitions the train will deliver — rotation needs at least one per group
+  // to cover every line, and this is where that is known.
+  pl.reps = def.period_us
+          ? (uint32_t)(((uint64_t)def.duration_us + def.period_us - 1) / def.period_us)
+          : 0;
   const uint8_t chm = (uint8_t)((pl.lines[0] ? 1 : 0) | (pl.lines[1] ? 2 : 0));
 
   if (g.type != SINE) {
@@ -68,15 +133,15 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
       const uint8_t p = pl.nPoints++;
       pl.label[p]  = i;
       pl.chMask[p] = chm;
-      if (gap < room) {
+      if (!groupPoint(pl, p, gap, g, def.meas.fit)) {
         pl.skipMask |= (uint16_t)(1u << p);
-        if (pl.needCyc == 0) { pl.needCyc = room; pl.roomCyc = (uint32_t)gap; }
         pl.atCyc[p] = stageEnd;            // never fires; keeps the list sorted
       } else {
-        pl.atCyc[p] = stageEnd - g.preloadCyc - pl.budgetCyc;
+        pl.atCyc[p] = stageEnd - g.preloadCyc - pl.budCyc[p];
       }
     }
     pl.on = (pl.nPoints != 0);
+    pl.rotShort = rotationShort(pl);
     return;
   }
 
@@ -95,36 +160,42 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
   static const uint16_t degrees[2] = {90, 270};
   uint64_t at[2] = {0, 0};
   uint16_t deg[2] = {0, 0};
-  bool     ok[2] = {false, false};
   uint8_t  np = 0;
   for (uint8_t j = 0; j < 2; j++) {
     if (!(def.meas.when & (1u << j))) continue;
     // The reads go *after* the peak sample latches — that sample is what we
     // want to read — and must finish before the next sample's programming.
-    const uint64_t a = (uint64_t)peakSampleIndex(g.phaseInit[pc], inc, target[j])
-                     * g.sampleCyc + g.settleCyc;
-    at[np]  = a;
+    at[np]  = (uint64_t)peakSampleIndex(g.phaseInit[pc], inc, target[j])
+            * g.sampleCyc + g.settleCyc;
     deg[np] = degrees[j];
-    ok[np]  = (g.sampleCyc >= room) &&
-              (a + pl.budgetCyc + g.preloadCyc <= g.burstCyc);
     np++;
   }
   if (np == 2 && at[1] < at[0]) {          // keep the point list ascending
     uint64_t ta = at[0]; at[0] = at[1]; at[1] = ta;
     uint16_t td = deg[0]; deg[0] = deg[1]; deg[1] = td;
-    bool     to = ok[0];  ok[0] = ok[1];   ok[1] = to;
   }
+  pl.nPoints = np;
   for (uint8_t j = 0; j < np; j++) {
     pl.atCyc[j]  = at[j];
     pl.label[j]  = deg[j];
     pl.chMask[j] = chm;
-    if (!ok[j]) {
+    // The free gap of a sine point is one sample interval; the reads must also
+    // finish inside the burst, before the off event's programming window.
+    // The two failures report different arithmetic: the sample interval is too
+    // short, or the peak sits too close to the end of the burst.
+    if (!groupPoint(pl, j, g.sampleCyc, g, def.meas.fit)) {
       pl.skipMask |= (uint16_t)(1u << j);
-      if (pl.needCyc == 0) { pl.needCyc = room; pl.roomCyc = g.sampleCyc; }
+    } else if (at[j] + pl.budCyc[j] + g.preloadCyc > g.burstCyc) {
+      pl.skipMask |= (uint16_t)(1u << j);
+      pl.rotMask &= (uint16_t)~(1u << j);
+      if (pl.needCyc == 0) {
+        pl.needCyc = (uint32_t)(at[j] + pl.budCyc[j] + g.preloadCyc);
+        pl.roomCyc = (uint32_t)g.burstCyc;
+      }
     }
   }
-  pl.nPoints = np;
-  pl.on      = (np != 0);
+  pl.on       = (np != 0);
+  pl.rotShort = rotationShort(pl);
 }
 
 // ------------------------------------------------------------- device section
@@ -189,12 +260,18 @@ void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15) {
   // describes neither, so those repetitions are counted and dropped.
   if (p.envGate && envQ15 < 32768) { p.envSkipped++; return; }
 
+  // Which lines this repetition reads. Without rotation that is every line of
+  // the point (group 0 holds them all); with it, one group per pulse in
+  // rotation — the reads stay at this instant, only their number per pulse
+  // drops. The modulo keeps the rotation aligned to the pulse grid even when
+  // the envelope gate has dropped repetitions.
+  const uint8_t rmask = p.grpMask[i][p.nGrp[i] > 1 ? (uint8_t)(pulseIdx % p.nGrp[i]) : 0];
+
   uint8_t valid = 0;
   int16_t raw[2][2] = {{0, 0}, {0, 0}};
   for (uint8_t ch = 0; ch < 2; ch++) {
-    if (!(p.chMask[i] & (1u << ch))) continue;
     for (uint8_t ln = 0; ln < 2; ln++) {
-      if (!(p.lines[ch] & (1u << ln))) continue;
+      if (!(rmask & (1u << (ch * 2 + ln)))) continue;
       FastIO::adcSelectLine(ch, ln);
       const int16_t v = FastIO::adcRead(ch, ln);
       Accum& a = p.acc[i][ch][ln];
@@ -258,6 +335,25 @@ static void printNote(uint8_t eng) {
                     (unsigned long)cycToUsUp(p.needCyc),
                     (unsigned long)SJ_CYC_TO_US(p.roomCyc));
     }
+  }
+  if (p.rotMask) {
+    // One line for the whole plan, not one per point: every rotating point of
+    // a train normally rotates the same way, and the interesting numbers are
+    // how thin the per-line count gets and how to get the full window back.
+    uint8_t nRot = 0, maxGrp = 1;
+    for (uint8_t i = 0; i < p.nPoints; i++) {
+      if (!(p.rotMask & (1u << i))) continue;
+      nRot++;
+      if (p.nGrp[i] > maxGrp) maxGrp = p.nGrp[i];
+    }
+    Serial.printf("# MEAS: slot %u: %u read(s) do not fit one free gap — %u point(s) rotate "
+                  "their reads over up to %u repetitions (each line gets about n/%u of them). "
+                  "A wider gap: DT (L) or CAL; refuse instead: MEAS fit=0\n",
+                  p.slot, p.nReads, nRot, maxGrp, maxGrp);
+    if (p.rotShort)
+      Serial.printf("WARN MEAS: slot %u delivers %lu repetition(s), fewer than the %u "
+                    "rotation groups — some lines are never read\n",
+                    p.slot, (unsigned long)p.reps, maxGrp);
   }
   if (p.peakMismatch)
     Serial.printf("WARN MEAS: slot %u sine peaks follow channel %u; the other measured "
@@ -329,6 +425,11 @@ void printSummary(uint8_t eng, uint8_t slot) {
                     p.label[i],
                     (unsigned long)cycToUsUp(p.needCyc),
                     (unsigned long)SJ_CYC_TO_US(p.roomCyc));
+    // With rotation the four lines are read on different repetitions, so their
+    // counts differ by at most one and the n field above carries the largest.
+    else if (p.rotMask & (1u << i))
+      Serial.printf("# MSUM point %u: reads rotated over %u repetitions, n is the largest "
+                    "of the lines' counts\n", p.label[i], p.nGrp[i]);
   }
   if (p.envSkipped)
     Serial.printf("# MSUM: %lu repetitions skipped inside the ENV ramps\n",

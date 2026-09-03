@@ -61,15 +61,24 @@ static void fillGeometry(Geometry& g, uint8_t type, uint8_t chMask) {
   g.settleCyc    = SETTLE;
 }
 
+// 50 repetitions, and `fit` strict: a point that does not fit its gap is
+// refused. The rotation tests below set fit = SJ_FIT_ROTATE explicitly, which
+// keeps the two behaviours visibly separate in every other test.
 static void defaultDef(TrainDef& t, uint8_t mode0, uint8_t mode1) {
   memset(&t, 0, sizeof t);
   t.mode0 = mode0;
   t.mode1 = mode1;
+  t.period_us   = 10000;
+  t.duration_us = 500000;
   t.meas.what0 = 3;
   t.meas.what1 = 3;
   t.meas.when  = 0;
   t.meas.stage = -1;
+  t.meas.fit   = SJ_FIT_STRICT;
 }
+
+// Read mask bit of one (channel, line) pair, as Plan::grpMask packs it.
+static uint8_t readBit(uint8_t ch, uint8_t line) { return (uint8_t)(1u << (ch * 2 + line)); }
 
 // ---------------------------------------------------------------- peak solver
 
@@ -326,6 +335,8 @@ static void testSineTooFast() {
   planBuild(p, 0, t, g);
   CHECK_EQ(p.nPoints, 1);
   CHECK_EQ(p.skipMask, 1);
+  // Strict `fit` asked for all four reads in one gap, so that is what the
+  // refusal reports — the rotation tests below check the other number.
   CHECK_EQ(p.needCyc, roomOf(4));
   CHECK_EQ(p.roomCyc, 20u * CYC);
 }
@@ -370,6 +381,150 @@ static void testSineBurstTooShort() {
   planBuild(p, 0, t, g);
   CHECK_EQ(p.nPoints, 1);
   CHECK_EQ(p.skipMask, 1);
+}
+
+// ------------------------------------------------------------------- rotation
+
+static void testRotateHoldStage() {
+  // Read windows on this board: roomOf(1..4) = 21, 28, 35, 42 us. A 25 us
+  // stage therefore holds exactly one read per repetition, and the four reads
+  // of a V+I-on-both-channels point become four groups.
+  TrainDef t;
+  defaultDef(t, 0, 1);
+  t.meas.fit = SJ_FIT_ROTATE;
+  t.nStages = 1;
+  t.stages[0].dur_us = 25;
+  uint64_t cum[2] = {0, 25u * CYC};
+  Geometry g;
+  fillGeometry(g, PIECEWISE_HOLD, 0b11);
+  g.nStages = 1;
+  g.cum     = cum;
+
+  Plan p;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.skipMask, 0);                 // measured after all
+  CHECK_EQ(p.rotMask, 1);
+  CHECK_EQ(p.nGrp[0], 4);
+  CHECK_EQ(p.budCyc[0], budgetOf(1));
+  CHECK(!p.rotShort);                      // 50 repetitions, 4 groups
+  // one read per group, in (channel, line) order
+  CHECK_EQ(p.grpMask[0][0], readBit(0, 0));
+  CHECK_EQ(p.grpMask[0][1], readBit(0, 1));
+  CHECK_EQ(p.grpMask[0][2], readBit(1, 0));
+  CHECK_EQ(p.grpMask[0][3], readBit(1, 1));
+  // placement uses the one-read window, so the point sits later than it would
+  // with all four reads in one gap
+  CHECK_EQ(p.atCyc[0], cum[1] - PRELOAD - budgetOf(1));
+
+  // A 30 us stage takes two reads per gap: two groups of two, and the window
+  // reserved is the two-read one.
+  t.stages[0].dur_us = 30;
+  cum[1] = 30u * CYC;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.skipMask, 0);
+  CHECK_EQ(p.rotMask, 1);
+  CHECK_EQ(p.nGrp[0], 2);
+  CHECK_EQ(p.budCyc[0], budgetOf(2));
+  CHECK_EQ(p.grpMask[0][0], (uint8_t)(readBit(0, 0) | readBit(0, 1)));
+  CHECK_EQ(p.grpMask[0][1], (uint8_t)(readBit(1, 0) | readBit(1, 1)));
+  CHECK_EQ(p.atCyc[0], cum[1] - PRELOAD - budgetOf(2));
+
+  // A stage with room for everything does not rotate: one group holds all four
+  // reads, which is what keeps the unmeasured-path behaviour bit-identical.
+  t.stages[0].dur_us = 1000;
+  cum[1] = 1000u * CYC;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.rotMask, 0);
+  CHECK_EQ(p.nGrp[0], 1);
+  CHECK_EQ(p.budCyc[0], budgetOf(4));
+  CHECK_EQ(p.grpMask[0][0], 0x0F);
+}
+
+static void testRotateRamp() {
+  // The headline coverage case: an L ramp with V+I on both channels. At the
+  // default 20 us sample interval not even one read fits and rotation cannot
+  // help; at 25 us one read fits per gap, so four repetitions cover the four
+  // lines and the ramp itself is untouched.
+  TrainDef t;
+  defaultDef(t, 0, 1);
+  t.meas.fit = SJ_FIT_ROTATE;
+  t.nStages = 1;
+  t.stages[0].dur_us = 1000;
+  uint64_t cum[2] = {0, 1000u * CYC};
+  uint32_t stageN[1] = {50};                // 1000 us / 50 = 20 us
+  Geometry g;
+  fillGeometry(g, PIECEWISE_RAMP, 0b11);
+  g.nStages = 1;
+  g.cum     = cum;
+  g.stageN  = stageN;
+
+  Plan p;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.skipMask, 1);                  // rotation is not magic
+  CHECK_EQ(p.rotMask, 0);
+  CHECK_EQ(p.needCyc, roomOf(1));
+  CHECK_EQ(p.roomCyc, 20u * CYC);
+
+  stageN[0] = 40;                           // 25 us per sample
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.skipMask, 0);
+  CHECK_EQ(p.rotMask, 1);
+  CHECK_EQ(p.nGrp[0], 4);
+  CHECK_EQ(p.atCyc[0], cum[1] - PRELOAD - budgetOf(1));
+}
+
+static void testRotationShortTrain() {
+  // One repetition cannot cover four groups: the plan says so rather than
+  // reporting three lines with n = 0 and no explanation.
+  TrainDef t;
+  defaultDef(t, 0, 1);
+  t.meas.fit    = SJ_FIT_ROTATE;
+  t.period_us   = 10000;
+  t.duration_us = 10000;                    // exactly one pulse
+  t.nStages = 1;
+  t.stages[0].dur_us = 25;                   // one read per gap => four groups
+  uint64_t cum[2] = {0, 25u * CYC};
+  Geometry g;
+  fillGeometry(g, PIECEWISE_HOLD, 0b11);
+  g.nStages = 1;
+  g.cum     = cum;
+
+  Plan p;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.reps, 1);
+  CHECK_EQ(p.nGrp[0], 4);
+  CHECK(p.rotShort);
+
+  t.duration_us = 40000;                    // four pulses: enough
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.reps, 4);
+  CHECK(!p.rotShort);
+}
+
+static void testRotateSine() {
+  // 40 us between samples holds three reads but not four, so the four reads
+  // split into two balanced groups of two.
+  TrainDef t;
+  defaultDef(t, 0, 1);
+  t.meas.fit  = SJ_FIT_ROTATE;
+  t.meas.when = 1;                          // positive peak only
+  Geometry g;
+  fillGeometry(g, SINE, 0b11);
+  g.sampleCyc    = 40 * CYC;
+  g.burstCyc     = 100000u * CYC;
+  g.phaseInc[0]  = 0x04000000u;             // peak at sample 16
+  g.phaseInc[1]  = 0x04000000u;
+
+  Plan p;
+  planBuild(p, 0, t, g);
+  CHECK_EQ(p.nPoints, 1);
+  CHECK_EQ(p.skipMask, 0);
+  CHECK_EQ(p.rotMask, 1);
+  CHECK_EQ(p.nGrp[0], 2);
+  CHECK_EQ(p.budCyc[0], budgetOf(2));
+  // rotation does not move the point: the reads still start SETTLE after the
+  // peak sample latches, on every repetition
+  CHECK_EQ(p.atCyc[0], (uint64_t)16 * g.sampleCyc + SETTLE);
 }
 
 // ------------------------------------------------------------------ estimator
@@ -417,6 +572,10 @@ int main() {
   testSineTooFast();
   testSinePeakChannelMismatch();
   testSineBurstTooShort();
+  testRotateHoldStage();
+  testRotateRamp();
+  testRotationShortTrain();
+  testRotateSine();
   testAccumStats();
   printf(failures ? "%d check(s) failed\n" : "all checks passed\n", failures);
   return failures;

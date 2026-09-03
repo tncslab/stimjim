@@ -18,6 +18,9 @@
 //
 //    It measures V and I inside the train (`MEAS`/MSUM/MDATA), logs the results
 //    to the onboard SD card and serves the card back over the serial port.
+//    Every hardware timing budget the scheduler and the measurement engine work
+//    from is runtime state (`CAL`), so calibrating one bench costs a serial line
+//    rather than a rebuild.
 //
 //    Not implemented: the button menu editor.
 //
@@ -33,6 +36,7 @@
 //    <https://www.gnu.org/licenses/>
 
 #include "Config.h"
+#include "Cal.h"
 #include "FastIO.h"
 #include "Engine.h"
 #include "Protocol.h"
@@ -61,6 +65,13 @@ void setup() {
   SJ_TRACE("serial up");
 #endif
 
+  // The timing budgets first: everything that arms a train reads them, and the
+  // EEPROM restore below may replace them with a calibrated set.
+  SJ_TRACE("-> Cal::begin");
+  Cal::begin();
+  if (const char* bad = Cal::validate(Cal::live()))
+    Serial.printf("WARN CAL: this build's default budget is inconsistent — %s\n", bad);
+
   // Legacy library boot: SPI init, DAC range/power-up, ADC + current offset
   // calibration (outputs stay grounded throughout; takes a few hundred ms).
   SJ_TRACE("-> Stimjim.begin");
@@ -80,15 +91,18 @@ void setup() {
   SJ_TRACE("-> Triggers::begin");
   Triggers::begin();
 
-  // Restore the EEPROM image (slots 0-9 + trigger table) if magic, version and
-  // CRC all check out. setRoute() also wires the pins, so a restored trigger
-  // is live from boot.
+  // Restore the EEPROM image (slots 0-9 + trigger table + the CAL budget) if
+  // magic, version and CRC all check out. setRoute() also wires the pins, so a
+  // restored trigger is live from boot.
   SJ_TRACE("-> eepromRestore");
   TriggerRoute trig[2];
-  if (TrainStore::eepromRestore(trig)) {
+  bool calRejected = false;
+  if (TrainStore::eepromRestore(trig, &calRejected)) {
     Triggers::setRoute(0, trig[0]);
     Triggers::setRoute(1, trig[1]);
-    Serial.println("# EEPROM: restored slots 0-9 and the trigger table");
+    Serial.println("# EEPROM: restored slots 0-9, the trigger table and the CAL budget");
+    if (calRejected)
+      Serial.println("# EEPROM: the stored CAL budget failed validation — build defaults kept");
   } else {
     Serial.println("# EEPROM: no valid image — using boot defaults");
   }

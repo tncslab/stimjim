@@ -2,11 +2,12 @@
 //    stimulus-marker output. GPL-3.0-or-later; see Config.h header.
 //
 //    An edge ISR does the whole arm-and-start in place (Engine::startTrain is
-//    copy-on-arm and sets t0 = now + START_LATENCY + the slot's delay), so the
-//    trigger-to-output latency is a fixed constant rather than something that
-//    depends on how busy loop() is. The ISRs run at SJ_TRIG_PRIO (80), below
-//    the players (64): a trigger can never delay a waveform already playing,
-//    and a player always preempts the arming work.
+//    copy-on-arm and sets t0 = edge - CAL TRIGCOMP + CAL STARTLAT + the slot's
+//    delay), so the trigger-to-output latency is a fixed constant rather than
+//    something that depends on how busy loop() is, on how complex the train is,
+//    or on how long interrupt entry took. The ISRs run at SJ_TRIG_PRIO (80),
+//    below the players (64): a trigger can never delay a waveform already
+//    playing, and a player always preempts the arming work.
 //
 //    Nothing here prints. A rejected trigger (channel busy) only bumps a
 //    counter; poll() emits the WARN from loop context (plan §3.3).
@@ -27,26 +28,33 @@ static volatile uint8_t markerMask = 0;   // bit0 = IN0 drives a marker, bit1 = 
 static const uint8_t PIN[2] = {IN0, IN1};
 
 // Start one slot on one engine from ISR context, counting a refusal.
-static inline void fire(uint8_t eng, int8_t slot) {
+// `at` is the edge timestamp, so the delivered latency is measured from the
+// edge and not from the end of the arm (Engine::startTrain).
+static inline void fire(uint8_t eng, int8_t slot, uint64_t at) {
   if (slot < 0) return;
   char scratch[SJ_MSG_MAX];
   if (!Engine::startTrain(eng, (uint8_t)slot, TrainStore::slotConst((uint8_t)slot),
-                          scratch, sizeof scratch))
+                          scratch, sizeof scratch, at))
     rejects++;
 }
 
 static void edge(uint8_t input) {
+  // First thing in the ISR: the edge's own timebase reading. Everything after
+  // it — dispatch, the arm's precomputation, a second engine's arm — is then
+  // subtracted from the start latency instead of added to it, so two engines
+  // started by one edge also share one t0 grid.
+  const uint64_t at = FastIO::cycles64();
   const TriggerRoute& r = routes[input];
   if (r.mode == 1) {
     // joint: one slot, one engine — the slot's own modes decide which physical
     // channels it drives, so "both channels synchronized" is a property of the
     // waveform definition, not of the routing.
-    fire(0, r.slot0);
+    fire(0, r.slot0, at);
   } else if (r.mode == 2) {
     // independent: slot0 on engine 0, slot1 on engine 1. Each refusal counts
     // separately, so a half-served trigger is visible in the reject count.
-    fire(0, r.slot0);
-    fire(1, r.slot1);
+    fire(0, r.slot0, at);
+    fire(1, r.slot1, at);
   }
 }
 

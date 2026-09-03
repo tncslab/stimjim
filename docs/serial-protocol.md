@@ -1,11 +1,12 @@
 # stimjimAWG serial protocol reference (draft)
 
 Status: protocol version 1. Implemented: waveform definition and queries (`S`/`L`/`W`,
-`DELAY`, `ENV`/`MEAS`), `T`/`U` playback of all three slot types with the `ENV` envelope,
+`DELAY`, `DT`, `ENV`/`MEAS`), `T`/`U` playback of all three slot types with the `ENV` envelope,
 `TRIG`/`R` trigger routing, the immediate commands (`M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`),
 persistence (`P`), in-train measurement (`MEAS` execution with its `MSUM` summaries and
 `MDATA` stream), SD logging (`LOG`) with serial access to the card (the `SD` group), and
-`STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`. **Not implemented:** the button menu editor.
+`STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`, and the runtime timing budget (`CAL`).
+**Not implemented:** the button menu editor.
 See [awg-implementation-plan.md](awg-implementation-plan.md) for what remains. The legacy
 sections below double as documentation of the sibling `stimjimPulser` firmware in this
 repository; the "hardened" notes describe where stimjimAWG deliberately differs from it.
@@ -41,7 +42,7 @@ one `ReadLine()` per command and parses `E`'s `(<value><unit>)` group.
 Common header for `S`/`L`/`W`:
 `<idx>` 0–99 (slot), `<mode0>,<mode1>` per physical channel (below), `<period_us>` interval
 between pulse/burst starts, `<duration_us>` total train length, and the optional
-`<delay_us>` below.
+`<delay_us>` below — plus, on an `L` line only, the optional `<dt_us>` after it.
 
 **Optional 6th header field — `delay_us`.** A legacy header ends after `duration_us` (the next
 character is `;` or end of line), so a `,` in that position can only be the new field: the
@@ -100,7 +101,7 @@ outside {0–3, 90, 91} → `ERR` (old: silently coerced out-of-range values).
 ### `L` — piecewise-linear (ramp) train — NEW
 
 ```
-L<idx>,<mode0>,<mode1>,<period_us>,<duration_us>[,<delay_us>]; <a0>,<a1>,<dur_us>; ...
+L<idx>,<mode0>,<mode1>,<period_us>,<duration_us>[,<delay_us>[,<dt_us>]]; <a0>,<a1>,<dur_us>; ...
 ```
 
 Identical syntax to `S`; each stage **ramps linearly from the previous end value** to
@@ -112,9 +113,26 @@ L0,...;1000,-1000,200      # ramp 0 → (1000,−1000) over 200 µs
 L0,...;1000,0,0;1000,0,500 # jump to 1000, hold 500 µs (ramp from 1000 to 1000)
 ```
 
-Ramp sample interval defaults to 20 µs (engine `TARGET_DT_US`); last sample lands exactly on the
-stage boundary and end value (integer Bresenham, plan §3.5 — no rounding accumulates across
-samples or stages). Each pulse ramps from the parked offset (0) and, after the last stage
+**Optional 7th header field — `dt_us`, the ramp sample interval.** It defaults to 20 µs (the
+build's `SJ_TARGET_DT_US`) and is settable per slot, either as this field or with `DT` below.
+The field is positional, so a slot that wants an interval and no delay writes the delay as `0`;
+it is accepted on `L` lines only — on `S` and `W` a 7th field is an `ERR`, not a silently ignored
+number. Omitting it resets the interval to the build default, the same rule the delay follows.
+Range 2…1 000 000 µs at parse time; an interval below what one latch costs on this board
+(`CAL PRELOAD + DACPROG1/2 + 3 µs`) is **refused at start** with the arithmetic, because that
+budget is runtime state.
+
+A coarser interval is the honest way to make room for an in-train measurement point: the free gap
+a point lives in *is* the sample interval (§4), and stretching the interval changes how finely
+the ramp is approximated rather than what the waveform is worth measuring. The other way out is
+`MEAS` `fit`, which keeps the interval and thins the sample count instead.
+
+```
+L0,0,1,2000,1000000,0,50;4095,0,1000    # 1 ms ramp sampled every 50 µs (20 samples)
+```
+
+Last sample lands exactly on the stage boundary and end value (integer Bresenham, plan §3.5 — no
+rounding accumulates across samples or stages). Each pulse ramps from the parked offset (0) and, after the last stage
 boundary, parks and grounds like `S`: the final stage's end value is latched exactly at the
 boundary and immediately parked — append a same-value stage to hold it.
 
@@ -156,7 +174,7 @@ convert incorrectly on the DAC → `WARN` on set.
 | `B` | recalibrate ADC offsets (grounds outputs) | `OK` when done (legacy printed nothing, §6); refused while a train runs |
 | `C` | recalibrate current+voltage offsets | prints `WARN C: output will ramp` first — `getVoltageOffsets()` sweeps a voltage ramp on the outputs |
 | `D` | print offsets (human); `D?` machine CSV: `D,<adc25_0>,<adc25_1>,<adc10_0>,<adc10_1>,<ioff0>,<ioff1>,<voff0>,<voff1>` | |
-| `P` | save slots 0–9 + ENV/MEAS + TRIG table to EEPROM (versioned, checksummed) | legacy confirmation |
+| `P` | save slots 0–9 + ENV/MEAS + TRIG table + the `CAL` timing budget to EEPROM (versioned, checksummed) | legacy confirmation |
 
 ## 4. New long-form commands
 
@@ -176,6 +194,18 @@ PicoScope 2204A from the trigger edge to the first output sample, corrected for 
 between the two engines' arming: 2000 µs set → 1999.3 µs, 5000 → 5000.2, 20000 → 20002.7, the
 residual being the scope's own sample interval.
 
+### `DT` — per-train ramp sample interval
+
+```
+DT<idx>,<dt_us>              0 = the build default (SJ_TARGET_DT_US, 20 µs), else 2 .. 1000000
+DT<idx>?  →  DT<idx>,<dt_us>
+```
+
+Convenience setter for the same field an `L` header carries as its optional 7th value (§2, which
+documents the semantics, the reset-on-redefinition rule and the start-time floor). Accepted on
+`L` slots only — on an `S` or `W` slot it is an `ERR`, since neither has a sample interval —
+and refused while the slot is attached to a running train, like every other slot edit.
+
 ### `ENV` — per-train amplitude envelope
 
 ```
@@ -192,8 +222,8 @@ does not move). Validation: `rampIn + rampOut ≤ duration` else `ERR`. Default 
 ### `MEAS` — per-train measurement configuration
 
 ```
-MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>]
-MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>
+MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>[,<fit>]]
+MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>,<fit>
 ```
 
 - `what<ch>`: 0 none, 1 voltage, 2 current, 3 both. Coupled to the train-definition mode field
@@ -215,29 +245,35 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>
   the stage count below a stored selection → `ERR` (reset `MEAS` first) — same policy as a
   preserved `ENV` that no longer fits.
 - `report` bitmask: 0 end-of-train summary (always kept), +1 stream `MDATA` lines, +2 log to SD.
+- `fit`: what to do when a point's reads do not fit the free gap they live in. **0** = refuse the
+  point (nothing measured, reported twice — the pre-Phase-8 behaviour), **1** = rotate the reads
+  over consecutive repetitions (the default). Both are detailed below.
+- An omitted optional field takes its default rather than the stored value: a `MEAS` line fully
+  defines the slot's measurement configuration, the same rule `S`/`L`/`W` headers follow.
 - Repetitions (one measurement point per pulse/burst) accumulate `n`, Σv and Σv² per point,
   line and channel; the summary reports the mean **and the sample standard deviation** derived
   from those sums. This is the single-pass estimator — numerically simplified by design
   (documented trade-off; adequate for 13-bit ADC data at the repetition counts a train can
   reach), chosen so a waveform averaged over many repetitions also yields a spread estimate.
 - Defaults: `what0=what1=3`, `when=0` for `S`/`L` slots / `3` for `W` slots, `stage=-1`,
-  `report=0` — measure everything, summary only (reproduces legacy averaging behavior).
+  `report=0`, `fit=1` — measure everything, summary only (reproduces legacy averaging behavior).
 
-**How much time a measurement point needs, and when it is refused.** Each ADC value costs a
-control-register write to select the input line plus the conversion itself. The reads must end
-before the next latch event starts *programming* the DAC, which happens `SJ_PRELOAD_US +
-SJ_DAC_PROG*_US` early, and they cannot start until the previous latch has settled. So a point
-needs
+**How much time a measurement point needs.** Each ADC value costs a control-register write to
+select the input line plus the conversion itself. The reads must end before the next latch event
+starts *programming* the DAC, which happens `PRELOAD + DACPROG*` early, and they cannot start
+until the previous latch has settled. So a point needs
 
 ```
-room = (SJ_PRELOAD_US + SJ_DAC_PROG*_US)
-     + nReads * (SJ_ADC_READ_US + SJ_ADC_SWITCH_US)
-     + SJ_MEAS_GUARD_US + SJ_DAC_SETTLE_US
+room = (CAL PRELOAD + CAL DACPROG1/2)
+     + nReads * (CAL ADCREAD + CAL ADCSWITCH)
+     + CAL GUARD + CAL SETTLE
 ```
 
 `nReads` counts the values actually taken — one per selected line per driven channel — and the
-DAC programming term is `SJ_DAC_PROG1_US` when the train drives one channel, `SJ_DAC_PROG2_US`
-when it drives two. That room must fit the free gap the point lives in:
+DAC programming term is `DACPROG1` when the train drives one channel, `DACPROG2` when it drives
+two. Every term is a runtime `CAL` parameter (below), so the numbers in the tables that follow
+describe the *default* budget of a Teensy 3.5 register build and change with the calibration.
+That room must fit the free gap the point lives in:
 
 | Slot type | The free gap is |
 |---|---|
@@ -245,7 +281,7 @@ when it drives two. That room must fit the free gap the point lives in:
 | `L` | the stage's *ramp sample interval* (stage duration / N, 20 µs by default) — not the stage |
 | `W` | the sine sample interval `1/Fs`, which is never shorter than 20 µs because Fs is capped |
 
-On a Teensy 3.5 with the constants above that works out to:
+On a Teensy 3.5 with the default `CAL` budget that works out to:
 
 | What is measured | `nReads` | room | Fits an `L` train at the default 20 µs? | Highest `W` frequency |
 |---|---|---|---|---|
@@ -254,12 +290,43 @@ On a Teensy 3.5 with the constants above that works out to:
 | one line, both channels | 2 | 28 µs | no | 558 Hz |
 | V+I, both channels | 4 | 42 µs | no | 372 Hz |
 
-A point that does not fit is **refused, not squeezed**: a `WARN MEAS:` line at start names the
-required and available times, the point never fires, and the summary still emits its `MSUM`
-line with `n = 0` plus a `#` line repeating the reason. Stretching the waveform to make room
-for the instrumentation would change the delivered stimulus, so it is not done. The remedies,
-in order: measure one line (`MEAS<i>,1,1,…`), measure one channel, use `S` instead of `L`, or
-rebuild with a larger `SJ_TARGET_DT_US`.
+**The waveform is never stretched to make room for the instrumentation.** What happens instead
+depends on `fit`.
+
+*`fit = 0`, strict.* The point is **refused**: a `WARN MEAS:` line at start names the required
+and available times, the point never fires, and the summary still emits its `MSUM` line with
+`n = 0` plus a `#` line repeating the reason.
+
+*`fit = 1`, rotate (the default).* The reads are split into the smallest number of groups that
+each fit one gap, and **one group fires per repetition**, cycling by pulse index. Every read
+still happens at exactly the instant the point's label names — the stage end, or the peak sample
+— so no reading describes a different part of the waveform than it claims. What shrinks is `n`:
+each line accumulates about `nPulses / nGroups` samples. A `#` line at start states the group
+count and how thin the per-line count gets; the per-point `#` line in the summary repeats it,
+because `MSUM` has one `n` field per point and with rotation it carries the largest of the four
+lines' counts (they differ by at most one). `MDATA` needs no change — its `valid` mask already
+says which lines a row carries, so a rotated row is simply a partial one.
+
+Rotation is not magic: when not even *one* read fits the gap, the point is refused whatever
+`fit` says, and the reported requirement is then `room` for a single read — the number that
+would have to change for the point to become measurable at all. Nor does it help a train with
+fewer repetitions than groups; `planBuild` compares `duration_us / period_us` against the group
+count and warns when some lines would never be read.
+
+With rotation the same board reaches:
+
+| Case | gap | reads per gap | outcome |
+|---|---|---|---|
+| `L`, V+I both channels, `dt` 20 µs | 20 µs | 0 (needs 21) | refused — raise `dt`, or trim `CAL` |
+| `L`, V+I both channels, `dt` 25 µs | 25 µs | 1 | 4 groups: every 4th pulse per line |
+| `L`, V+I both channels, `dt` 30 µs | 30 µs | 2 | 2 groups: V+I of one channel per pulse |
+| `L`, V+I one channel, `dt` 20 µs | 20 µs | 1 | 2 groups (`room(1)` is 19 µs here) |
+| `W` 2 kHz, V+I one channel | 20 µs | 1 | 2 groups, at any frequency |
+| `W` 2 kHz, V+I both channels | 20 µs | 0 (needs 21) | refused — 1 µs short; see `CAL` |
+
+The remedies, in the order they cost least: raise the ramp interval (`DT`, `L` only), measure
+fewer lines or channels, use `S` instead of `L`, or re-measure the timing budget and set it with
+`CAL` — the last row above is refused by a single microsecond of `GUARD`.
 
 **The envelope gates measurement.** A reading taken while the `ENV` envelope is ramping
 describes an attenuated waveform, and averaging it with full-amplitude repetitions gives a mean
@@ -268,7 +335,7 @@ envelope is fully on; the skipped repetitions are counted and reported as a `#` 
 summary. Without an envelope every repetition is measured, so legacy behaviour is unchanged.
 
 **Where the reads sit.** For `S`/`L` the window ends just before the next latch's programming
-window opens (`when = 0`, "near stage end"). For `W` the reads start `SJ_DAC_SETTLE_US` *after*
+window opens (`when = 0`, "near stage end"). For `W` the reads start one `CAL SETTLE` *after*
 the peak sample latches — that sample is the value being measured — with the peak sample index
 solved at arm time from the phase accumulator. When both channels are measured but carry
 different frequencies or phases, the peaks follow the lower-numbered channel and a `WARN MEAS:`
@@ -295,12 +362,58 @@ normally absent:
 
 - `WARN engine: <n> latch(es) overran their deadline by up to <t> ns` — DAC programming for an
   event that was still in the future finished after its deadline. This is a defect: a timing
-  budget in `Config.h` is too small for this board, and `BENCH` (§4) is how to resize it.
+  budget is too small for this board: `BENCH` (§4) measures the right value and `CAL` sets it without a rebuild.
 - `# engine: <n> event(s) were already due when the player reached them` — an earlier event ran
   long. Events that share a deadline *by definition* are excluded, because that is the
   waveform's shape and not a fault: an `L` train latches its last ramp sample and then parks at
   the same stage boundary, and a `W` burst with `burst_us == period_us` puts the off event on
   top of a sample. In both cases the second latch of the pair is a few µs behind the first.
+
+### `CAL` — the hardware timing budget
+
+```
+CAL?              →  one CAL,<name>,<us> line per parameter, then OK
+CAL,<name>?       →  CAL,<name>,<us>
+CAL,<name>,<us>   →  CAL,<name>,<us>          set one parameter
+CALDEF            →  the whole set, then OK   restore this build's defaults
+```
+
+Every number the scheduler and the measurement engine budget for a hardware operation is runtime
+state, not a compiled constant. `Config.h` supplies the defaults per board and backend; `CAL`
+adjusts them on one bench without a rebuild, `P` persists them in the EEPROM image, and `DUMP`
+emits a line for each one that differs from the build default. The `IDN` `# engine:` line reports
+`cal=default` or `cal=custom`, so a session that attached later can tell whether the constants in
+`Config.h` still describe the running board.
+
+| Name | Default (T3.5 registers) | What it budgets |
+|---|---|---|
+| `PRELOAD` | 4 | how early the player ISR wakes before a latch, then spins on `CYCCNT` |
+| `DACPROG1` | 3 | `dacProgram`, one channel |
+| `DACPROG2` | 5 | `dacProgramBoth` |
+| `ADCREAD` | 3 | one conversion, line already selected |
+| `ADCSWITCH` | 4 | extra cost of a control-register line switch |
+| `GUARD` | 1 | margin between the last read and the next preload window |
+| `SETTLE` | 4 | after a latch, before a reading means anything |
+| `STARTLAT` | 20 | fixed start-request → first-latch latency |
+| `TRIGCOMP` | 0 | hardware pin edge → trigger-ISR entry, subtracted for trigger starts |
+
+All values are whole microseconds, 0…1000. They are **budgets, so they carry the measured worst
+case, not the average** (§4 `BENCH`): a single outlying read that overruns its window pushes the
+next latch late, and the engine's per-latch deadline counter reports exactly that.
+
+Refusals: a set is rejected while a train runs (the engine takes its copy at arm time, so a
+mid-train change would describe a board the running waveform is not using); `PRELOAD`,
+`DACPROG1`, `DACPROG2`, `ADCREAD` and `STARTLAT` must be at least 1 µs; `DACPROG2` cannot be
+smaller than `DACPROG1`; and `STARTLAT` must cover `PRELOAD + DACPROG2 + 3 µs` beyond `TRIGCOMP`,
+since the first latch is programmed one preload window before `t0`. A stored budget that fails
+these checks at boot is dropped with a `#` line and the build defaults stay in force.
+
+`TRIGCOMP` is the one parameter with no measured value: it is the delay from the physical edge at
+the input pin to the trigger ISR's first instruction, which software cannot see. The ISR
+timestamps the edge at its own entry and the engine measures `STARTLAT` from that timestamp, so
+interrupt entry and the arm-time precomputation are already out of the delivered latency
+whatever the train's complexity. What remains is the hardware part; set `TRIGCOMP` to it once a
+scope has measured edge-to-output, and the delivered latency becomes `STARTLAT` exactly.
 
 ### `READ` — manual averaged measurement (immediate)
 
@@ -333,7 +446,8 @@ A log has to be readable on its own, including when the trains were fired by tri
 no host attached, so the file carries:
 
 1. its own header line, the `IDN` block and the whole session configuration — the same
-   paste-back-able lines `DUMP` prints — written when the file is opened;
+   paste-back-able lines `DUMP` prints, `CAL` included, so the timing budget the readings were
+   taken with is recorded next to them — written when the file is opened;
 2. the `# columns:` names;
 3. a `# train:` block for every train that arms while the file is open, giving that slot's
    canonical `S`/`L`/`W` line plus its `ENV`/`MEAS` lines. This is what records configuration
@@ -404,13 +518,14 @@ TRIG<t>?  → canonical line
 | Cmd | Reply |
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
-| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>` and `# engine: …, K_RELOAD=<n> cycles`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)). |
+| `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>` and `# engine: …, K_RELOAD=<n> cycles, cal=<default|custom>`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)); `cal` says whether they are still the ones the board runs on, or a hand-calibrated set (`CAL?`). |
 | `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
-| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, `OK`. Paste-back restores the configuration, `TRIG` lines included (they are real set-commands). |
+| `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, one `CAL` line per hand-calibrated timing budget, `OK`. Paste-back restores the configuration, `TRIG` and `CAL` lines included (they are real set-commands). |
 | `LOG` | SD logging: status / open / close — see above. |
 | `SD` | SD file access over the serial port: `SDINFO`, `SDLIST`, `SDGET`, `SDDEL` — see above. |
 | `BENCH` | hardware benchmark group, see below. |
+| `CAL` | the hardware timing budget: `CAL?`, `CAL,<name>,<us>`, `CALDEF` — see above. |
 
 **`BENCH` group.** Timing results are printed in CPU cycles (120/µs on a Teensy 3.5) and ns; multi-line
 output ends with `OK`. `BENCH?` lists the group. DAC benches program without latching (or re-latch
@@ -431,8 +546,10 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 | `BENCHSQL,ch,code,half_us,n` | the same square wave via legacy `Stimjim.writeToDac` |
 
 **Measured on a Teensy 3.5 at 120 MHz, register backends, n = 2000** (these are the numbers the
-`Config.h` budgets are sized against; the budgets carry the *maximum*, not the average, because
-one outlying event is enough to push the next latch late):
+timing budgets are sized against — `Config.h` holds the defaults, `CAL` the running values, and
+the `SJ_*` names below are the `CAL` parameters `PRELOAD`, `ADCREAD` and `ADCSWITCH`; a budget
+carries the *maximum*, not the average, because one outlying event is enough to push the next
+latch late):
 
 | Bench | min / avg / max | What it sizes |
 |---|---|---|
@@ -451,15 +568,16 @@ one outlying event is enough to push the next latch late):
 
 | Item | Default |
 |---|---|
-| Slot (boot, all 100) | mode0=mode1=3 (grounded = not driven), period=10000 µs, duration=500000 µs, delay=0 µs, 0 stages, type=S |
+| Slot (boot, all 100) | mode0=mode1=3 (grounded = not driven), period=10000 µs, duration=500000 µs, delay=0 µs, dt=0 (build default), 0 stages, type=S |
 | `DELAY` | 0 (fire on the start request); reset to 0 by any `S`/`L`/`W` line without the 6th header field |
 | `ENV` | 0,0,0 (no ramp) |
-| `MEAS` | 3,3,auto-when (0 for S/L, 3 for W),-1 (all stages),0 (summary only) |
+| `MEAS` | 3,3,auto-when (0 for S/L, 3 for W),-1 (all stages),0 (summary only),1 (rotate reads that do not fit) |
 | `READ` sample count | 16 |
 | Triggers | both `TRIG<t>,3,-1,-1,0` (output marker) |
 | `R` third argument | 0 (trigger-input mode) |
-| Ramp sample interval | 20 µs (`TARGET_DT_US`) |
-| EEPROM restore | overrides boot defaults for slots 0–9 + ENV/MEAS/DELAY + TRIG when version+checksum valid (image v4; older images are rejected outright, never re-interpreted) |
+| Ramp sample interval | 20 µs (`SJ_TARGET_DT_US`); per slot via the `L` 7th header field or `DT` |
+| `CAL` timing budget | this build's `Config.h` values, tabulated in §4; `CALDEF` restores them |
+| EEPROM restore | overrides boot defaults for slots 0–9 + ENV/MEAS/DELAY/DT + TRIG + the `CAL` budget when version+checksum valid (image v5; older images are rejected outright, never re-interpreted; a stored budget that fails validation is dropped on its own) |
 | Serial | USB CDC — baud irrelevant (fixes the `Serial.begin(112500)` typo) |
 
 ## 6. Compatibility appendix

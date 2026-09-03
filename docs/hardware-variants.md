@@ -12,10 +12,10 @@ Build status (Teensyduino 1.62.0, `--warnings more`, zero warnings):
 
 | Target | Command | Result |
 |---|---|---|
-| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 157 KB flash, 37.7 KB RAM |
-| Teensy 3.5 (portable backends) | `--fqbn teensy:avr:teensy35 -DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | builds clean, 159 KB flash |
-| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | 136 KB flash, RAM1 56.5 KB |
-| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | 93 KB flash — no SD, see below |
+| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 163 KB flash, 38.4 KB RAM |
+| Teensy 3.5 (portable backends) | `--fqbn teensy:avr:teensy35 -DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | builds clean, 164 KB flash |
+| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | 139 KB flash, RAM1 59.2 KB |
+| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | 97 KB flash — no SD, see below |
 
 Only the Teensy 3.5 register build has been run on hardware. The others compile and are
 structurally correct; they are untested silicon until someone runs the bench list in §4.
@@ -73,8 +73,8 @@ an `end()` + `begin()` pair per scheduled event.
 
 That cost is absorbed rather than hand-tuned: `K_RELOAD` is calibrated closed-loop at boot by
 running the *real* scheduling path and measuring when the timer actually fires, so it takes on
-whatever the selected backend costs. Only `SJ_PRELOAD_US` and the DAC budgets are constants a
-human must set.
+whatever the selected backend costs. Only the `CAL` preload and DAC budgets are numbers a
+human must set — and those are settable at runtime, not compiled in.
 
 A native LPSPI4 + shared-vector PIT backend remains a worthwhile optimization, but it is not a
 prerequisite for running on a Teensy 4.
@@ -96,19 +96,28 @@ literal tuned for 120 MHz becomes five times shorter at 600 MHz:
 
 ## 4. What must be recalibrated, and how
 
-Everything in this list is a constant in `Config.h` marked `RECALIBRATE`. Run the benches with
-nothing else going on, in this order:
+Everything in this list is a `CAL` parameter (protocol §4) whose default lives in `Config.h`
+marked `RECALIBRATE`. Measure on the board, set it with `CAL,<name>,<us>`, check the train, then
+`P` to persist — no rebuild in the loop. Editing `Config.h` is still the right move once a value
+is known to be wrong on *every* board of that type. Run the benches with nothing else going on,
+in this order:
 
 | Command | Sets | Note |
 |---|---|---|
-| `BENCHDAC` / `BENCHDAC2` | `SJ_DAC_PROG1_US` / `SJ_DAC_PROG2_US` | round up; the portable route pays an extra `beginTransaction`/`endTransaction` per word |
-| `BENCHADC` / `BENCHSW` | `SJ_ADC_READ_US` / `SJ_ADC_SWITCH_US` — the measurement budget (plan §3.6) | carry the **maximum**, not the average: one outlying read pushes the next latch late. `BENCHSW` also answers bench-verify item 1, first-conversion validity after a line switch |
-| a scope on one output | `SJ_DAC_SETTLE_US`, `SJ_MEAS_GUARD_US` | how long after a latch a reading means anything; the floor is also the player's own post-latch bookkeeping, ~3.2 µs on the register path |
+| `BENCHDAC` / `BENCHDAC2` | `DACPROG1` / `DACPROG2` | round up; the portable route pays an extra `beginTransaction`/`endTransaction` per word |
+| `BENCHADC` / `BENCHSW` | `ADCREAD` / `ADCSWITCH` — the measurement budget (plan §3.6) | carry the **maximum**, not the average: one outlying read pushes the next latch late. `BENCHSW` also answers bench-verify item 1, first-conversion validity after a line switch |
+| a scope on one output | `SETTLE`, `GUARD` | how long after a latch a reading means anything; the floor is also the player's own post-latch bookkeeping, ~3.2 µs on the register path |
 | `BENCHMISO` | confirms the mux swap does not glitch the first bit | on the portable route this covers `SPI.setMISO` instead of the PORT mux |
-| `BENCHPIT,1000,5000` | `SJ_PRELOAD_US` — raw ISR wake latency | the portable route wakes later: `IntervalTimer::begin()` is slower than writing `LDVAL` |
-| `BENCHPIT,1000,5000,<preload>` | acceptance: residual latch jitter must stay < 200 ns | if it does not, raise `SJ_PRELOAD_US` |
+| `BENCHPIT,1000,5000` | `PRELOAD` — raw ISR wake latency | the portable route wakes later: `IntervalTimer::begin()` is slower than writing `LDVAL` |
+| `BENCHPIT,1000,5000,<preload>` | acceptance: residual latch jitter must stay < 200 ns | if it does not, raise `PRELOAD` |
 | `BENCHK` | spread of the boot `K_RELOAD` calibration | the constant itself is self-calibrated; this only checks it is stable |
 | `BENCHSQ` vs `BENCHSQL` | scope A/B of the FastIO path against `Stimjim.writeToDac` | the shape check for a new FastIO backend |
+| a scope on the trigger input and one output | `TRIGCOMP` — pin edge to ISR entry | the delivered latency is `STARTLAT` once this is set; everything from the ISR's first instruction onwards is already compensated |
+
+`STARTLAT` has to cover `PRELOAD + DACPROG2 + 3 µs` beyond `TRIGCOMP`, which is why the portable
+default is 40 µs against the register path's 20: its programming budgets are twice as wide.
+`Cal::validate` refuses a set that breaks the relation, and reports it at boot if a build's own
+defaults do.
 
 Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
 which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the
@@ -130,12 +139,12 @@ reference a new board's numbers should be compared against.
 
 ```
 # build: Teensy3.5, F_CPU=120 MHz, fastio=registers, timer=raw-PIT, sd=yes
-# engine: PIT channels 0/1, K_RELOAD=96 cycles
+# engine: PIT channels 0/1, K_RELOAD=96 cycles, cal=default
 ```
 
 ## 5. EEPROM size
 
-The persisted image (slots 0–9 plus the trigger table, ~1.6 KB) fits the 4096 B EEPROM of the
+The persisted image (slots 0–9, the trigger table and the CAL budget, ~1.7 KB) fits the 4096 B EEPROM of the
 Teensy 3.5 and the 4284 B of the Teensy 4.1, but **not** the 1080 B of a Teensy 4.0. Since
 `EEPROM.put()` past `E2END` is a silent no-op in the Teensy core, an image that does not fit
 would appear to save and then restore as garbage. `TrainStore.cpp` therefore static_asserts the

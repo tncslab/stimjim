@@ -31,12 +31,14 @@ void slotDefault(TrainDef& t) {
   t.period_us   = 10000;
   t.duration_us = 500000;
   t.delay_us    = 0;          // fire immediately on the start request
+  t.dt_us       = 0;          // ramp sample interval: use the build default
   t.nStages     = 0;
   t.meas.what0  = 3;          // both V and I
   t.meas.what1  = 3;
   t.meas.when   = 0;          // auto default for S/L (3 = both peaks for SINE), see defaultWhen()
   t.meas.stage  = -1;         // all stages
   t.meas.report = 0;          // end-of-train summary only
+  t.meas.fit    = SJ_FIT_ROTATE;  // rotate reads over repetitions rather than refuse a point
 }
 
 void begin() {
@@ -53,7 +55,7 @@ uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 bool isDefaultTrain(const TrainDef& t) {
   return t.type == PIECEWISE_HOLD && t.mode0 == 3 && t.mode1 == 3 &&
          t.period_us == 10000 && t.duration_us == 500000 &&
-         t.delay_us == 0 && t.nStages == 0;
+         t.delay_us == 0 && t.dt_us == 0 && t.nStages == 0;
 }
 bool isDefaultEnv(const EnvDef& e) {
   return e.rampIn_us == 0 && e.rampOut_us == 0 && e.shape == 0;
@@ -61,7 +63,7 @@ bool isDefaultEnv(const EnvDef& e) {
 bool isDefaultMeas(const TrainDef& t) {
   return t.meas.what0 == 3 && t.meas.what1 == 3 &&
          t.meas.when == defaultWhen(t.type) && t.meas.stage == -1 &&
-         t.meas.report == 0;
+         t.meas.report == 0 && t.meas.fit == SJ_FIT_ROTATE;
 }
 
 // -------------------------------------------------------------- scan helpers
@@ -222,6 +224,28 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
     staged.delay_us = 0;
   }
 
+  // ---- optional 7th header field: the ramp sample interval, `L` only. It is
+  // positional, so a slot that wants a custom interval and no delay writes the
+  // delay as 0. Omitting it resets the interval to the build default, for the
+  // same reason omitting the delay resets that: a waveform line fully defines
+  // its own header.
+  staged.dt_us = 0;
+  p = sksp(p);
+  if (*p == ',') {
+    p++;
+    unsigned long dt;
+    if (staged.type != PIECEWISE_RAMP) {
+      setMsg(err, errsz, "only an L line takes a 7th header field (ramp sample interval)");
+      return false;
+    }
+    if (!scanULong(p, dt)) { setMsg(err, errsz, "bad dt_us"); return false; }
+    if (dt < SJ_MIN_DT_US || dt > SJ_MAX_DT_US) {
+      setMsg(err, errsz, "dt_us must be 2..1000000 us (0 = the build default, omit the field)");
+      return false;
+    }
+    staged.dt_us = (uint32_t)dt;
+  }
+
   if (staged.type != SINE) {
     // ---- S/L stage triplets: ;a0,a1,dur_us  (0-10 of them; 0 = legacy "empty train")
     unsigned long durSum = 0;
@@ -351,6 +375,8 @@ const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t
   if (warn && warnsz) warn[0] = '\0';
   if (m.what0 > 3 || m.what1 > 3) return "what must be 0-3";
   if (m.report > 3)               return "report must be 0-3 (+1 stream, +2 SD)";
+  if (m.fit > SJ_FIT_ROTATE)
+    return "fit must be 0 (refuse a point that does not fit) or 1 (rotate over repetitions)";
   if (t.type == SINE) {
     if (m.when < 1 || m.when > 3) return "sine slots require when 1 (+peak), 2 (-peak) or 3 (both)";
     if (m.stage != -1)            return "sine slots have no stages — stage must be -1";
@@ -395,11 +421,14 @@ void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n) {
   size_t o = snprintf(buf, n, "%c%u,%u,%u,%lu,%lu", letter, idx,
                       modeOut(t.mode0, t.meas.what0), modeOut(t.mode1, t.meas.what1),
                       (unsigned long)t.period_us, (unsigned long)t.duration_us);
-  // The optional delay field is emitted only when it is set, so a slot that
-  // uses no delay still serializes to a line an older firmware would accept.
-  // Round-trip stays exact: an absent field parses back as 0.
-  if (t.delay_us)
+  // The optional delay and ramp-interval fields are emitted only when set, so
+  // a slot that uses neither still serializes to a line an older firmware
+  // would accept. Round-trip stays exact: an absent field parses back as 0.
+  // They are positional, so a set interval forces the delay field out too.
+  if (t.delay_us || t.dt_us)
     o += snprintf(buf + o, n - o, ",%lu", (unsigned long)t.delay_us);
+  if (t.dt_us)
+    o += snprintf(buf + o, n - o, ",%lu", (unsigned long)t.dt_us);
   if (t.type == SINE) {
     char f0[16], f1[16], p0[16], p1[16];
     milliToStr(t.sine.freq0_mHz, f0);
@@ -424,13 +453,18 @@ void serializeDelay(uint8_t idx, uint32_t delay_us, char* buf, size_t n) {
   snprintf(buf, n, "DELAY%u,%lu", idx, (unsigned long)delay_us);
 }
 
+void serializeDt(uint8_t idx, uint32_t dt_us, char* buf, size_t n) {
+  snprintf(buf, n, "DT%u,%lu", idx, (unsigned long)dt_us);
+}
+
 void serializeEnv(uint8_t idx, const EnvDef& e, char* buf, size_t n) {
   snprintf(buf, n, "ENV%u,%lu,%lu,%u", idx,
            (unsigned long)e.rampIn_us, (unsigned long)e.rampOut_us, e.shape);
 }
 
 void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n) {
-  snprintf(buf, n, "MEAS%u,%u,%u,%u,%d,%u", idx, m.what0, m.what1, m.when, m.stage, m.report);
+  snprintf(buf, n, "MEAS%u,%u,%u,%u,%d,%u,%u", idx, m.what0, m.what1, m.when,
+           m.stage, m.report, m.fit);
 }
 
 // --------------------------------------------------------------------- EEPROM
@@ -467,11 +501,13 @@ void eepromSave(const TriggerRoute trig[2]) {
   memcpy(eeImg.slots, slots, sizeof(eeImg.slots));
   eeImg.trig[0] = trig[0];
   eeImg.trig[1] = trig[1];
+  eeImg.cal     = Cal::live();
   eeImg.crc = crc16((const uint8_t*)&eeImg + offsetof(EepromImage, slots), EE_CRC_SPAN);
   EEPROM.put(0, eeImg);
 }
 
-bool eepromRestore(TriggerRoute trigOut[2]) {
+bool eepromRestore(TriggerRoute trigOut[2], bool* calRejected) {
+  if (calRejected) *calRejected = false;
   EEPROM.get(0, eeImg);
   if (eeImg.magic != SJ_EEPROM_MAGIC || eeImg.version != SJ_EEPROM_VERSION)
     return false;
@@ -480,6 +516,13 @@ bool eepromRestore(TriggerRoute trigOut[2]) {
   memcpy(slots, eeImg.slots, sizeof(eeImg.slots));
   trigOut[0] = eeImg.trig[0];
   trigOut[1] = eeImg.trig[1];
+  // A stored budget that no longer validates is dropped and the build defaults
+  // stay in force: the image may predate a Config.h change that moved a floor,
+  // and arming from an inconsistent budget is worse than losing a calibration.
+  // The slots are kept either way — they are checked by the same CRC. Nothing
+  // in this module prints, so the caller reports it.
+  if (Cal::validate(eeImg.cal) == nullptr) Cal::set(eeImg.cal);
+  else if (calRejected) *calRejected = true;
   return true;
 }
 #endif // ARDUINO

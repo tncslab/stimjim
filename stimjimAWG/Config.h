@@ -122,6 +122,13 @@
 
 // ------------------------------------------------- engine knobs (plan §3.1)
 //
+// The nine hardware timing budgets below are the *defaults* of the runtime
+// `CAL` parameter set (Cal.h): the engine arms from Cal::live(), which starts
+// as a copy of these and can be changed over the serial port and persisted
+// with `P`. Editing this file is still the right move for a value that is
+// wrong on every board of a given type; `CAL` is for calibrating one bench
+// without a rebuild. `CAL?` prints what a running board actually uses.
+//
 // RECALIBRATE all of the following whenever the MCU, the clock speed or a
 // backend changes. Procedure, in this order, with nothing else running:
 //   BENCHDAC / BENCHDAC2          -> SJ_DAC_PROG1_US / SJ_DAC_PROG2_US (round up)
@@ -176,8 +183,18 @@
 
 #define SJ_MIN_SCHEDULE_US   3         // events closer than this are run inline in the same ISR pass
 #define SJ_MAX_SLICE_US      10000000  // 10 s: chunk longer gaps (PIT max ~71 s; keeps cycles64 alive)
-#define SJ_START_LATENCY_US  20        // fixed arm->first-latch latency: trigger latency is deterministic
-#define SJ_TARGET_DT_US      20        // default ramp sample interval (per-train overridable later)
+// Fixed arm->first-latch latency, which is what makes the trigger latency
+// deterministic. It must cover a preload plus a dual-channel DAC program plus
+// SJ_MIN_SCHEDULE_US (Cal::validate refuses a set that does not), so the
+// portable route — whose program budget is twice the register path's — needs a
+// wider one. A trigger-started train subtracts the CAL TRIGCOMP parameter from
+// it, so the sum of the two is what the hardware actually has to cover.
+#if SJ_TIMER_REGISTER && SJ_FASTIO_REGISTER
+  #define SJ_START_LATENCY_US 20
+#else
+  #define SJ_START_LATENCY_US 40       // RECALIBRATE with the other portable budgets
+#endif
+#define SJ_TARGET_DT_US      20        // default ramp sample interval; per-train override: TrainDef.dt_us
 // SJ_MAX_DELAY_US (per-slot post-trigger delay ceiling) lives in WaveformDef.h:
 // the host-testable parser validates against it and never includes this file.
 

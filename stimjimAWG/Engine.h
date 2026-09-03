@@ -34,13 +34,20 @@ uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU 
 // ------------------------------------------------------------------- players
 //
 // Start `def` (copied — copy-on-arm, live serial editing stays safe) on engine
-// 0 (`T`) or 1 (`U`). The first latch happens at now + SJ_START_LATENCY_US in
-// timer-ISR context, never in the caller context. All slot types play.
-// Returns false with a short reason in err (busy engine, channel conflict
-// with the other engine, sine frequency above Fs/2) — caller prints the
-// WARN/ERR (ignore-and-warn policy, plan §2.5).
+// 0 (`T`) or 1 (`U`). The first latch happens one CAL STARTLAT after the start
+// request, in timer-ISR context, never in the caller context. All slot types
+// play. Returns false with a short reason in err (busy engine, channel
+// conflict with the other engine, sine frequency above Fs/2, ramp interval
+// below the board's per-sample budget) — caller prints the WARN/ERR
+// (ignore-and-warn policy, plan §2.5).
+//
+// anchorCyc: the cycle count at which the start was *requested*, or 0 for
+// "now". The trigger ISRs timestamp the edge at entry and pass it, which keeps
+// interrupt entry and this function's own precomputation out of the delivered
+// trigger-to-output latency; CAL TRIGCOMP then covers the hardware
+// pin-to-ISR-entry delay that software cannot see.
 bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
-                char* err, size_t errsz);
+                char* err, size_t errsz, uint64_t anchorCyc = 0);
 
 // `T-1`/`U-1` (loop context): disarm under busLock, park the DACs on their
 // offsets and ground the claimed channels. Safe no-op when idle.

@@ -23,7 +23,8 @@ namespace TrainStore {
 void begin();   // initialize all slots to defaults (EEPROM restore is separate)
 
 // Boot default (protocol §5): grounded (not-driven) modes, period 10 ms,
-// duration 500 ms, 0 stages, type S; ENV 0,0,0; MEAS 3,3,auto-when,-1,0.
+// duration 500 ms, 0 stages, type S, build-default ramp interval; ENV 0,0,0;
+// MEAS 3,3,auto-when,-1,0,1 (rotate reads rather than refuse a point).
 void slotDefault(TrainDef& t);
 
 TrainDef&       slot(uint8_t idx);         // idx asserted < SJ_NUM_SLOTS by caller
@@ -52,6 +53,7 @@ void commit(uint8_t idx, const TrainDef& staged);   // atomic slot replacement
 // Canonical one-line set-commands (protocol §1 query contract), no spaces.
 void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n);
 void serializeDelay(uint8_t idx, uint32_t delay_us, char* buf, size_t n);
+void serializeDt(uint8_t idx, uint32_t dt_us, char* buf, size_t n);
 void serializeEnv(uint8_t idx, const EnvDef& e, char* buf, size_t n);
 void serializeMeas(uint8_t idx, const MeasDef& m, char* buf, size_t n);
 
@@ -67,11 +69,13 @@ bool isDefaultMeas(const TrainDef& t);        // auto-when aware
 
 // ------------------------------------------------------------------- EEPROM
 #ifdef ARDUINO
-// `P`: persist slots 0-9 + the trigger table as EepromImage (versioned,
-// CRC-16/CCITT). eepromRestore returns false (and touches nothing) unless
-// magic, version and CRC all match.
+// `P`: persist slots 0-9, the trigger table and the CAL timing budget as
+// EepromImage (versioned, CRC-16/CCITT). eepromRestore returns false (and
+// touches nothing) unless magic, version and CRC all match. A stored budget
+// that no longer passes Cal::validate is dropped — the build defaults stay in
+// force and *calRejected is set, for the caller to report.
 void eepromSave(const TriggerRoute trig[2]);
-bool eepromRestore(TriggerRoute trigOut[2]);
+bool eepromRestore(TriggerRoute trigOut[2], bool* calRejected = nullptr);
 #endif
 
 } // namespace TrainStore

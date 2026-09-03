@@ -310,6 +310,13 @@ latch jitter is **42 ns** against a 200 ns target, and every latch of every wave
 its deadline with measurement enabled — checked by the engine's own per-latch deadline
 comparison rather than by a scope, so any board can be re-qualified over the serial port alone.
 
+**Also built.** The timing budgets are runtime state (`Cal.h`, the `CAL` command group, persisted
+by `P` and reported by `IDN`), the ramp sample interval is per slot (`L`'s 7th header field or
+`DT`), and a measurement point whose reads do not fit its free gap rotates them over consecutive
+repetitions instead of being refused (`MEAS` `fit`). The trigger ISRs timestamp the edge and the
+engine measures the start latency from that timestamp, so interrupt entry and the arm-time
+precomputation no longer land on the delivered trigger-to-output latency.
+
 **Remaining work.**
 
 - **Sine ceiling and dual-channel collisions.** `SJ_FS_MAX_HZ` is still the desk estimate. A
@@ -318,11 +325,10 @@ comparison rather than by a scope, so any board can be re-qualified over the ser
   the SPI bus) has not been measured, and that is what sets the published FsMax table with its
   ~30 % margin. The remaining scope work is long-run drift (≤ 1 µs cumulative over a 10 s train)
   and the full trigger-latency battery.
-- **Measurement coverage.** A V+I measurement on both channels needs 42 µs of free gap, which an
-  `L` train at the default 20 µs ramp interval cannot give at all and a `W` train gives only
-  below 372 Hz (the full table is in [serial-protocol.md](serial-protocol.md) §4). Two ways out,
-  neither built: a per-train ramp sample interval, and splitting a point's reads across
-  consecutive sample gaps (the fallback §7 already anticipated).
+- **Two numbers still guessed, both now one serial line from correct.** `CAL SETTLE` (the AD5752
+  settling time, bench-verify item 2) and `CAL TRIGCOMP` (the pin-edge-to-ISR-entry delay of the
+  trigger path) need a scope. Until then `SETTLE` carries the player's own post-latch bookkeeping
+  cost and `TRIGCOMP` is 0.
 - **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`).
 
 ## 7. Bench-verify, don't guess
@@ -332,9 +338,9 @@ comparison rather than by a scope, so any board can be re-qualified over the ser
    the line already selected. The switch therefore costs ~2.4 µs and the conversion following it
    is valid; the budget carries 7 µs so the worst case is covered outright.
 2. AD5752 output settling vs NLDAC — **still open on the scope**, and it is the one number that
-   bounds the shortest useful measured stage. `SJ_DAC_SETTLE_US` is 4 µs, chosen because that is
+   bounds the shortest useful measured stage. `CAL SETTLE` is 4 µs, chosen because that is
    what the player's own post-latch bookkeeping costs anyway; whether the DAC needs more is
-   unknown.
+   unknown. Measuring it now costs one `CAL,SETTLE,<us>` line instead of a rebuild.
 3. MISO PORT-mux swap at register level — **measured**: `BENCHMISO` alternates channels at
    2.29 µs per read, statistically the same as a same-channel read, and the readings are
    plausible on both channels, so the swap costs nothing and glitches nothing.
@@ -347,7 +353,11 @@ comparison rather than by a scope, so any board can be re-qualified over the ser
 6. `K_RELOAD` boot-calibration variance — **measured**: `BENCHK` residuals span 11 cycles
    (92 ns) over 200 repetitions, and boot-to-boot values sit between 84 and 98 cycles. The
    closed-loop calibration is what makes that spread irrelevant.
+7. Trigger pin edge to ISR entry — **still open on the scope**, and the only part of the
+   trigger-to-output latency software cannot see: the ISR timestamps the edge at its own first
+   instruction, so everything after that is already compensated. `CAL TRIGCOMP` carries the
+   hardware part and is 0 until measured.
 
-Fallbacks: latch jitter too high → increase `PRELOAD`; ISR cost too high → lower FsMax and/or
+Fallbacks: latch jitter too high → increase `CAL PRELOAD`; ISR cost too high → lower FsMax and/or
 split measurement into a follow-up event; raw-register SPI troublesome → temporary SPI-library
 fallback inside the same FastIO API (≈30–50 kS/s dual, still meets pulse-train specs).

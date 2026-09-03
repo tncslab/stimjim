@@ -8,6 +8,7 @@
 #include "SampleGen.h"
 #include "Triggers.h"
 #include "Measure.h"
+#include "Cal.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -427,15 +428,33 @@ static int16_t ampToCode(int32_t amp, uint8_t mode, uint8_t ch) {
 }
 
 bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
-                char* err, size_t errsz) {
+                char* err, size_t errsz, uint64_t anchorCyc) {
   Player& pl = player[eng];
   if (pl.active) {
     snprintf(err, errsz, "engine busy (slot %u) — start dropped, stop with %c-1",
              pl.slot, eng ? 'U' : 'T');
     return false;
   }
+  // The timing budgets are runtime state (Cal.h): one copy is taken here and
+  // used for the whole arm, so a `CAL` line that lands mid-arm cannot make one
+  // train use two different budgets.
+  const Cal::Def cal = Cal::live();
   uint8_t mask = (uint8_t)(((def.mode0 <= 1) ? 1 : 0) | ((def.mode1 <= 1) ? 2 : 0));
   if (def.type != SINE && def.nStages == 0) mask = 0;   // empty train: bookkeeping only
+  // Programming budget of one latch on this train: the preload spin plus the
+  // DAC write, which costs more when both channels are driven.
+  const uint32_t progUs = (uint32_t)cal.us[Cal::PRELOAD] +
+                          (mask == 0b11 ? cal.us[Cal::DACPROG2] : cal.us[Cal::DACPROG1]);
+  const uint32_t dtUs   = def.dt_us ? def.dt_us : (uint32_t)SJ_TARGET_DT_US;
+  if (def.type == PIECEWISE_RAMP && mask && dtUs < progUs + SJ_MIN_SCHEDULE_US) {
+    // A ramp interval below what one latch costs would schedule samples the
+    // player cannot program in time — every one of them late. Refused here
+    // rather than at parse time because the budget is a runtime quantity.
+    snprintf(err, errsz, "ramp interval %lu us is below the %lu us this board needs "
+             "per sample — start dropped", (unsigned long)dtUs,
+             (unsigned long)(progUs + SJ_MIN_SCHEDULE_US));
+    return false;
+  }
   if (def.type == SINE && mask) {
     // Nyquist gate: above Fs/2 the phase increment exceeds half a turn per
     // sample — unrepresentable. Checked here (not at parse time) because
@@ -498,15 +517,14 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
     // the offset at pulse start) to its own programmed value (plan §3.5)
     for (uint8_t i = 0; i < pl.nStages; i++)
       SampleGen::rampStageInit(pl.rst[i], def.stages[i].dur_us, SJ_CYC_PER_US,
-                               SJ_TARGET_DT_US,
+                               dtUs,
                                i ? pl.d0[i - 1] : 0, pl.d0[i],
                                i ? pl.d1[i - 1] : 0, pl.d1[i]);
   }
 
   pl.periodCyc   = SJ_US_TO_CYC(def.period_us);
   pl.durationCyc = SJ_US_TO_CYC(def.duration_us);
-  pl.preloadCyc  = (uint32_t)SJ_US_TO_CYC(SJ_PRELOAD_US +
-                     (mask == 0b11 ? SJ_DAC_PROG2_US : SJ_DAC_PROG1_US));
+  pl.preloadCyc  = (uint32_t)SJ_US_TO_CYC(progUs);
   pl.nPulses     = 0;
   pl.lateEvents  = 0;
   pl.maxLateCyc  = 0;
@@ -540,22 +558,33 @@ bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   geo.phaseInc[0]  = pl.phaseInc0;
   geo.phaseInc[1]  = pl.phaseInc1;
   geo.preloadCyc   = pl.preloadCyc;
-  geo.adcReadCyc   = (uint32_t)SJ_US_TO_CYC(SJ_ADC_READ_US);
-  geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(SJ_ADC_SWITCH_US);
-  geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(SJ_MEAS_GUARD_US);
-  geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(SJ_DAC_SETTLE_US);
+  geo.adcReadCyc   = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCREAD]);
+  geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCSWITCH]);
+  geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::GUARD]);
+  geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::SETTLE]);
   Measure::armPlan(eng, slotIdx, def, geo);
   pl.meas = Measure::hasPlan(eng);
 
   // t0 is taken *after* all precomputation so the arm->first-latch latency
-  // stays the fixed START_LATENCY regardless of train complexity. The slot's
+  // stays the fixed STARTLAT regardless of train complexity. The slot's
   // delay_us is added on top: the train's whole timebase (pulse grid, envelope,
   // duration) starts at t0, so the delay shifts the waveform without changing
   // its length. It applies to every start path — trigger edge, T/U and menu —
   // so a delay can be verified over the serial port before it is wired to a
   // trigger.
+  //
+  // A caller that knows *when* the start was requested passes that cycle count
+  // as `anchorCyc` (the trigger ISR timestamps the edge at its entry). t0 is
+  // then measured from the request instead of from the end of this function,
+  // so neither interrupt entry nor the precomputation above shows up in the
+  // delivered latency, whatever the train's complexity. TRIGCOMP is the one
+  // part that remains outside software's view — the hardware pin-to-ISR-entry
+  // delay — and is subtracted so that edge + STARTLAT is what the output sees.
+  // It defaults to 0: uncompensated until someone measures it on a scope.
   pl.delayCyc    = SJ_US_TO_CYC(def.delay_us);
-  pl.t0          = FastIO::cycles64() + SJ_US_TO_CYC(SJ_START_LATENCY_US) + pl.delayCyc;
+  const uint64_t base = anchorCyc ? anchorCyc - SJ_US_TO_CYC(cal.us[Cal::TRIGCOMP])
+                                  : FastIO::cycles64();
+  pl.t0          = base + SJ_US_TO_CYC(cal.us[Cal::STARTLAT]) + pl.delayCyc;
   pl.pulseStart  = pl.t0;
   if (pl.type == SINE) {               // first burst starts at t0
     pl.evPhase = EV_SAMP;

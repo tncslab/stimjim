@@ -5,6 +5,7 @@
 #define STIMJIMAWG_WAVEFORMDEF_H
 
 #include <stdint.h>
+#include "Cal.h"       // EepromImage carries the CAL timing budget
 
 #define SJ_NUM_SLOTS    100
 #define SJ_MAX_STAGES   10
@@ -17,6 +18,12 @@
 // Ceiling of the per-slot post-trigger delay (2000 s). Defined here rather than in
 // Config.h because the host-testable parser validates against it.
 #define SJ_MAX_DELAY_US 2000000000u
+// Bounds of the per-train ramp sample interval (`L` only; 0 = use the build
+// default SJ_TARGET_DT_US). The floor here is a parser sanity bound only — the
+// interval the player can actually keep up with depends on the CAL budgets and
+// is checked at start, which is where the arithmetic is known.
+#define SJ_MIN_DT_US 2u
+#define SJ_MAX_DT_US 1000000u
 
 enum TrainType : uint8_t {
   PIECEWISE_HOLD = 0,   // `S` — rectangular steps, legacy bit-exact semantics
@@ -48,12 +55,21 @@ struct EnvDef {
 // onto what=0); when: type-specific — S/L: 0 = near stage end; W: 1 = +peak,
 // 2 = -peak, 3 = both peaks (one period per burst); stage: -1 = all stages,
 // 0..nStages-1 = that stage only (S/L; W requires -1);
-// report bitmask: +1 stream MDATA, +2 log to SD (summary always kept).
+// report bitmask: +1 stream MDATA, +2 log to SD (summary always kept);
+// fit: what to do when the reads of one point do not fit the free gap they
+// live in — 0 = refuse the point (loud, nothing measured), 1 = rotate, i.e.
+// split the reads into groups that do fit and fire one group per repetition.
+// Rotation never moves a read away from the instant its label names; it only
+// spreads the lines over consecutive repetitions, so each line accumulates
+// about nPulses/nGroups samples.
 struct MeasDef {
   uint8_t what0, what1, when;
   int8_t  stage;
   uint8_t report;
+  uint8_t fit;
 };
+#define SJ_FIT_STRICT 0
+#define SJ_FIT_ROTATE 1
 
 struct TrainDef {
   uint8_t  type;          // TrainType
@@ -65,6 +81,10 @@ struct TrainDef {
   uint32_t delay_us;      // wait between the start request (trigger edge, T/U or
                           // menu) and the train's first sample; 0 = legacy
                           // behaviour. Optional 6th header field of S/L/W.
+  uint32_t dt_us;         // `L` only: ramp sample interval, 0 = SJ_TARGET_DT_US.
+                          // Optional 7th header field of an L line, or `DT`.
+                          // A coarser interval is how a ramp makes room for a
+                          // measurement point (docs/serial-protocol.md §4).
   uint8_t  nStages;       // used by PIECEWISE_* only
   union {
     StageDef stages[SJ_MAX_STAGES];
@@ -85,16 +105,18 @@ struct TriggerRoute {
 // EEPROM image (written by `P`): versioned + checksummed so a
 // layout change can never mis-restore silently. v3: MeasDef gained the stage
 // field and modes returned to the original 0-3 numbering. v4: TrainDef gained
-// delay_us. An image of an older version is rejected outright and boot
-// defaults apply — never re-interpreted.
+// delay_us. v5: TrainDef gained dt_us, MeasDef gained fit, and the image
+// carries the CAL timing budget. An image of an older version is rejected
+// outright and boot defaults apply — never re-interpreted.
 struct EepromImage {
   uint32_t     magic;    // 'S''J''A''W' = 0x534A4157
   uint16_t     version;  // SJ_EEPROM_VERSION
   uint16_t     crc;      // CRC-16/CCITT over everything after this field
   TrainDef     slots[SJ_EEPROM_SLOTS];
   TriggerRoute trig[2];
+  Cal::Def     cal;      // restored only if it still validates (Cal::validate)
 };
 #define SJ_EEPROM_MAGIC   0x534A4157u
-#define SJ_EEPROM_VERSION 4
+#define SJ_EEPROM_VERSION 5
 
 #endif // STIMJIMAWG_WAVEFORMDEF_H

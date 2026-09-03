@@ -1,12 +1,14 @@
 """On-target smoke test for stimjimAWG over the USB serial port.
 
 Covers what can be checked without an oscilloscope: identity, backward
-compatibility of the command grammar, the new per-slot start delay (set both
-ways, queried, and timed end-to-end against STAT), in-train measurement
-(MSUM/MDATA and the refusal of a point whose ADC window does not fit), SD
-logging with length-framed retrieval over the serial port, and the OLED
-framebuffer in each of its three views. Waveform shape and microsecond-accurate
-delay timing need the scope -- see capture.py.
+compatibility of the command grammar, the per-slot start delay (set both ways,
+queried, and timed end-to-end against STAT), the runtime timing budget (CAL:
+query, set, the invariant refusals, CALDEF), the per-slot ramp sample interval
+(DT), in-train measurement (MSUM/MDATA, the refusal of a point whose ADC window
+does not fit, and the rotation that measures it anyway), SD logging with
+length-framed retrieval over the serial port, and the OLED framebuffer in each
+of its three views. Waveform shape and microsecond-accurate delay timing need
+the scope -- see capture.py.
 
 The SD section is skipped, with a note, when no card is in the socket.
 
@@ -161,6 +163,55 @@ def main():
               "over-cap delay refused")
         eq(sj.cmd1("DELAY1?"), "DELAY1,0", "refused line left the slot untouched")
 
+        print("\n[CAL: the runtime timing budget]")
+        cal = sj.cmd("CAL?", quiet=0.6, limit=15)
+        eq(len(cal), 10, "CAL? prints nine parameters and OK")
+        eq(cal[-1], "OK", "CAL? ends with OK")
+        for line in cal[:-1]:
+            print("      ", line)
+        names = [l.split(",")[1] for l in cal[:-1]]
+        eq(names[0], "PRELOAD", "first parameter is PRELOAD")
+        check("TRIGCOMP" in names, "TRIGCOMP is in the set")
+        eq(sj.cmd1("CAL,TRIGCOMP?"), "CAL,TRIGCOMP,0",
+           "trigger compensation is 0 until someone measures it")
+        settle = sj.cmd1("CAL,SETTLE?")
+        eq(sj.cmd1("CAL,SETTLE,6"), "CAL,SETTLE,6", "one parameter set echoes back")
+        eq(sj.cmd1("CAL,SETTLE?"), "CAL,SETTLE,6", "and is what the board now uses")
+        check(any("cal=custom" in l for l in sj.cmd("IDN")), "IDN reports a custom budget")
+        # A preload of 100 us cannot fit inside a 20 us start latency, so the
+        # set is refused whole rather than arming an inconsistent budget.
+        check(sj.cmd1("CAL,PRELOAD,100").startswith("ERR"),
+              "a value breaking the STARTLAT invariant is refused")
+        check(sj.cmd1("CAL,NONSENSE,4").startswith("ERR"), "unknown parameter refused")
+        check(sj.cmd1("CAL,SETTLE,-1").startswith("ERR"), "negative value refused")
+        check(sj.cmd1("CAL,SETTLE,1001").startswith("ERR"), "value above 1000 us refused")
+        dump = sj.cmd("DUMP", quiet=0.8, limit=25)
+        check(any(l == "CAL,SETTLE,6" for l in dump), "DUMP carries the changed parameter")
+        eq(sj.cmd("CALDEF", quiet=0.6, limit=15)[-1], "OK", "CALDEF ends with OK")
+        eq(sj.cmd1("CAL,SETTLE?"), settle, "CALDEF restored the build default")
+        check(any("cal=default" in l for l in sj.cmd("IDN")), "IDN reports the default budget")
+
+        print("\n[DT: the per-slot ramp sample interval]")
+        eq(sj.cmd1("L8,0,1,10000,200000,0,25;4095,1000,1000"),
+           "L8,0,1,10000,200000,0,25;4095,1000,1000", "L line with the 7th field echoes")
+        eq(sj.cmd1("DT8?"), "DT8,25", "DT query agrees")
+        eq(sj.cmd1("DT8,50"), "DT8,50", "DT set echoes")
+        eq(sj.cmd1("L8?"), "L8,0,1,10000,200000,0,50;4095,1000,1000", "L line follows")
+        # Same asymmetry as DELAY: a line without the field resets the interval.
+        sj.cmd1("L8,0,1,10000,200000;4095,1000,1000")
+        eq(sj.cmd1("DT8?"), "DT8,0", "waveform line without the field clears it")
+        check(sj.cmd1("DT0,25").startswith("ERR"), "DT refused on an S slot")
+        check(sj.cmd1("S0,0,1,2000,1000000,0,25;100,0,150").startswith("ERR"),
+              "a 7th header field is refused on an S line")
+        check(sj.cmd1("L8,0,1,10000,200000,0,1;4095,1000,1000").startswith("ERR"),
+              "dt below the parse floor refused")
+        # Below what one latch costs on this board: refused at start, since that
+        # budget is runtime state and the parser cannot know it.
+        sj.cmd1("L8,0,1,10000,200000,0,2;4095,1000,1000")
+        r = sj.cmd("T8", quiet=0.4)
+        check(any("ramp interval" in l for l in r), f"2 us ramp interval refused at start: {r}")
+        sj.cmd("T-1", quiet=0.2)
+
         print("\n[screens: browse view]")
         screen(sj, "1-browse", a.screens)
 
@@ -240,14 +291,60 @@ def main():
         if mdata:
             eq(len(mdata[0].split(",")), 8, "MDATA field count")
 
-        # A stage too short for its measurement window is refused, not squeezed.
-        sj.cmd1("MEAS4,3,3,0,-1,0")
+        # A stage too short for its measurement window is refused, not squeezed
+        # -- with fit = 0, which is what the 7th MEAS field selects.
+        sj.cmd1("MEAS4,3,3,0,-1,0,0")
         sj.cmd1("S5,0,1,10000,30000;5000,1000,20;0,0,1000")
+        sj.cmd1("MEAS5,3,3,0,-1,0,0")
         r = run_train(sj, "T5", 1.0)
         check(any(l.startswith("WARN MEAS:") and "not measured" in l for l in r),
-              "short stage: measurement refused with a reason")
+              "short stage, fit=0: measurement refused with a reason")
         skipped = [l for l in r if l.startswith("MSUM,5,0,0,")]
         check(bool(skipped), f"refused point still reports an MSUM line: {skipped}")
+
+        print("\n[measurement coverage: reads rotated over repetitions]")
+        # Stage 0 is 25 us: too short for four reads in one gap (42 us needed)
+        # but long enough for one (21 us), so fit = 1 measures all four lines
+        # over four consecutive pulses. Stage 1 is long and does not rotate.
+        # 20 pulses, so each line of stage 0 accumulates about five samples.
+        sj.cmd1("S6,0,1,10000,200000;5000,1000,25;-5000,-1000,1000")
+        sj.cmd1("MEAS6,3,3,0,-1,0,0")
+        r = run_train(sj, "T6", 1.6)
+        check(any(l.startswith("WARN MEAS:") and "not measured" in l for l in r),
+              "fit=0: the 25 us stage is refused")
+        sj.cmd1("MEAS6,3,3,0,-1,0,1")
+        r = run_train(sj, "T6", 1.6)
+        check(not any(l.startswith("WARN MEAS:") for l in r),
+              "fit=1: nothing refused any more")
+        rot = [l for l in r if l.startswith("# MEAS:") and "rotate" in l]
+        check(bool(rot), f"rotation is announced: {rot}")
+        if rot:
+            print("      ", rot[0])
+        msum6 = [l for l in r if l.startswith("MSUM,6,")]
+        check(len(msum6) == 2, f"both stages summarised: {len(msum6)}")
+        if len(msum6) == 2:
+            f0 = msum6[0].split(",")
+            # 20 pulses over four groups: the field carries the largest of the
+            # four lines' counts, so 5 or 6.
+            check(4 <= int(f0[2]) <= 6, f"rotated point n is about nPulses/4: {f0[2]}")
+            check(all(f0[i] for i in (4, 6, 8, 10)),
+                  f"all four lines got a reading: {f0[4:]}")
+            eq(msum6[1].split(",")[2], "20", "the long stage still measures every pulse")
+        check(any(l.startswith("# MSUM point 0:") and "rotated" in l for l in r),
+              "the summary repeats how the point was measured")
+
+        # The same coverage on an L ramp, where the free gap is the sample
+        # interval: refused at the default 20 us, measured at 25 us.
+        sj.cmd1("L7,0,1,10000,100000;4095,1000,1000")
+        sj.cmd1("MEAS7,3,3,0,-1,0,1")
+        r = run_train(sj, "T7", 1.0)
+        check(any(l.startswith("WARN MEAS:") for l in r),
+              "L at the default 20 us interval: not even one read fits")
+        sj.cmd1("DT7,25")
+        r = run_train(sj, "T7", 1.0)
+        check(not any(l.startswith("WARN MEAS:") for l in r),
+              "L at a 25 us interval: rotated and measured")
+        check(any(l.startswith("MSUM,7,") for l in r), "ramp point summarised")
 
         print("\n[SD: log, listing and framed retrieval]")
         info = sj.cmd1("SDINFO").split(",")
@@ -310,6 +407,10 @@ def main():
         sj.cmd1("S3,0,1,20000,8000000,3000000;3000,2000,4000")
         sj.cmd("T3", quiet=0.06)
         time.sleep(1.0)                                  # inside the 3 s delay
+        # The engine copies the budget at arm time, so changing it mid-train
+        # would describe a board the running waveform is not using.
+        check(sj.cmd1("CAL,SETTLE,5").startswith("ERR"), "CAL refused while a train runs")
+        check(sj.cmd1("CALDEF").startswith("ERR"), "CALDEF refused while a train runs")
         screen(sj, "2-waiting", a.screens)
         while stat(sj)["el0"] == 0 and stat(sj)["n0"] == 0:
             pass                                         # wait out the delay
@@ -319,7 +420,7 @@ def main():
 
         print("\n[cleanup]")
         sj.cmd("T-1")
-        for slot in (0, 1, 2, 3, 4, 5):
+        for slot in (0, 1, 2, 3, 4, 5, 6, 7, 8):
             sj.cmd1(f"S{slot},3,3,10000,500000")
 
     print()

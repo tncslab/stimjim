@@ -1,5 +1,6 @@
 //    stimjimAWG — command handlers: S/L/W definition with atomic staging, `?`
-//    queries + round-trip serializers, DELAY/ENV/MEAS, T/U start-stop with the
+//    queries + round-trip serializers, DELAY/DT/ENV/MEAS, the CAL timing budget,
+//    T/U start-stop with the
 //    completion-ring drain, TRIG/R routing, byte-exact M/V/A/E (BIST contract),
 //    READ, B/C/D/P, STAT, SCREEN, DUMP, LOG, the SD file group and the BENCH
 //    group. GPL-3.0-or-later.
@@ -13,6 +14,7 @@
 #include "UiMenu.h"
 #include "Measure.h"
 #include "SdLog.h"
+#include "Cal.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -134,6 +136,12 @@ static void dumpSlot(uint8_t idx) {
                 (unsigned long)t.duration_us, 0.000001 * t.duration_us);
   Serial.printf("  delay:     %lu usec after the start request (%0.3f sec)\r\n",
                 (unsigned long)t.delay_us, 0.000001 * t.delay_us);
+  if (t.type == PIECEWISE_RAMP) {
+    if (t.dt_us) Serial.printf("  interval:  %lu usec per ramp sample\r\n",
+                               (unsigned long)t.dt_us);
+    else         Serial.printf("  interval:  %u usec per ramp sample (build default)\r\n",
+                               SJ_TARGET_DT_US);
+  }
   const char* u0 = (t.mode0 == 1) ? "uA" : "mV";
   const char* u1 = (t.mode1 == 1) ? "uA" : "mV";
   if (t.type == SINE) {
@@ -157,8 +165,9 @@ static void dumpSlot(uint8_t idx) {
   }
   Serial.printf("  env:  rampIn %lu usec, rampOut %lu usec, shape %u\r\n",
                 (unsigned long)t.env.rampIn_us, (unsigned long)t.env.rampOut_us, t.env.shape);
-  Serial.printf("  meas: what0 %u, what1 %u, when %u, stage %d, report %u\r\n",
-                t.meas.what0, t.meas.what1, t.meas.when, t.meas.stage, t.meas.report);
+  Serial.printf("  meas: what0 %u, what1 %u, when %u, stage %d, report %u, fit %u (%s)\r\n",
+                t.meas.what0, t.meas.what1, t.meas.when, t.meas.stage, t.meas.report,
+                t.meas.fit, t.meas.fit ? "rotate over repetitions" : "refuse if it does not fit");
   Serial.println("----------------------------------");
   ok();
 }
@@ -247,6 +256,108 @@ static void handleDelay(const char* args) {
   Serial.println(line);
 }
 
+// -------------------------------------------------------------------- DT
+//
+// The slot's ramp sample interval, also the optional 7th field of an `L`
+// header. Same asymmetry as DELAY: a later L line without the field resets the
+// interval to the build default, so set DT *after* defining the waveform.
+// A coarser interval is what makes room for a measurement point on a ramp
+// (protocol §4); the value the player can actually keep up with depends on the
+// CAL budgets and is checked at start, not here.
+static void handleDt(const char* args) {
+  const char* p = args;
+  uint8_t idx;
+  if (!parseSlotIdx("DT", p, idx)) return;
+
+  char line[48];
+  if (*p == '?') {
+    TrainStore::serializeDt(idx, TrainStore::slotConst(idx).dt_us, line, sizeof line);
+    Serial.println(line);
+    return;
+  }
+  if (*p != ',') { err("DT", "need DT<idx>,<dt_us> or DT<idx>?"); return; }
+
+  long v[1];
+  if (parseFields(p + 1, v, 1) != 1) { err("DT", "need <dt_us>"); return; }
+  if (v[0] != 0 && ((unsigned long)v[0] < SJ_MIN_DT_US || (unsigned long)v[0] > SJ_MAX_DT_US)) {
+    err("DT", "dt_us must be 0 (build default) or 2..1000000 us");
+    return;
+  }
+  if (TrainStore::slotConst(idx).type != PIECEWISE_RAMP) {
+    err("DT", "only an L (ramp) slot has a sample interval");
+    return;
+  }
+  if (Engine::activeSlot(0) == idx || Engine::activeSlot(1) == idx) {
+    err("DT", "slot is attached to a running train — stop first (T-1 / U-1)");
+    return;
+  }
+
+  TrainDef staged = TrainStore::slotConst(idx);
+  staged.dt_us = (uint32_t)v[0];
+  TrainStore::commit(idx, staged);
+  TrainStore::serializeDt(idx, staged.dt_us, line, sizeof line);
+  Serial.println(line);
+}
+
+// ------------------------------------------------------------------- CAL
+//
+// The hardware timing budget (Cal.h) as set-commands. `CAL?` prints the whole
+// set, `CAL,<name>?` one parameter, `CAL,<name>,<us>` sets one and `CALDEF`
+// restores the compiled defaults. Sets are refused while a train runs: the
+// engine takes its copy at arm time, so a mid-train change would describe a
+// board the running waveform is not using.
+static void printCalLine(uint8_t id) {
+  Serial.printf("CAL,%s,%u\n", Cal::NAME[id], Cal::live().us[id]);
+}
+
+static void handleCal(const char* args) {
+  const char* p = args;
+  while (*p == ' ') p++;
+  if (*p == '\0' || *p == '?') {
+    for (uint8_t i = 0; i < Cal::N_ID; i++) printCalLine(i);
+    ok();
+    return;
+  }
+  if (*p != ',') { err("CAL", "need CAL? , CAL,<name>? or CAL,<name>,<us>"); return; }
+  p++;
+  while (*p == ' ') p++;
+
+  char name[16];
+  size_t n = 0;
+  while (isalnum((unsigned char)*p) && n + 1 < sizeof name) name[n++] = *p++;
+  name[n] = '\0';
+  const int8_t id = Cal::indexOf(name);
+  if (id < 0) {
+    Serial.printf("ERR CAL: unknown parameter '%s' — CAL? lists them\n", name);
+    return;
+  }
+  while (*p == ' ') p++;
+  if (*p == '?' || *p == '\0') { printCalLine((uint8_t)id); return; }
+  if (*p != ',') { err("CAL", "expected ',' , '?' or end of line after the name"); return; }
+
+  long v[1];
+  if (parseFields(p + 1, v, 1) != 1) { err("CAL", "need <us>"); return; }
+  if (Engine::anyActive()) {
+    err("CAL", "a train is running — stop first (T-1 / U-1)");
+    return;
+  }
+  Cal::Def staged;
+  const char* msg = Cal::apply(Cal::live(), (uint8_t)id, v[0], staged);
+  if (msg) { err("CAL", msg); return; }
+  Cal::set(staged);
+  printCalLine((uint8_t)id);
+}
+
+static void handleCalDef() {
+  if (Engine::anyActive()) {
+    err("CALDEF", "a train is running — stop first (T-1 / U-1)");
+    return;
+  }
+  Cal::set(Cal::defaults());
+  for (uint8_t i = 0; i < Cal::N_ID; i++) printCalLine(i);
+  ok();
+}
+
 // ------------------------------------------------------------- ENV / MEAS
 
 static void handleEnv(const char* args) {
@@ -297,17 +408,19 @@ static void handleMeas(const char* args) {
     Serial.println(line);
     return;
   }
-  if (*p != ',') { err("MEAS", "need MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>] or MEAS<idx>?"); return; }
+  if (*p != ',') { err("MEAS", "need MEAS<idx>,<what0>,<what1>,<when>,<stage>[,<report>[,<fit>]] or MEAS<idx>?"); return; }
 
-  long v[5];
-  int8_t n = parseFields(p + 1, v, 5);
-  if (n < 4) { err("MEAS", "need <what0>,<what1>,<when>,<stage>[,<report>]"); return; }
-  if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < -1 || (n == 5 && v[4] < 0)) {
+  long v[6];
+  int8_t n = parseFields(p + 1, v, 6);
+  if (n < 4) { err("MEAS", "need <what0>,<what1>,<when>,<stage>[,<report>[,<fit>]]"); return; }
+  if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < -1 || (n >= 5 && v[4] < 0) ||
+      (n >= 6 && v[5] < 0)) {
     err("MEAS", "fields must be non-negative (stage may be -1 = all)");
     return;
   }
   // keep the narrow casts below honest (detailed validation in validateMeas)
-  if (v[0] > 3 || v[1] > 3 || v[2] > 3 || v[3] >= SJ_MAX_STAGES || (n == 5 && v[4] > 3)) {
+  if (v[0] > 3 || v[1] > 3 || v[2] > 3 || v[3] >= SJ_MAX_STAGES ||
+      (n >= 5 && v[4] > 3) || (n >= 6 && v[5] > SJ_FIT_ROTATE)) {
     err("MEAS", "field out of range");
     return;
   }
@@ -322,7 +435,11 @@ static void handleMeas(const char* args) {
   m.what1  = (uint8_t)v[1];
   m.when   = (uint8_t)v[2];
   m.stage  = (int8_t)v[3];
-  m.report = (n == 5) ? (uint8_t)v[4] : 0;
+  // Omitted optional fields take the boot default, not the stored value: a
+  // MEAS line fully defines the slot's measurement configuration, the same way
+  // an S/L/W line fully defines its header.
+  m.report = (n >= 5) ? (uint8_t)v[4] : 0;
+  m.fit    = (n >= 6) ? (uint8_t)v[5] : (uint8_t)SJ_FIT_ROTATE;
   char warnbuf[SJ_MSG_MAX];
   const char* msg = TrainStore::validateMeas(TrainStore::slotConst(idx), m, warnbuf, sizeof warnbuf);
   if (msg) { err("MEAS", msg); return; }
@@ -721,6 +838,12 @@ void writeDump(Print& out) {
     serializeTrig(t, line, sizeof line);
     out.println(line);
   }
+  // Only the timing budgets that differ from this build's defaults, so a dump
+  // pasted into an identical firmware reproduces the state and a dump read by
+  // a human shows what was calibrated by hand.
+  for (uint8_t i = 0; i < Cal::N_ID; i++)
+    if (Cal::live().us[i] != Cal::defaults().us[i])
+      out.printf("CAL,%s,%u\n", Cal::NAME[i], Cal::live().us[i]);
 }
 
 static void handleDump() {
@@ -959,14 +1082,18 @@ static void benchDispatch(const char* sub, const char* args) {
 static void help() {
   Serial.println("# stimjimAWG commands — details: docs/serial-protocol.md");
   Serial.println("#   S<i>,m0,m1,per,dur[,delay];a0,a1,d;...  rectangular train (slots 0-99, <=10 stages)");
-  Serial.println("#   L<i>,...                        same syntax, linear ramps (0-dur stage = jump)");
+  Serial.println("#   L<i>,m0,m1,per,dur[,delay[,dt]];...  same syntax, linear ramps (0-dur stage = jump)");
   Serial.println("#   W<i>,m0,m1,per,dur[,delay];amp;freq;phase[;env]  sine train (decimals in Hz ok)");
   Serial.println("#   modes: 0 V, 1 I, 2/3 channel not driven; 90/91 V/I without measurement");
   Serial.println("#   S<i> / L<i> / W<i>              human parameter dump; append ? for the canonical line");
   Serial.println("#   T<i> / T-1, U<i> / U-1          start/stop engine 0 / 1");
   Serial.println("#   DELAY<i>,<us>                   delay from start request to first sample; DELAY<i>?");
   Serial.println("#   ENV<i>,in,out[,shape]           amplitude envelope; ENV<i>?");
-  Serial.println("#   MEAS<i>,w0,w1,when,stage[,rep]  measurement config; MEAS<i>?");
+  Serial.println("#   DT<i>,<us>                      L ramp sample interval, 0 = build default; DT<i>?");
+  Serial.println("#   MEAS<i>,w0,w1,when,stage[,rep[,fit]]  measurement config; MEAS<i>?");
+  Serial.println("#     fit: 0 refuse a point that does not fit its gap, 1 rotate its reads (default)");
+  Serial.println("#   CAL? / CAL,<name>,<us> / CALDEF timing budget: PRELOAD DACPROG1 DACPROG2 ADCREAD");
+  Serial.println("#                                   ADCSWITCH GUARD SETTLE STARTLAT TRIGCOMP (us)");
   Serial.println("#   READ<ch>[,n]                    manual averaged V+I read (mean and std dev)");
   Serial.println("#   M<ch>,<mode>  V<ch>,<mV>  A<ch>,<dac>  E<ch>,<line>   immediate (legacy replies)");
   Serial.println("#   B / C                           recalibrate ADC / current+voltage offsets");
@@ -1035,6 +1162,12 @@ void handleLine(const char* line) {
     handleRead(args);
   } else if (!strcmp(word, "DELAY")) {
     handleDelay(args);
+  } else if (!strcmp(word, "DT")) {
+    handleDt(args);
+  } else if (!strcmp(word, "CAL")) {
+    handleCal(args);
+  } else if (!strcmp(word, "CALDEF")) {
+    handleCalDef();
   } else if (!strcmp(word, "SCREEN")) {
     UiMenu::dumpScreen();
   } else if (!strcmp(word, "ENV")) {

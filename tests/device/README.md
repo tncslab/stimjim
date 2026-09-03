@@ -36,6 +36,15 @@ channels are also called A and B, and mixing the two up is easy):
    scope B              scope A            scope gnd
 ```
 
+**The two antiparallel LEDs are deliberately different colours — one red, one blue.** Their
+forward voltages differ by roughly a volt (red ~1.8 V, blue ~2.7 V), so the branch clamps at a
+different level in each polarity: the load a positive half of a bipolar pulse sees is not the
+load the negative half sees. That asymmetry is the point of the pair. An `S` train with a
+positive and a negative stage should read back two clamp levels that differ, and a pair of equal
+magnitudes would mean the firmware is reporting one stage's value for both, or averaging across
+polarities. Where a capture or an `MSUM` line shows the positive and negative excursions
+clipping at unequal voltages, that is the diodes, not the instrument.
+
 The AWG wire is not teed to a scope input, so `capture.py` measures the trigger-to-output delay
 differentially: the same edge starts a zero-delay reference pulse on CH1 and the delayed pulse
 under test on CH0, the scope triggers on the reference, and the two engines' arming skew
@@ -48,7 +57,8 @@ the circuit, not the instrument, and neither trace is an output of the channel i
   *grounded* (mode 3, the state `Stimjim.begin()` and every train end leave behind), which ties
   CH1(+) to CH1(−) and hence to the LED branch. Below the LEDs' turn-on that branch carries no
   current, so scope B simply sits at CH0(+)'s potential (within a few per cent up to ~1.8 V);
-  above it the LEDs clamp, and scope B saturates at +2.2 V one way, −2.9 V the other.
+  above it the LEDs clamp, and scope B saturates at +2.2 V one way, −2.9 V the other — the two
+  levels differ because the two diodes do (above).
 - **A CH1 pulse divides down onto scope channel A**: with CH0 grounded, its 8 V reference pulse
   reads about 0.5 V there, roughly 11 %.
 

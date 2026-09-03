@@ -3,6 +3,7 @@
 #include "Protocol.h"
 #include "Config.h"
 #include "Engine.h"
+#include "Cal.h"
 
 namespace Protocol {
 
@@ -23,13 +24,16 @@ void printIdentity(Print& out) {
              SJ_FASTIO_REGISTER ? "registers" : "Arduino-SPI",
              SJ_TIMER_REGISTER  ? "raw-PIT"   : "IntervalTimer",
              SJ_USE_SD ? "yes" : "no");
+  // `cal` says whether the timing budgets are still this build's defaults;
+  // a board calibrated by hand answers `custom`, and `CAL?` prints the values.
+  const char* calState = Cal::isDefault() ? "default" : "custom";
   if (Engine::pitChannelOf(0) == 0xFE)
-    out.printf("# engine: IntervalTimer-managed channels, K_RELOAD=%lu cycles\n",
-               (unsigned long)Engine::kReloadCycles());
+    out.printf("# engine: IntervalTimer-managed channels, K_RELOAD=%lu cycles, cal=%s\n",
+               (unsigned long)Engine::kReloadCycles(), calState);
   else
-    out.printf("# engine: PIT channels %u/%u, K_RELOAD=%lu cycles\n",
+    out.printf("# engine: PIT channels %u/%u, K_RELOAD=%lu cycles, cal=%s\n",
                Engine::pitChannelOf(0), Engine::pitChannelOf(1),
-               (unsigned long)Engine::kReloadCycles());
+               (unsigned long)Engine::kReloadCycles(), calState);
 }
 
 // Digits produced back to front, so no 64-bit division-by-10 loop appears in

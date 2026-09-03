@@ -165,7 +165,7 @@ int main() {
   TrainDef cur;
   TrainStore::slotDefault(cur);
   cur.env = {100, 100, 0};
-  cur.meas = {1, 2, 0, 0, 2};   // what0=V, what1=I, when=stage end, stage 0 only, report=SD
+  cur.meas = {1, 2, 0, 0, 2, 0};   // what0=V, what1=I, when=stage end, stage 0 only, report=SD
   CHECK(parse('L', ",0,0,1000,10000;500,500,400", t, err, warn, &cur));
   CHECK(t.type == PIECEWISE_RAMP);
   CHECK(t.env.rampIn_us == 100 && t.env.rampOut_us == 100);            // ENV preserved for S/L
@@ -203,35 +203,40 @@ int main() {
   CHECK(TrainStore::validateEnv(cur, {0, 0, 1}) != nullptr);           // shape reserved
 
   cur.mode0 = cur.mode1 = 0;              // driven modes (the default 3/3 has nothing to measure)
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0}, warn, sizeof warn) == nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0, 0}, warn, sizeof warn) == nullptr);
   CHECK(warn[0] == '\0');
-  CHECK(TrainStore::validateMeas(cur, {4, 3, 0, -1, 0}, warn, sizeof warn) != nullptr);  // what > 3
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, -1, 0}, warn, sizeof warn) != nullptr);  // sine-peak code on S slot
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 4}, warn, sizeof warn) != nullptr);  // report > 3
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  0, 0}, warn, sizeof warn) != nullptr);  // stage 0 on a 0-stage slot
+  CHECK(TrainStore::validateMeas(cur, {4, 3, 0, -1, 0, 0}, warn, sizeof warn) != nullptr);  // what > 3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 1, -1, 0, 0}, warn, sizeof warn) != nullptr);  // sine-peak code on S slot
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 4, 0}, warn, sizeof warn) != nullptr);  // report > 3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  0, 0, 0}, warn, sizeof warn) != nullptr);  // stage 0 on a 0-stage slot
   // Both report bits are implemented now, so neither warns any more.
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1}, warn, sizeof warn) == nullptr);  // stream MDATA
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1, 0}, warn, sizeof warn) == nullptr);  // stream MDATA
   CHECK(warn[0] == '\0');
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 3}, warn, sizeof warn) == nullptr);  // stream + SD
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 3, 0}, warn, sizeof warn) == nullptr);  // stream + SD
   CHECK(warn[0] == '\0');
   cur.nStages = 2;                                                     // per-stage selection in range
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  1, 0}, warn, sizeof warn) == nullptr);
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  2, 0}, warn, sizeof warn) != nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  1, 0, 0}, warn, sizeof warn) == nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  2, 0, 0}, warn, sizeof warn) != nullptr);
   cur.nStages = 0;
   cur.mode0 = 2;                                                       // hi-Z: not driven
-  CHECK(TrainStore::validateMeas(cur, {3, 0, 0, -1, 0}, warn, sizeof warn) == nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 0, 0, -1, 0, 0}, warn, sizeof warn) == nullptr);
   CHECK(strstr(warn, "nothing to measure") != nullptr);
   cur.mode0 = 0;
   cur.type = SINE;
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0}, warn, sizeof warn) != nullptr);  // sine needs when 1-3
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 2, -1, 0}, warn, sizeof warn) == nullptr);  // -peak only: fine
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 3,  0, 0}, warn, sizeof warn) != nullptr);  // sine has no stages
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 0, 0}, warn, sizeof warn) != nullptr);  // sine needs when 1-3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 2, -1, 0, 0}, warn, sizeof warn) == nullptr);  // -peak only: fine
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 3,  0, 0, 0}, warn, sizeof warn) != nullptr);  // sine has no stages
 
   // ------------------------------------------------- ENV/MEAS serializers
   TrainStore::serializeEnv(7, {1000, 2000, 0}, line, sizeof line);
   CHECK_STREQ(line, "ENV7,1000,2000,0");
-  TrainStore::serializeMeas(7, {3, 3, 3, -1, 1}, line, sizeof line);
-  CHECK_STREQ(line, "MEAS7,3,3,3,-1,1");
+  TrainStore::serializeMeas(7, {3, 3, 3, -1, 1, 1}, line, sizeof line);
+  CHECK_STREQ(line, "MEAS7,3,3,3,-1,1,1");
+  // fit is the 7th field and round-trips; 0 = refuse a point that does not fit
+  TrainStore::serializeMeas(7, {3, 3, 3, -1, 1, 0}, line, sizeof line);
+  CHECK_STREQ(line, "MEAS7,3,3,3,-1,1,0");
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 3, -1, 0, 1}, warn, sizeof warn) == nullptr);
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 3, -1, 0, 2}, warn, sizeof warn) != nullptr);  // fit > 1
 
   // --------------------------------------- optional post-trigger delay field
   // A legacy header (5 fields) must keep meaning exactly what it meant before:
@@ -276,6 +281,38 @@ int main() {
 
   TrainStore::serializeDelay(9, 4200, line, sizeof line);
   CHECK_STREQ(line, "DELAY9,4200");
+
+  // -------------------------------------- optional ramp sample interval field
+  // 7th header field, `L` only. It is positional, so a slot that wants an
+  // interval and no delay writes the delay as 0 — and serializes back that way.
+  CHECK(parse('L', ",0,1,2000,1000000,0,50;100,0,150", t, err, warn));
+  CHECK(t.dt_us == 50 && t.delay_us == 0);
+  TrainStore::serializeTrain(4, t, line, sizeof line);
+  CHECK_STREQ(line, "L4,0,1,2000,1000000,0,50;100,0,150");
+  CHECK(parse('L', line + 2, t, err, warn));            // canonical form round-trips
+  TrainStore::serializeTrain(4, t, line2, sizeof line2);
+  CHECK_STREQ(line, line2);
+
+  CHECK(parse('L', ",0,1,2000,1000000,300,25;100,0,150", t, err, warn));
+  CHECK(t.dt_us == 25 && t.delay_us == 300);
+  // Omitting it resets the interval to the build default, like the delay.
+  TrainDef withDt;
+  TrainStore::slotDefault(withDt);
+  withDt.dt_us = 200;
+  CHECK(parse('L', ",0,1,2000,1000000;100,0,150", t, err, warn, &withDt));
+  CHECK(t.dt_us == 0);
+
+  CHECK(!parse('L', ",0,1,2000,1000000,0,1;100,0,150", t, err, warn));        // below the floor
+  CHECK(!parse('L', ",0,1,2000,1000000,0,1000001;100,0,150", t, err, warn));  // above the ceiling
+  CHECK(!parse('L', ",0,1,2000,1000000,0,0;100,0,150", t, err, warn));        // 0 = omit the field
+  // Only a ramp has a sample interval: on S and W the field is an error, not a
+  // silently ignored number.
+  CHECK(!parse('S', ",0,1,2000,1000000,0,50;100,0,150", t, err, warn));
+  CHECK(strstr(err, "7th header field") != nullptr);
+  CHECK(!parse('W', ",0,0,10000,1000000,0,50;1,1,500;5,5,0;0,0,0", t, err, warn));
+
+  TrainStore::serializeDt(9, 40, line, sizeof line);
+  CHECK_STREQ(line, "DT9,40");
 
   // ------------------------------------------------------- default helpers
   TrainStore::slotDefault(cur);
