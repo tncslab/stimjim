@@ -322,7 +322,7 @@ by `P` and reported by `IDN`), the ramp sample interval is per slot (`L`'s 7th h
 repetitions instead of being refused (`MEAS` `fit`). The trigger ISRs timestamp the edge and the
 engine measures the start latency from that timestamp, so interrupt entry and the arm-time
 precomputation are spent *inside* `CAL STARTLAT` rather than added to it — which is why
-`STARTLAT` has to be wide enough to hold the arm, is 45 µs rather than 20, and is reported by
+`STARTLAT` has to be wide enough to hold the arm, is 35 µs rather than 20, and is reported by
 name when a train's arm does not fit it. `BENCHARM` measures the arm and `BENCHSETTLE` measures
 the settling time, so of the four budgets that once needed an oscilloscope only `TRIGCOMP`
 still does.
@@ -342,12 +342,11 @@ still does.
   `BENCHSETTLE` and needed no scope at all.
 - **Menu UI.** The button editing FSM (`HOME → SELECT → ARMED → RESULT`). This is the last
   unbuilt item of the requested-feature list in `firmware-spec.md`.
-- **The arm costs 16.6 µs before it does anything train-specific**, and since that cost sits
-  inside `STARTLAT` it is the trigger latency. It has not been profiled. The candidates visible
-  from `BENCHARM` are `Measure::planBuild`'s `memset` of a ~1 kB plan (paid even by a train that
-  measures nothing), the 64-bit divisions of the ramp and sine setup, and `ampToCode`'s float
-  division per stage per channel. Pre-building the measurement plan when the `TRIG` route is set
-  rather than when the edge arrives would remove another 4.3 µs.
+- **The arm costs 9.0 µs before it does anything train-specific**, and since that cost sits
+  inside `STARTLAT` it is the trigger latency. It has been profiled and cut from 16.2–37.5 µs to
+  9.0–15.0 µs ([timing.md](timing.md) §7); what remains is a floor no rearrangement inside
+  `startTrain` gets below, so the next step is not a smaller arm but no arm at all on the edge —
+  pre-arming the train and firing on a bare `NLDAC` pulse (§3 of that document).
 - **A pre-armed trigger path could reach single-digit microseconds.** The AD5752 already separates
   program from execute, and `dacLatch` costs 0.44 µs, so if the *whole* arm moved before the edge —
   armed when the `TRIG` route is set, or at the end of the previous train — the edge ISR would only

@@ -1,11 +1,10 @@
 # Plan — bring the arm cost under one latch interval
 
-Status: done, 2026-09-03. Items 1–5 are built, host-tested and measured on silicon; item 6 is
-deferred with its prerequisite in place and is re-scoped by what the bench found. The arm fell from
-16.2–37.5 µs to 8.5–28.5 µs on a re-arm, but the measurement-plan compile turned out to cost 3.1 µs
-per point on the first arm after an edit, which is now the largest single term and puts the worst
-case at 54.3 µs. `CAL STARTLAT` therefore stays at 60 µs. Current numbers and the remaining work
-live in [timing.md](timing.md) §7; this file keeps the reasoning behind each decision.
+Status: done, 2026-09-03. All six items are built and measured on silicon; items 1–5 in this
+phase, item 6 in [PLAN_lazy-stages.md](PLAN_lazy-stages.md) after the measurement-plan compile
+moved out of the arm ([PLAN_plan-out-of-arm.md](PLAN_plan-out-of-arm.md)) unblocked it. The arm
+fell from 16.2–37.5 µs to 9.0–15.0 µs and `CAL STARTLAT` from 60 to 35. Current numbers live in
+[timing.md](timing.md) §7; this file keeps the reasoning behind each decision.
 
 The goal is a start latency no longer than the interval between two consecutive DAC updates, so
 that a trigger-started train never needs a wider budget than the waveform itself already runs on.
@@ -206,7 +205,7 @@ the decisions in this file:
 | 3 — derive the sine constants at definition | Done. `SampleGen::sineDerive` is the pure derivation, `Engine` caches one `SineConst` per slot (2 kB) keyed on the definition epoch, and `Engine::deriveSine` warms it from the `S`/`L`/`W` commit. The arm still derives on demand, so correctness never depends on the warm-up. Measured: a `W` arm fell 37.5 → 10.1 µs, the largest single saving in the plan, and now costs the same as an `S` arm. |
 | 4 — 32-bit `UDIV` in `rampStageInit` | Done, with the exactness checked rather than argued: `testRampDivisionPaths` compares both paths against the 64-bit reference across six `dt` values and 21 durations up to `UINT32_MAX`, including both overflow guards, and re-checks that N Bresenham steps still land exactly on the stage end. Measured: a ramp stage costs 1.93 µs in the arm, of which 1.04 µs is `rampStageInit`. |
 | 5 — `FASTRUN` | Done as `SJ_CODE_IN_RAM`, default on for Kinetis, covering `Engine::startTrain`, `Engine::playerRun` and — added after the first bench run — `SampleGen::rampStageInit` and `rampStep`. Verified in the ELF: all are at `0x1fff…` in SRAM, and RAM rises 41 404 → 47 820 B. `IDN` reports `hot=RAM`/`flash`/`ITCM`. Measured: 13–17 % on the arm, the two large functions accounting for essentially all of it. |
-| 6 — derive stage i+1 during stage i | Deferred, and re-scoped by the bench: it is worth 0.89 µs per `S` stage and 1.93 µs per `L` stage, but the plan compile above it is worth 3.1 µs per point, and compiling the plan outside the arm is also what would free the lazy scheme from having to leave `cum[]` and the per-stage `N` behind in the arm. Prerequisite built: consecutive 0-duration `L` stages are refused at parse time, so look-ahead is bounded to one stage. |
+| 6 — derive stage i+1 during stage i | Done, in [PLAN_lazy-stages.md](PLAN_lazy-stages.md), once the plan compile had moved to `loop()`. Worth 0.6 µs per `S` stage and 1.6 µs per `L` stage: a ten-stage `L` arm fell 28.7 → 15.0 µs. `cum[]` and the per-stage `N` stayed in the arm after all, because `buildGeometry` is shared with the plan warm — they are the 0.25–0.31 µs a stage that is left. |
 
 Not attempted, and deliberately: `ampToCode`'s `VDIV.F32` stays a division. Replacing it with a
 reciprocal multiply would risk a 1-LSB shift in delivered amplitude, and the claim that `S` trains

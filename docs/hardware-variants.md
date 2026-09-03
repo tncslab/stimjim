@@ -125,17 +125,21 @@ in this order:
 `TRIGCOMP`. The one that actually sizes it is **the cost of `Engine::startTrain`**, because `t0`
 is measured from the start request and every microsecond of arming is spent inside the latency
 rather than added to it. `BENCHARM` measures that per slot, and `tests/device/bench_arm.py` sweeps the
-shapes: on the Teensy 3.5 register build, 8.8 µs for a slot that drives nothing, 10–11 µs for a
-one-stage `S`, `L` or `W` train, 17.5 µs for a ten-stage `S` and 28.7 µs for a ten-stage `L`, with
-in-train measurement costing nothing on any of them. Roughly double on the portable route. The
-defaults are 45 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one edge
+shapes: on the Teensy 3.5 register build, 9.0 µs for a slot that drives nothing, 11–12 µs for a
+one-stage `S`, `L` or `W` train, 13.3 µs for a ten-stage `S` and 15.0 µs for a ten-stage `L`, with
+in-train measurement costing nothing on any of them and stage count costing about 0.3 µs a stage.
+Roughly double on the portable route. The defaults are 35 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one edge
 and so needs twice the arm; when an arm does not fit, the train's completion says so and names the
 `STARTLAT` that would have covered it, so this is one of the values a board can be qualified for
 over the serial port alone.
 
 Those figures assume a running `loop()`, which is what prepares each engine's next measurement plan
-and clears the last train's accumulators. That is portable code with no backend behind it, so it
-carries over to any target; what does not is the cost of the arm itself.
+and clears the last train's accumulators, and a train that has started, which is what derives the
+stages past the first. Both are portable code with no backend behind them, so they carry over to
+any target; what does not is the cost of the arm itself. The one target-dependent constant the
+stage derivation adds is `SJ_STAGE_DERIVE_US` — what deriving one stage costs, which gates whether
+the player does it in a gap before a latch or falls back to the stage boundary. 4 µs on the
+Teensy 3.5; a slower target should raise it in proportion to `BENCHARM`'s per-stage figure.
 
 Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
 which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the

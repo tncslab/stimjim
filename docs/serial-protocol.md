@@ -431,7 +431,7 @@ emits a line for each one that differs from the build default. The `IDN` `# engi
 | `ADCSWITCH` | 4 | extra cost of a control-register line switch |
 | `GUARD` | 1 | margin between the last read and the next preload window |
 | `SETTLE` | 9 | after a latch, before a reading means anything (`BENCHSETTLE`) |
-| `STARTLAT` | 45 | fixed start-request → first-latch latency |
+| `STARTLAT` | 35 | fixed start-request → first-latch latency |
 | `TRIGCOMP` | 0 | hardware pin edge → trigger-ISR entry, subtracted for trigger starts |
 
 All values are whole microseconds, 0…1000. They are **budgets, so they carry the measured worst
@@ -450,25 +450,27 @@ these checks at boot is dropped with a `#` line and the build defaults stay in f
 instruction — so every microsecond `Engine::startTrain` spends comes out of the latency rather
 than being added to it. `BENCHARM,<slot>` measures that cost for one slot, and
 `tests/device/bench_arm.py` sweeps one slot per shape and prints what `STARTLAT` each needs.
-Measured on a Teensy 3.5 with the register backends: 8.8 µs for a slot that drives nothing,
-10.4 µs for a one-stage two-channel `S` train — measured or not, in-train measurement now costs
-the arm nothing — 10.8 µs for a sine, 17.5 µs for a ten-stage `S` train with a point on every
-stage, and 28.7 µs for a ten-stage `L` train, which is the worst case because a ramp stage costs
-the arm twice what a rectangular one does. `STARTLAT` must be at least that plus
-`PRELOAD + DACPROG2 + 3 µs`, which is where the 45 µs default comes from.
+Measured on a Teensy 3.5 with the register backends: 9.0 µs for a slot that drives nothing,
+11.1 µs for a one-stage two-channel `S` train — measured or not, in-train measurement costs the
+arm nothing — 11.0 µs for a sine, 13.3 µs for a ten-stage `S` train with a point on every stage,
+and 15.0 µs for a ten-stage `L` train, which is the worst case because a ramp stage costs the arm
+more than a rectangular one does. Stage count barely matters: only the first stage is converted in
+the arm, and the player converts stage i+1 while stage i plays. `STARTLAT` must be at least the
+worst of those plus `PRELOAD + DACPROG2`, which is 24 µs; the 35 µs default adds the margin.
 
 Those figures assume `loop()` is running, because that is what prepares each engine's next
 measurement plan and clears the accumulators of the last train. An engine re-triggered so fast
 that `loop()` never ran in between falls back to doing both inside the arm, which costs about
-0.6 µs per measurement point and, if the slot also changed, another 3.1 µs per point.
+0.6 µs per measurement point and, if the slot also changed, another 3.1 µs per point — 20 µs of
+arm on the heaviest slot, which the 35 µs default still covers.
 
 A `TRIG` route in independent mode (`mode 2`) arms **two** engines from one edge, inside one ISR,
 so it pays the arm twice before the second engine's first latch is due: two ten-stage `L` trains
-need about 70 µs, and everything else fits in 45. When an arm does not fit, the train still runs
+need about 39 µs, and everything else fits in 35. When an arm does not fit, the train still runs
 — its first latch is simply late — and the completion carries
 
 ```
-WARN engine: arming this train took longer than CAL STARTLAT (45 us), so its first latch could
+WARN engine: arming this train took longer than CAL STARTLAT (35 us), so its first latch could
 not be on time — set CAL STARTLAT >= <n> us (BENCHARM,<slot> measures the arm; a TRIG independent
 route arms twice)
 ```
@@ -588,8 +590,8 @@ TRIG<t>?  → canonical line
   the fixed `START_LATENCY` plus the slot's `delay_us`, not something that depends on how busy
   `loop()` is. Loop-context `T`/`U` takes the bus lock around `startTrain` so a trigger edge
   cannot interleave with it.
-- **The latency is 60 µs** on a Teensy 3.5 with the register backends (`CAL STARTLAT`; 120 µs on
-  the portable build), repeatable to the 42 ns residual latch jitter, and 16–42 µs of it is the arm
+- **The latency is 35 µs** on a Teensy 3.5 with the register backends (`CAL STARTLAT`; 120 µs on
+  the portable build), repeatable to the 42 ns residual latch jitter, and 9–15 µs of it is the arm
   itself rather than the 2.75 µs DAC write. **The edge ISR emits no sample**: it timestamps the
   edge, arms, computes `t0 = edge − TRIGCOMP + STARTLAT + delay_us`, and programs its player's PIT
   channel to wake one `PRELOAD` before `t0`. The first latch, like every later one, happens in the

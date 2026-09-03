@@ -4,10 +4,10 @@ This document answers, in one place, how long `stimjimAWG` takes to put signal o
 after a trigger edge, why that number is what it is, how it compares with the original
 `stimjimPulser` firmware, whether the DAC can be preloaded to fire faster, what the trigger
 interrupt actually starts, whether waveform generation occupies the CPU, and what SD logging
-costs and stores. The short answers: a trigger edge delivers the first latch a fixed **45 µs**
+costs and stores. The short answers: a trigger edge delivers the first latch a fixed **35 µs**
 later on a Teensy 3.5 with the register backends (`CAL STARTLAT`, adjustable without a rebuild),
 most of which is the arm — the copy and precomputation the edge ISR does before it hands the
-train to the timer, 8.8 µs for the simplest train and 28.7 µs for the heaviest — and
+train to the timer, 9.0 µs for the simplest train and 15.0 µs for the heaviest — and
 none of which is the DAC write; the original firmware had no fixed
 figure at all, because it played the first pulse inside the trigger ISR after two USB
 `Serial.print` calls; the AD5752 *can* hold a preloaded code and fire on a bare `NLDAC` pulse in
@@ -36,11 +36,11 @@ A trigger start delivers its first DAC latch at
 t0 = <edge timestamp> − CAL TRIGCOMP + CAL STARTLAT + <slot delay_us>
 ```
 
-`STARTLAT` is **45 µs** by default on a Teensy 3.5 at 120 MHz with the register backends, and
+`STARTLAT` is **35 µs** by default on a Teensy 3.5 at 120 MHz with the register backends, and
 120 µs on the portable (Arduino-SPI + `IntervalTimer`) build. It is runtime state:
 `CAL,STARTLAT,<us>` changes it, `P` persists it, `CAL?` reports what a running board uses. A board
 that already has an EEPROM image keeps the budget it stored — the image is not rejected over a
-default that only got smaller — so adopting the new one takes `CAL,STARTLAT,45` and `P`.
+default that only got smaller — so adopting the new one takes `CAL,STARTLAT,35` and `P`.
 
 The latency is deterministic because the edge ISR timestamps the edge in its own first
 instruction, and everything it then does is spent *inside* `STARTLAT` rather than added after it.
@@ -48,7 +48,7 @@ What has to fit in the window:
 
 | Term | Cost (T3.5, register backends) |
 |---|---|
-| `Engine::startTrain` — copy-on-arm and fixed-point precomputation | 8.83 µs for a train that drives nothing, rising with the *stages* the train holds and with nothing else: 10.4 µs for a one-stage `S`, 28.7 µs for a ten-stage `L`. In-train measurement adds nothing — §7 measures every case |
+| `Engine::startTrain` — copy-on-arm and fixed-point precomputation | 9.0 µs for a train that drives nothing, 11–12 µs for a one-stage `S`/`L`/`W`, 15.0 µs for a ten-stage `L`. Neither in-train measurement nor stage count adds much: the plan is compiled in `loop()` and stage i+1 is derived while stage i plays — §7 measures every case |
 | `CAL PRELOAD` — how early the player ISR wakes before the first latch | 4 µs |
 | `CAL DACPROG2` — the dual-channel SPI write inside that window | 5 µs budgeted (2.75 µs measured) |
 | `SJ_MIN_SCHEDULE_US` | 3 µs |
@@ -57,19 +57,19 @@ So `STARTLAT ≥ arm + 12 µs`, and the arm is the term that sizes it — **the 
 bottleneck, the arm is**. When an arm does not fit, the train still runs with a late first latch,
 and its completion names the `STARTLAT` that would have covered it.
 
-Two cases exceed the 45 µs default and both report themselves that way. A `TRIG` route in
-independent mode arms two engines inside one ISR and pays the arm twice, so two ten-stage `L`
-trains need about 70 µs; everything else fits. And an engine re-triggered so fast that `loop()`
-never ran in between prepares its measurement plan inside the arm instead, which costs 0.55 µs per
-point, plus 3.1 µs per point if the slot changed too — a ten-point plan then needs 65 µs. A train
-has to *finish* before its engine can be re-armed, so this takes `loop()` starved for a whole
+One case exceeds the 35 µs default and reports itself that way: a `TRIG` route in independent
+mode arms two engines inside one ISR and pays the arm twice, so two ten-stage `L` trains need
+about 39 µs. An engine re-triggered so fast that `loop()` never ran in between prepares its
+measurement plan inside the arm instead, which costs 0.55 µs per point plus 3.1 µs per point if
+the slot changed too — a ten-point plan then needs 29 µs, which the default still covers. A train
+has to *finish* before its engine can be re-armed, so that takes `loop()` starved for a whole
 train, not merely a fast trigger.
 
 Jitter, not latency, is what the design buys: residual latch jitter is **42 ns** (`BENCHPIT` with
 a preload), and the per-slot delay is exact to the scope's own sample interval (2000 µs set →
 1999.3 µs measured, 20000 → 19996.0).
 
-Two qualifications on the 45 µs:
+Two qualifications on the 35 µs:
 
 - **`CAL TRIGCOMP` is 0 and unmeasured.** It is the delay from the physical edge at the input pin
   to the ISR's first instruction, which software cannot see; expect a few hundred nanoseconds.
@@ -107,7 +107,7 @@ The consequences are structural rather than tunable:
 - **The first pulse can be preempted by its own repeat.** The pin ISR runs at the core default
   priority while the repeat `IntervalTimer` runs at 64.
 - **Desk arithmetic, not a measurement:** the non-print terms sum to roughly 10 µs, so the best
-  case is under the 45 µs of `stimjimAWG` and the worst case is unbounded. Neither
+  case is under the 35 µs of `stimjimAWG` and the worst case is unbounded. Neither
   firmware's absolute edge-to-output latency has been measured on this bench; what is measured is
   the arm cost (`BENCHARM`) and the delay accuracy.
 
@@ -115,7 +115,7 @@ The consequences are structural rather than tunable:
 `loop()` prints them), `t0` is anchored to the edge timestamp so the arm is subtracted rather than
 added, the first latch always happens in the player ISR, and the trigger ISR sits at priority 80
 *below* the players, so a trigger can never delay a waveform already playing. The trade is that
-the constant is currently 45 µs — larger than the original firmware's best case, smaller than its
+the constant is currently 35 µs — larger than the original firmware's best case, smaller than its
 worst, and unlike either, repeatable to 42 ns.
 
 ## 3. Can values be preloaded into the DAC to fire faster?
@@ -155,7 +155,7 @@ timebase, not the onset. In that practical sense, the expectation that this matt
 waves is right, with those two extensions.
 
 The ceiling stands regardless: the output still needs 8–9 µs after the latch to reach full
-amplitude, so a pre-armed path would move the onset from ~45 µs to a few µs without sharpening the
+amplitude, so a pre-armed path would move the onset from ~35 µs to a few µs without sharpening the
 rise.
 
 ## 4. What the trigger interrupt starts
@@ -274,7 +274,9 @@ measurement plan; and finally `t0` plus one timer program.
 
 Of all that, only the train-level scalars and **one stage's worth** of codes and times are needed
 at `t0`. Stage i's constants are first read at the end of stage i−1 — 20 µs to seconds later — and
-the measurement plan's first point cannot fire until at least `SETTLE` after the first latch.
+the measurement plan's first point cannot fire until at least `SETTLE` after the first latch. Both
+observations have since been acted on, which is why the table below barely varies with either
+stage count or plan size.
 
 ### Measured
 
@@ -290,40 +292,43 @@ the measurement plan's first point cannot fire until at least `SETTLE` after the
 
 | Case | warmed, µs | typical, µs | worst, µs |
 |---|---|---|---|
-| undriven, 0 stages | 8.83 | 8.83 | 9.25 |
-| `S`, 1 ch, 1 stage | 10.17 | 10.12 | 10.62 |
-| `S`, 2 ch, 1 stage | 10.42 | 10.42 | 11.00 |
-| `S`, 2 ch, 1 stage, `MEAS` V+I both | 10.42 | 10.42 | 12.17 |
-| `S`, 2 ch, 10 stages | 17.46 | 17.46 | 18.00 |
-| `S`, 2 ch, 10 stages, `MEAS` V+I on every stage | 17.46 | 17.46 | 24.17 |
-| `L`, 2 ch, 1 stage | 11.75 | 11.75 | 12.25 |
-| `L`, 2 ch, 10 stages | 28.67 | 28.67 | 29.21 |
-| `W`, 2 ch | 10.83 | 10.83 | 11.33 |
+| undriven, 0 stages | 9.04 | 9.04 | 9.50 |
+| `S`, 1 ch, 1 stage | 10.79 | 10.79 | 11.29 |
+| `S`, 2 ch, 1 stage | 11.12 | 11.33 | 11.58 |
+| `S`, 2 ch, 1 stage, `MEAS` V+I both | 11.12 | 11.12 | 12.83 |
+| `S`, 2 ch, 10 stages | 13.29 | 13.29 | 13.79 |
+| `S`, 2 ch, 10 stages, `MEAS` V+I on every stage | 13.29 | 13.29 | 19.96 |
+| `L`, 2 ch, 1 stage | 12.17 | 12.38 | 12.62 |
+| `L`, 2 ch, 10 stages | 15.00 | 15.00 | 15.54 |
+| `W`, 2 ch | 10.96 | 10.96 | 11.50 |
 
 Read the third and fourth rows together, and the fifth and sixth: **in-train measurement costs the
-arm nothing at all**, whether the plan has one point or ten. What a train costs the arm is now
-only its shape:
+arm nothing at all**, whether the plan has one point or ten. Read the third against the fifth and
+the seventh against the eighth: **nine extra stages cost 2.2 µs on an `S` train and 2.8 µs on an
+`L` one**, where they used to cost 8.0 and 17.4. What a train costs the arm is now:
 
 | Term | Cost | What it is |
 |---|---|---|
-| floor | 8.83 µs | gatekeeping, the `CAL` copy, the geometry, the train-level scalars, `envInit`, `t0`, one `pitProgram` |
-| per `S` stage | 0.89 µs | two `ampToCode` conversions (`VDIV.F32` each, plus the int↔float converts and the saturation) and one 64-bit `dur_us × 120` into `cum[]` |
-| per `L` stage | 1.93 µs | the same 0.89 µs, plus 1.04 µs in `rampStageInit` |
+| floor | 9.04 µs | gatekeeping, the `CAL` copy, the geometry, the train-level scalars, `envInit`, `t0`, one `pitProgram` |
+| stage 0 | 0.6 µs (`S`) / 1.6 µs (`L`) | the one stage whose values are due at `t0` — two amplitude conversions and, for `L`, `rampStageInit` |
+| per further stage | 0.25 µs (`S`) / 0.31 µs (`L`) | one 64-bit `dur_us × 120` into `cum[]` and, for `L`, the sample-count division `rampStageN`. Both feed the measurement plan, so they cannot be deferred the way the rest of a stage can |
 | per measurement point | 0 | compiled and cleared in `loop()`. 0.55 µs to clear, and 3.1 µs more to compile, only when an engine is re-triggered before `loop()` ran |
 
-So `CAL STARTLAT` is **45 µs**: the worst warmed arm is the ten-stage `L` train's 28.7 µs, plus the
-12 µs of `PRELOAD + DACPROG2 + MIN_SCHEDULE`, with margin. Two cases still exceed it and both say
-so at train end rather than failing quietly — a `TRIG` independent route of two ten-stage `L`
-slots, which pays the arm twice and needs ~70 µs, and an engine re-triggered with `loop()` starved
-for a whole train.
+So `CAL STARTLAT` is **35 µs**. The worst warmed arm is the ten-stage `L` train's 15.0 µs, which
+needs 15.0 + `PRELOAD` + `DACPROG2` = 24 µs — and that is not arithmetic alone: set `CAL,STARTLAT,23`,
+put a real trigger edge on that train, and the engine reports `set CAL STARTLAT >= 24 us`, while 25
+and everything above it runs clean. The worst *cold* arm — an engine re-triggered with `loop()`
+starved, which compiles its own ten-point plan — is 19.96 µs and needs 29. 35 covers both with
+margin. The one case that still exceeds it says so at train end rather than failing quietly: a
+`TRIG` independent route of two ten-stage `L` slots, which pays the arm twice and needs ~39 µs.
 
-**The 8 µs target is not reachable by removing work from the arm.** The floor alone is 8.83 µs,
-for a train that drives nothing. Getting under one latch interval needs the arm moved *before* the
+**The 8 µs target is not reachable by removing work from the arm.** The floor alone is 9.0 µs, for
+a train that drives nothing. Getting under one latch interval needs the arm moved *before* the
 edge (§3), not made smaller.
 
 ### Where the arm no longer spends anything
 
-Seven changes took the arm from the 16.2–37.5 µs it once cost to the table above. All of them move
+Eight changes took the arm from the 16.2–37.5 µs it once cost to the table above. All of them move
 work out of the arm rather than making it faster.
 
 1. **The measurement plan is compiled in `loop()`, not in the arm.** The compiled region depends
@@ -370,9 +375,39 @@ work out of the arm rather than making it faster.
    the measurement plan needs — the sample count — so both `buildGeometry` and `rampStageInit`
    compute it; as an out-of-line function it cost 0.35 µs per ramp stage, because `SJ_HOT` carries
    `noinline`, which is more than the division it wraps.
+8. **Stage i+1 is derived while stage i plays.** The arm derives stage 0 — the one stage whose DAC
+   codes are due at `t0` — and the player derives each later stage in the gap before a latch it is
+   already waiting for. That takes 0.6 µs per `S` stage and 1.6 µs per `L` stage out of the arm and
+   is what makes a ten-stage `L` train cost 15.0 µs instead of 28.7.
 
-**What RAM residency is actually worth, measured.** Building the same sources with
-`-DSJ_CODE_IN_RAM=0` and running the same sweep:
+   The mechanism is one counter, `nDerived`: stages below it have their DAC-code deltas and, for a
+   ramp, their Bresenham constants. `Engine::deriveAhead` tops it up on the one path in `playerRun`
+   that programs the timer and returns — idle time by construction — and only while the gap is
+   wider than `SJ_STAGE_DERIVE_US`. `ensureDerived` at each use site is the guarantee, so
+   correctness never depends on the look-ahead having run; the call sites sit *after* a latch, so
+   a derivation that does fall back spends the interval to the next latch and never a preload
+   window. It derives as many stages as fit rather than exactly one, which is what covers a
+   0-duration `L` jump: its single sample shares a deadline with the previous stage's last one, so
+   entering it yields no gap of its own and the stage after it has to be ready already. Two
+   0-duration stages in a row are refused at parse time, so that chain is at most two long.
+
+   The player carries a 120-byte copy of the stage triplets for this (+336 B of RAM for the two
+   engines), because it must not read `TrainStore` while a train runs: a slot write is refused only
+   for the slot a train is *attached to*, and that check is made in `loop()` while a trigger edge
+   can arm from an ISR. The conversion was rewritten to take the channel's park code as an argument
+   instead of reading `Stimjim`'s offset tables, so nothing in the ISR path depends on live
+   calibration state; the expression and therefore every DAC code is unchanged.
+
+   **Measured on the board, not argued:** `tests/device/stage_timing.py` runs the six trains that
+   stress the stage machinery — ten `S` stages a millisecond apart and twelve microseconds apart,
+   ten `L` stages at the default 20 µs interval and at the 12 µs floor, an alternating 0-duration
+   jump chain, and a measured ramp — and every one completes with `lateEvents` and `overdueEvents`
+   both zero. The same script prints each case's `MSUM` rows, and they match the pre-change
+   firmware to within 7.3 mV, against per-point standard deviations of 2–10 mV.
+
+**What RAM residency is actually worth, measured.** Building the phase-11 sources with
+`-DSJ_CODE_IN_RAM=0` and running the same sweep. The absolute numbers predate the last two changes
+above, so read the third column, not the first two:
 
 | Case | `hot=RAM` | `hot=flash` | saved |
 |---|---|---|---|
@@ -403,36 +438,14 @@ arduino-cli --config-file tmp/arduino-cli.yaml compile --fqbn teensy:avr:teensy3
 
 Ordered by what the measurements say each is worth, largest first.
 
-- **Compile the measurement plan outside the arm.** 3.1 µs per point, and the whole reason the
-  worst arm is 54.3 µs instead of 23.6. The plan depends on `(slot, definition, CAL)` and on
-  nothing the arm learns, so it can be compiled in `loop()` as soon as a slot or the `CAL` set is
-  written — the arm would then always hit the tag and the two columns of the table above would
-  collapse into one. What it needs is the train geometry (`cum[]`, the ramp `N` per stage, the
-  sine constants) computed outside `startTrain`, which is the same prerequisite the next item has.
-- **Zero the accumulators outside the arm.** 0.55 µs per point, up to 5.7 µs on a ten-point plan.
-  No memory operation makes this free: 96 bytes is 24 SRAM words, and even a hand-rolled `STMIA`
-  clear would only halve the generic `memset`'s ~66 cycles. Moving it out is the only way to
-  reach zero — hold two result buffers per engine, arm on the clean one, and clear the retired one
-  in `loop()` after `printSummary` has read it. That also removes the reason the reset is in the
-  arm today (a re-arm that beats `loop()` to the drain would otherwise have its own accumulators
-  wiped) and lets the previous train's statistics survive the next start, which is what querying
-  them or writing them to SD after the fact would need. Falling back to the in-arm clear when both
-  buffers are dirty costs nothing and keeps the worst case at today's; refusing to measure instead
-  would silently lose data and is not worth the microsecond.
-- **Derive stage i+1 during stage i.** Removes `(nStages−1) × 0.89 µs` for `S` and `× 1.93 µs` for
-  `L`, i.e. up to 8 µs and 17.4 µs on a ten-stage train, and is the only way an arm's cost stops
-  depending on how many stages the train has. What moves is the per-stage work named in the table:
-  the two `ampToCode` conversions and, for `L`, `rampStageInit`. What has to stay in the arm is
-  `cum[]` and the ramp's `N` per stage, because the measurement plan is compiled against them —
-  unless the item above lands first, which is why these two are ordered this way. Deferred because
-  it turns one straight-line function into a state machine whose invariants have to hold in ISR
-  context, and because the derivation then lands in the tail of a stage-boundary ISR pass, which
-  has to be shown to fit the sample interval. Its prerequisite is in place: a 0-duration `L` stage
-  means "shift the level here, then ramp on from it", and two in a row are refused at parse time,
-  so a lazy scheme never has to look more than one stage ahead — on entering a 0-duration stage it
-  prepares the next one too.
+- **Move `cum[]` and the ramp's per-stage `N` out of the arm as well.** They are what is left of
+  the per-stage cost — 0.25 µs per `S` stage and 0.31 µs per `L` one, so 2.8 µs on the worst train.
+  They stay because `Engine::buildGeometry` is shared with the `loop()`-side plan warm, which needs
+  both arrays whole and pays nothing for them there; making them lazy means splitting that function
+  in two, and the plan tag's guarantee that a warmed plan describes the geometry the arm computes
+  rests on there being exactly one copy of it.
 - **Pre-arm the whole train and fire on a bare `NLDAC` pulse** (§3). This makes the arm's cost
   irrelevant rather than smaller, and is the only path to a single-digit *total* trigger latency —
-  and, given the 8.45 µs floor, the only path to an arm inside one latch interval.
+  and, given the 9.0 µs floor, the only path to an arm inside one latch interval.
 - **`CAL TRIGCOMP`** is still 0 and unmeasured — the one term of the delivered latency that
   software cannot see. [bench-wiring.md](bench-wiring.md) configuration B measures it.

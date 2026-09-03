@@ -96,10 +96,13 @@ static inline void pitStop(uint8_t p) {
 
 // ------------------------------------------------------------------ players
 //
-// Copy-on-arm state (plan §3.3/§3.5). Stage amplitudes are pre-converted to
+// Copy-on-arm state (plan §3.3/§3.5). Stage amplitudes are converted to
 // DAC-code *deltas relative to the channel offset* (so the envelope scales
 // them without moving the baseline) and stage boundaries to cumulative cycle
-// offsets — the ISR does no unit math. A train whose modes drive no channel
+// offsets, so a latch event costs no unit math. The conversion of stage i > 0
+// happens while stage i-1 plays rather than in the arm — one stage's worth of
+// unit math per idle gap, which is what keeps the start latency independent of
+// stage count. A train whose modes drive no channel
 // (or an S/L train with 0 stages) degenerates to per-period bookkeeping
 // (type HOLD, nStages = 0, chMask = 0) — the legacy "empty train".
 //
@@ -123,10 +126,16 @@ struct Player {
   uint8_t  type;                       // TrainType (HOLD also covers empty trains)
   uint8_t  nStages;
   int16_t  off0, off1;                 // park codes (mode's calibration offset)
+  // Stage constants, derived lazily: entries [0, nDerived) are valid and the
+  // player fills the rest while it plays (deriveStage/deriveAhead below). The
+  // arm derives stage 0 alone, because that is the only one due at t0.
   int32_t  d0[SJ_MAX_STAGES];          // HOLD levels / RAMP stage-end values,
   int32_t  d1[SJ_MAX_STAGES];          //   DAC-code deltas rel. offset
   uint64_t cum[SJ_MAX_STAGES + 1];     // stage boundaries from pulse start, cycles
   SampleGen::RampStage rst[SJ_MAX_STAGES];
+  StageDef stages[SJ_MAX_STAGES];      // copy-on-arm source the derivation reads
+  uint32_t dtUs;                       // RAMP: sample interval in force
+  uint8_t  nDerived;                   // stages [0, nDerived) are derived
   SampleGen::EnvCoef   env;
   uint32_t phaseInit0, phaseInit1;     // SINE: Q32 start phase (per-burst restart)
   uint32_t phaseInc0, phaseInc1;       // SINE: Q32 turns per sample
@@ -252,12 +261,77 @@ static inline void oeGround(const Player& pl) {
 
 // offset + envelope-scaled delta, saturated to the DAC range. envq = 32768
 // (identity) reproduces the un-enveloped codes bit-exactly (scaleQ15 is exact
-// there and the saturation already happened in ampToCode).
+// there and the saturation already happened in ampToDelta).
 static inline int16_t mkCode(int16_t off, int32_t delta, int32_t envq) {
   int32_t v = off + ((envq == 32768) ? delta : SampleGen::scaleQ15(delta, envq));
   if (v >  32767) v =  32767;
   if (v < -32768) v = -32768;
   return (int16_t)v;
+}
+
+// ------------------------------------------------- lazy stage derivation
+//
+// Amplitude (mV or uA) -> DAC-code delta relative to `off`, the channel's
+// calibration offset for the mode it is driven in. Identical float expression
+// to the legacy pulse() conversion, so in-range amplitudes give bit-exact
+// legacy codes; out-of-range ones (already WARNed at parse time) saturate
+// instead of wrapping, and the saturation is why the offset cannot simply be
+// cancelled out of the expression.
+//
+// Written against `off` rather than against Stimjim's offset tables because
+// the player derives stages in ISR context and must not read live calibration
+// state; the arm captured the same number into pl.off0/pl.off1.
+static inline int32_t ampToDelta(int32_t amp, uint8_t mode, int16_t off) {
+  int v = amp / ((mode == 0) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC) + off;
+  if (v >  32767) v =  32767;
+  if (v < -32768) v = -32768;
+  return v - off;
+}
+
+// Stage i's playback constants: the two DAC-code deltas and, for a ramp, the
+// Bresenham constants carrying the stage from its predecessor's end value.
+// Strictly in order — rst[i] starts where rst[i-1] finishes.
+//
+// This ran for every stage inside startTrain until phase 13, where it cost
+// 0.89 us per `S` stage and 1.93 us per `L` stage of the start latency. Stage i
+// is first read when stage i is entered, which for i > 0 is at least one stage
+// duration after the first latch, so the arm now derives stage 0 — the only one
+// due at t0 — and the player derives the rest as it plays
+// (docs/PLAN_lazy-stages.md).
+static SJ_HOT void deriveStage(Player& pl, uint8_t i) {
+  const int32_t p0 = i ? pl.d0[i - 1] : 0;   // ramp entry value = previous stage's
+  const int32_t p1 = i ? pl.d1[i - 1] : 0;   //   end; 0 at pulse start
+  pl.d0[i] = (pl.chMask & 1) ? ampToDelta(pl.stages[i].a0, pl.outMode0, pl.off0) : 0;
+  pl.d1[i] = (pl.chMask & 2) ? ampToDelta(pl.stages[i].a1, pl.outMode1, pl.off1) : 0;
+  if (pl.type == PIECEWISE_RAMP)
+    SampleGen::rampStageInit(pl.rst[i], pl.stages[i].dur_us, SJ_CYC_PER_US, pl.dtUs,
+                             p0, pl.d0[i], p1, pl.d1[i]);
+  pl.nDerived = (uint8_t)(i + 1);
+}
+
+// Guarantee stage `upto` is derived. Normally a no-op, because deriveAhead did
+// it in idle time; correctness never depends on that, which is why every use
+// site calls this and why the call sites sit *after* a latch rather than
+// before one.
+static inline void ensureDerived(Player& pl, uint8_t upto) {
+  while (pl.nDerived <= upto && pl.nDerived < pl.nStages) deriveStage(pl, pl.nDerived);
+}
+
+// Derive stages while there is measurably room before `wake`, the instant the
+// player is about to sleep until — idle time by construction, since the
+// caller's next act is to program the timer for it and return.
+//
+// It derives as many as fit rather than exactly one, and that is what covers a
+// 0-duration `L` jump: its single sample shares a deadline with the previous
+// stage's last one, so entering it yields no gap of its own and the stage after
+// it has to be ready already. Two 0-duration stages in a row are refused at
+// parse time, so the chain is at most two stages long.
+static SJ_HOT void deriveAhead(Player& pl, uint64_t wake) {
+  const uint32_t cost = (uint32_t)SJ_US_TO_CYC(SJ_STAGE_DERIVE_US);
+  while (pl.nDerived < pl.nStages) {
+    if ((int64_t)(wake - FastIO::cycles64()) <= (int64_t)cost) return;
+    deriveStage(pl, pl.nDerived);
+  }
 }
 
 // The player event loop, entered from the PIT ISR. Future events are scheduled
@@ -313,6 +387,10 @@ static SJ_HOT void playerRun(uint8_t p) {
       uint64_t wake = dl - pl.preloadCyc;
       if ((int64_t)(wake - now) > (int64_t)SJ_US_TO_CYC(SJ_MAX_SLICE_US))
         wake = now + SJ_US_TO_CYC(SJ_MAX_SLICE_US);
+      // The only genuinely idle point in the player: everything below returns
+      // to the NVIC and waits for `wake`. Stages the arm no longer derives are
+      // derived here, as many as the gap has room for.
+      if (pl.nDerived < pl.nStages) deriveAhead(pl, wake);
       pitProgram(p, wake, true);
       return;
     }
@@ -366,6 +444,7 @@ static SJ_HOT void playerRun(uint8_t p) {
         }
         pl.evIdx++;                    // stage done — its last sample was exact
         if (pl.evIdx < pl.nStages) {
+          ensureDerived(pl, pl.evIdx);   // no-op unless deriveAhead found no room
           const SampleGen::RampStage& prev = pl.rst[pl.evIdx - 1];
           SampleGen::rampEnter(pl.rc, pl.rst[pl.evIdx],
                                pl.pulseStart + pl.cum[pl.evIdx], prev.end0, prev.end1);
@@ -399,7 +478,10 @@ static SJ_HOT void playerRun(uint8_t p) {
                         mkCode(pl.off1, off ? 0 : pl.d1[pl.evIdx], q));
       if (pl.evIdx == 0)    oeConnect(pl);
       else if (off)         oeGround(pl);
-      if (!off) { pl.evIdx++; continue; }
+      // Stage evIdx is derived before its latch by exactly this line one event
+      // earlier (the arm derives stage 0), so the derivation always lands in
+      // the interval between two latches and never inside a preload window.
+      if (!off) { pl.evIdx++; ensureDerived(pl, pl.evIdx); continue; }
     }
 
     // off event done (or bookkeeping tick of an empty train): pulse complete
@@ -477,17 +559,6 @@ void deriveSine(uint8_t slot) {
   SampleGen::sineDerive(sineCache[slot], def.sine, driveMask(def), SJ_CYC_PER_US,
                         SJ_SINE_SAMPLES_PER_CYC, SJ_FS_MIN_HZ, SJ_FS_MAX_HZ);
   sineCacheValid[slot >> 5] |= (uint32_t)(1u << (slot & 31));
-}
-
-// Identical float expression to the legacy pulse() conversion — bit-exact DAC
-// codes for in-range amplitudes; out-of-range (already WARNed at parse time)
-// saturates instead of wrapping. mode is 0 (voltage) or 1 (current) here.
-static int16_t ampToCode(int32_t amp, uint8_t mode, uint8_t ch) {
-  int v = amp / ((mode == 0) ? MILLIVOLTS_PER_DAC : MICROAMPS_PER_DAC)
-        + ((mode == 0) ? Stimjim.voltageOffsets[ch] : Stimjim.currentOffsets[ch]);
-  if (v >  32767) v =  32767;
-  if (v < -32768) v = -32768;
-  return (int16_t)v;
 }
 
 // Everything the measurement plan is compiled against, derived from the slot's
@@ -627,26 +698,26 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
     pl.phaseInc1  = geo.phaseInc[1];
     pl.phaseInit0 = geo.phaseInit[0];
     pl.phaseInit1 = geo.phaseInit[1];
-    pl.sAmp0 = (mask & 1) ? ampToCode(def.sine.amp0, pl.outMode0, 0) - pl.off0 : 0;
-    pl.sAmp1 = (mask & 2) ? ampToCode(def.sine.amp1, pl.outMode1, 1) - pl.off1 : 0;
+    pl.sAmp0 = (mask & 1) ? ampToDelta(def.sine.amp0, pl.outMode0, pl.off0) : 0;
+    pl.sAmp1 = (mask & 2) ? ampToDelta(def.sine.amp1, pl.outMode1, pl.off1) : 0;
     pl.burstCyc = geo.burstCyc;
   }
-  // pl.cum was filled by buildGeometry; the amplitudes could not be, because
-  // they read the calibration offsets and those are deliberately outside the
-  // plan tag.
-  for (uint8_t i = 0; i < pl.nStages; i++) {
-    pl.d0[i] = (mask & 1) ? ampToCode(def.stages[i].a0, pl.outMode0, 0) - pl.off0 : 0;
-    pl.d1[i] = (mask & 2) ? ampToCode(def.stages[i].a1, pl.outMode1, 1) - pl.off1 : 0;
-  }
-  if (pl.type == PIECEWISE_RAMP) {
-    // per-stage Bresenham constants; stage i ramps from stage i-1's end (0 =
-    // the offset at pulse start) to its own programmed value (plan §3.5)
-    for (uint8_t i = 0; i < pl.nStages; i++)
-      SampleGen::rampStageInit(pl.rst[i], def.stages[i].dur_us, SJ_CYC_PER_US,
-                               dtUs,
-                               i ? pl.d0[i - 1] : 0, pl.d0[i],
-                               i ? pl.d1[i - 1] : 0, pl.d1[i]);
-  }
+  // pl.cum was filled by buildGeometry; the stage amplitudes could not be,
+  // because they read the calibration offsets and those are deliberately
+  // outside the plan tag.
+  //
+  // Copy-on-arm of the stage triplets, so the derivation below and the ones the
+  // player does later never read TrainStore: a slot write is refused only for
+  // the slot a train is *attached to*, and that check is made in loop() while a
+  // trigger edge can arm from an ISR. 12 bytes a stage, one memcpy.
+  pl.dtUs = dtUs;
+  if (pl.nStages) memcpy(pl.stages, def.stages, (size_t)pl.nStages * sizeof(StageDef));
+  // Stage 0 is the only stage whose values are due at t0 itself, inside the
+  // first latch's preload window; every later stage is derived by the player in
+  // the gap before a latch it is already waiting for, which is what makes the
+  // arm's cost independent of stage count (docs/PLAN_lazy-stages.md).
+  pl.nDerived = 0;
+  if (pl.nStages) deriveStage(pl, 0);
 
   pl.periodCyc   = SJ_US_TO_CYC(def.period_us);
   pl.durationCyc = SJ_US_TO_CYC(def.duration_us);

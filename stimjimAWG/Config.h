@@ -229,36 +229,57 @@
 //      request (a trigger edge timestamps itself) and every microsecond the
 //      arm spends comes out of the latency.
 //
-// Term 2 dominates and depends on the train: BENCHARM measures it per slot,
-// and tests/device/bench_arm.py sweeps the shapes. Measured on a Teensy 3.5 at
-// 120 MHz with the register backends, on a board whose loop() is running (which
-// is what prepares each engine's next measurement plan -- Engine::warmPlans):
-// 8.8 us for a slot that drives nothing, 10.4 us for a one-stage two-channel
-// `S` train measured or not, 10.8 us for a `W` sine, 17.5 us for a ten-stage
-// `S` train with a measurement point on every stage, and 28.7 us for a
-// ten-stage `L` train -- the worst case, because a ramp stage costs the arm
-// twice what a rectangular one does. 45 us covers all of them with margin.
+// Term 2 dominates: BENCHARM measures it per slot and tests/device/bench_arm.py
+// sweeps the shapes. Measured on a Teensy 3.5 at 120 MHz with the register
+// backends, on a board whose loop() is running (which is what prepares each
+// engine's next measurement plan -- Engine::warmPlans): 9.3 us for a slot that
+// drives nothing, 11-12 us for a one-stage `S`/`L`/`W` train measured or not,
+// 13.3 us for a ten-stage `S` train with a measurement point on every stage,
+// and 15.0 us for a ten-stage `L` train -- the worst case, because a ramp stage
+// costs the arm more than a rectangular one does. It barely depends on stage
+// count any more: the player derives stage i+1 while stage i plays, so what the
+// arm still pays per stage is one cumulative-boundary add and one sample-count
+// division (SJ_STAGE_DERIVE_US, docs/timing.md §7).
+//
+// The worst of those needs 15.0 + PRELOAD + DACPROG2 = 24 us, which is what the
+// engine itself asks for when 23 is set and a trigger edge starts that train.
+// An engine re-triggered so fast that loop() never ran in between prepares its
+// measurement plan inside the arm and needs 29 us. 35 covers both.
 //
 // What it does not cover is a TRIG independent route -- which arms two engines
 // from one edge, paying term 2 twice -- of two ten-stage `L` slots, which needs
-// about 70 us. Nor does it cover an engine re-triggered so fast that loop()
-// never ran in between, which falls back to preparing the plan inside the arm.
-// Both cases still play; the engine names the STARTLAT that would have covered
-// the arm at train end, and CAL sets it without a rebuild.
+// about 39 us. That case still plays; the engine names the STARTLAT that would
+// have covered the arm at train end, and CAL sets it without a rebuild.
 //
 // Raising this default rather than lowering it is the safe direction, so a
 // board that has an EEPROM image saved keeps whatever budget it stored -- the
-// image is not rejected over this, because a stored 60 us is merely
-// conservative, not wrong. `CAL,STARTLAT,45` then `P` adopts the new one.
+// image is not rejected over this, because a stored 45 or 60 us is merely
+// conservative, not wrong. `CAL,STARTLAT,35` then `P` adopts the new one.
 //
 // A trigger-started train subtracts the CAL TRIGCOMP parameter from it, so the
 // sum of the two is what the hardware actually has to cover.
 #if SJ_TIMER_REGISTER && SJ_FASTIO_REGISTER
-  #define SJ_START_LATENCY_US 45
+  #define SJ_START_LATENCY_US 35
 #else
   #define SJ_START_LATENCY_US 120      // RECALIBRATE with BENCHARM on the target board
 #endif
 #define SJ_TARGET_DT_US      20        // default ramp sample interval; per-train override: TrainDef.dt_us
+// What one stage's lazy derivation costs the player: two amplitude conversions
+// and, for an `L` train, SampleGen::rampStageInit. The player derives stage i+1
+// while stage i plays (Engine::deriveAhead), and only when the gap to the next
+// wake-up is wider than this — so the number gates opportunistic work, and
+// being wrong in either direction is bounded. Too small and a derivation can
+// run into the tail of a gap, which the per-latch deadline counters report; too
+// large and the look-ahead is skipped and the stage boundary derives on demand
+// instead, which is where the work used to happen anyway.
+//
+// Unlike the CAL budgets this is a property of this firmware's code on this
+// MCU, not of the analog path or the SPI route, so it stays a compile-time
+// constant. Measured at 1.7 us for an `L` stage and 0.6 us for an `S` one on a
+// Teensy 3.5 at 120 MHz with SJ_CODE_IN_RAM (docs/timing.md §7); 4 us carries
+// the worst of those with margin and still fits the 11 us gap a default 20 us
+// ramp interval leaves.
+#define SJ_STAGE_DERIVE_US   4
 // SJ_MAX_DELAY_US (per-slot post-trigger delay ceiling) lives in WaveformDef.h:
 // the host-testable parser validates against it and never includes this file.
 

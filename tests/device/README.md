@@ -10,6 +10,8 @@ there is nothing else to install.
 | `sjcon.py` | Serial console. Library (`StimJim.cmd`, `.cmd1`, `.reset`) and a CLI: `python sjcon.py COM4 IDN "S0?" DUMP` |
 | `smoke.py` | Serial-only regression run: identity, backward compatibility, the post-trigger delay set both ways, rejection paths, completion reporting, and an OLED capture in each of the three views |
 | `bench_arm.py` | Serial-only: `BENCHARM` over one slot per waveform shape (empty, `S` 1/10 stages, measured `S`, a ten-point measured `S`, `L` 1/10 stages, `W`), in three columns — warmed, typical and worst — plus what `CAL STARTLAT` each case needs from the board's own `CAL` values. The warmed column is the one that matters: it runs one arm per `loop()` pass, which is what lets `loop()` prepare the next measurement plan. Nothing is played — `BENCHARM` stops each train inside the bus lock it armed it in — so it is safe with or without a load. Uses slots 90–98 and leaves them defined, and borrows trigger input 1 (restored at the end); slots 0–9 are untouched |
+| `stage_timing.py` | Serial-only: the six trains that stress the per-stage machinery — ten `S` stages 1 ms and 12 µs apart, ten `L` stages at the default 20 µs sample interval and at the 12 µs floor, an alternating 0-duration jump chain, and a measured ramp — each run to completion and checked against the firmware's own per-latch deadline counters. The player derives stage i+1 while stage i plays, so this is what says the derivation fits. It also prints every case's `MSUM` rows, so two firmware builds can be diffed for changed DAC codes. Uses slots 80–85 and drives the outputs |
+| `startlat_trig.py` | The only harness that actually qualifies `CAL STARTLAT`: it puts real trigger edges (PicoScope AWG into IN0) on the two heaviest slots at a candidate value and reads the firmware's own verdict. A `T`/`U` start cannot do this — with no anchor the arm is not charged to the latency, so every candidate passes |
 | `pico2000.py` | ctypes binding for the legacy `ps2000` driver, which is what the PicoScope 2204A needs. Run it directly to probe the scope |
 | `pico2000a.py` | the same for the newer `ps2000a` driver. Unused on this bench; kept for 2000a-series models |
 | `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
@@ -17,6 +19,7 @@ there is nothing else to install.
 ```
 python smoke.py COM4 --screens ../../tmp/screens
 python bench_arm.py COM4
+python stage_timing.py COM4 --out ../../tmp/stage.txt
 python capture.py all
 ```
 
@@ -36,6 +39,11 @@ qualified over USB alone:
 | Does a latch make its deadline? | any train, then read the completion | `WARN engine: … latch(es) overran their deadline` |
 | How long after a latch does a reading mean anything? (`CAL SETTLE`) | `M0,0` then `BENCHSETTLE,0,8000,20,64` | the delay at which the readings stop moving; 8–9 µs here |
 | How long does arming cost? (`CAL STARTLAT`) | `python bench_arm.py COM4` | the warmed column; `STARTLAT` needs that plus `PRELOAD + DACPROG2 + 3 µs`, doubled for a two-engine trigger route. `BENCHARM,<slot>,200` on its own reports the fallback path instead, because its repetitions leave no room for a `loop()` pass |
+| Does the player keep up with the work the arm no longer does? | `python stage_timing.py COM4` | `no timing faults` |
+
+`CAL STARTLAT` is the exception: `bench_arm.py` says what the arm costs, but confirming that a
+candidate value is enough needs a real trigger edge, because a `T`/`U` start is not charged for
+the arm. `startlat_trig.py` does that with the AWG already on the bench.
 | How much does one DAC/ADC operation cost? | `BENCHDAC`, `BENCHDAC2`, `BENCHADC`, `BENCHSW`, `BENCHPIT` | the max, not the average |
 
 `BENCHSETTLE` and `BENCHSQ`/`BENCHSQL` drive the output; everything else leaves it parked.

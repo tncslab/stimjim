@@ -110,7 +110,7 @@ configuration A informative only adds uncertainty here.
 2. Define a one-pulse train with no delay and a large step, on channel 0 only:
    `S20,0,3,100000,1000;8000,0,2000`
 3. Route the trigger to it, rising edge, joint mode: `TRIG0,1,20,-1,0`
-4. `CAL,TRIGCOMP,0` and `CAL,STARTLAT,45` — you are measuring against a known budget.
+4. `CAL,TRIGCOMP,0` and `CAL,STARTLAT,35` — you are measuring against a known budget.
 5. Scope: channel B on the trigger edge, channel A on CH0(+), both DC, ±10 V range. Trigger on
    channel B rising at half the AWG amplitude, 10 % pre-trigger, 640 ns/sample.
 6. AWG: a 1 Hz square wave, 0 to 2 V (`scope.square(1.0, 2.0)` in `pico2000.py`).
@@ -121,8 +121,8 @@ configuration A informative only adds uncertainty here.
 ### What the number means
 
 The delivered latency is `TRIGCOMP + STARTLAT`. With `TRIGCOMP` at 0 the measurement should read
-about 45 µs plus the hardware part. Set `CAL,TRIGCOMP,<measured − 45>` and re-run: the delivered
-latency then reads 45 µs exactly, and `P` persists it. If the measured value is *less* than 45 µs
+about 35 µs plus the hardware part. Set `CAL,TRIGCOMP,<measured − 35>` and re-run: the delivered
+latency then reads 35 µs exactly, and `P` persists it. If the measured value is *less* than 35 µs
 something is wrong with the setup, not with the firmware — `STARTLAT` is a floor the engine
 schedules against, not an average.
 
@@ -131,7 +131,7 @@ handler is the whole of it, and the value is a property of the MCU and the core,
 
 This is also the only configuration that measures the instrument's **absolute** trigger-to-output
 latency. Everything else on this bench is differential (the same edge starts a reference pulse on
-the other engine), so until this runs, the 45 µs of [timing.md](timing.md) §1 is a budget the
+the other engine), so until this runs, the 35 µs of [timing.md](timing.md) §1 is a budget the
 engine schedules against rather than a captured figure.
 
 ---
@@ -205,7 +205,7 @@ that used to be required.
 | Question | Command | Expected on a Teensy 3.5 |
 |---|---|---|
 | `CAL SETTLE` | `M0,0` then `BENCHSETTLE,0,8000,20,64` | readings stop moving at 8–9 µs |
-| `CAL STARTLAT` | `python bench_arm.py COM4` | 8.8 µs undriven, 10–11 µs for a one-stage `S`/`L`/`W` measured or not, 28.7 µs for a ten-stage `L` |
+| `CAL STARTLAT` | `python bench_arm.py COM4` | 9.0 µs undriven, 11–12 µs for a one-stage `S`/`L`/`W` measured or not, 15.0 µs for a ten-stage `L` |
 | DAC and ADC costs | `BENCHDAC`, `BENCHDAC2`, `BENCHADC`, `BENCHSW` | 2.81 / 4.14 / 3.81 / 6.06 µs worst |
 | Timer wake and latch jitter | `BENCHPIT,1000,2000` and `BENCHPIT,1000,2000,4` | 0.47 µs worst wake, 42 ns residual jitter |
 | Does anything miss a deadline? | run a train, read the completion | silence |
