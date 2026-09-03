@@ -551,8 +551,8 @@ void poll() {
     Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
     Serial.println(" pulses.");
     printTimingFaults(c);
-    if (Measure::hasPlan(c.eng)) Measure::printSummary(c.eng, c.slot);
-    else                         Serial.println("Note: no measurement carried out.");
+    if (!Measure::printSummary(c.eng, c.slot))
+      Serial.println("Note: no measurement carried out.");
     SdLog::flushNow();
     if (c.chMask & 1) modeShadow[0] = 3;
     if (c.chMask & 2) modeShadow[1] = 3;

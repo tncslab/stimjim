@@ -139,17 +139,36 @@ bool accumStats(const Accum& a, double& mean, double& sd);
 void begin();
 void poll();   // deferred start notes, then the single drain of the MDATA ring
 
-// Make engine `eng`'s plan describe this arm. The compile is skipped when the
-// plan already describes the same slot at the same definition and CAL epochs,
-// which is every re-arm of an unedited slot -- i.e. every trigger edge of an
-// experiment after the first. An unmeasured train leaves a plan with
-// on == false, so a stale plan can never fire. The result state is always
-// cleared here, so a finished or manually stopped train keeps its accumulators
-// until the *next* arm, which is what lets `T-1` still print a summary.
-// `defEpoch`/`calEpoch` are read by the caller under the same conditions as
-// the rest of the arm.
+// Each engine holds two plans, and the arm swaps between them rather than
+// rewriting one in place: the player ISR only ever reads the live buffer, so
+// loop() owns the other and can prepare it without any lock at all. That is
+// what takes the compile and the accumulator zeroing out of the start latency
+// (docs/PLAN_plan-out-of-arm.md); it also means a train re-armed before its
+// completion was drained keeps its summary.
+//
+// Make engine `eng`'s plan describe this arm, by taking the spare buffer. The
+// compile is skipped when that buffer already describes the same slot at the
+// same definition and CAL epochs -- which is what warmPlan arranges, and what
+// every re-arm of an unedited slot gets anyway. An unmeasured train leaves a
+// plan with on == false, so a stale plan can never fire. `defEpoch`/`calEpoch`
+// are read by the caller under the same conditions as the rest of the arm.
 void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
              uint32_t defEpoch, uint32_t calEpoch);
+
+// loop()-context preparation of the buffer the next arm will take. warmPlan
+// compiles it and clears its accumulators; planReady reports whether that has
+// already happened, so the caller can skip building a Geometry it would not
+// use. Both are no-ops while the spare buffer holds an unprinted summary.
+bool planReady(uint8_t eng, uint8_t slot, uint32_t defEpoch, uint32_t calEpoch);
+void warmPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
+              uint32_t defEpoch, uint32_t calEpoch);
+// Clear the spare buffer's accumulators if a finished train left results in
+// them and the summary has been printed. This is the zeroing the arm used to
+// do; calling it from loop() costs the arm nothing.
+void housekeep(uint8_t eng);
+// Player-ISR call at train end: freezes the finished train's buffer until
+// printSummary has read it.
+void trainDone(uint8_t eng);
 
 // --- player-ISR interface -------------------------------------------------
 // Absolute deadline of the next measurement point of the current pulse, or
@@ -162,8 +181,14 @@ void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15);
 // Rewind to the first point of the next pulse.
 void pulseDone(uint8_t eng);
 
-// End-of-train MSUM block, printed from loop() after the completion line.
-void printSummary(uint8_t eng, uint8_t slot);
+// End-of-train MSUM block, printed from loop() after the completion line. It
+// reads the buffer the *finished* train used, which is no longer the live one
+// once the engine has been re-armed -- surviving that is what the second buffer
+// is for. Returns false when the train measured nothing, so the caller can say
+// so; call it for every completion either way, because it is also what hands
+// the buffer back to loop()'s housekeeping.
+bool printSummary(uint8_t eng, uint8_t slot);
+// Whether the train the engine is playing *now* has measurement points.
 bool hasPlan(uint8_t eng);
 
 #endif // ARDUINO

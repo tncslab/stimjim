@@ -126,6 +126,7 @@ void loop() {
   Commands::poll();          // completion-ring drain: train result summaries
   Triggers::poll();          // deferred trigger-reject WARNs (ISRs never print)
   Measure::poll();           // MDATA ring drain: streaming and SD rows
+  Engine::warmPlans();       // compile + clear the next arm's plan, off the latency path
   SdLog::poll();             // periodic log flush
   UiMenu::tick();            // event drain + throttled render
 }

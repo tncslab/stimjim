@@ -65,6 +65,28 @@ struct RampCursor {           // live state — holds the NEXT sample to latch
   uint32_t tAcc, cAcc0, cAcc1;// remainder accumulators
 };
 
+// Samples a stage of `dur_us` gets at a target interval of `targetDt_us`,
+// rounded to nearest and never below 1 (a 0-duration stage is one sample: the
+// instant jump). Split out of rampStageInit because the measurement plan is
+// compiled against the sample count alone — it needs no other stage constant,
+// and deriving it separately is what lets the plan be compiled outside the arm
+// (docs/PLAN_plan-out-of-arm.md).
+// Inline rather than a call: both callers are on the start-latency path and
+// SJ_HOT (FASTRUN) carries noinline, so putting it in the .cpp cost 0.35 us per
+// ramp stage in the arm -- more than the division it wraps.
+inline uint32_t rampStageN(uint32_t dur_us, uint32_t targetDt_us) {
+  // N <= 2^32/targetDt so it fits int32 for targetDt >= 2. Both operands are
+  // 32-bit, which is one hardware UDIV instead of a call into
+  // __aeabi_uldivmod -- but dur_us is only bounded by strtoul, so a duration
+  // within targetDt/2 of UINT32_MAX would wrap the rounding bias. That case
+  // keeps the 64-bit sum.
+  const uint32_t bias = targetDt_us / 2;
+  const uint32_t N = (dur_us <= UINT32_MAX - bias)
+                   ? (dur_us + bias) / targetDt_us
+                   : (uint32_t)(((uint64_t)dur_us + bias) / targetDt_us);
+  return N ? N : 1;
+}
+
 // Precompute a stage's Bresenham constants. start/end are DAC-code deltas at
 // stage entry/exit; cycPerUs is exact (120 on Teensy 3.5).
 void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,

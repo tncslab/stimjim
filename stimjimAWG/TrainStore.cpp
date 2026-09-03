@@ -53,7 +53,15 @@ void begin() {
 TrainDef&       slot(uint8_t idx)      { return slots[idx]; }
 const TrainDef& slotConst(uint8_t idx) { return slots[idx]; }
 
-void commit(uint8_t idx, const TrainDef& staged) { slots[idx] = staged; defEpoch++; }
+static uint8_t lastWritten_ = 0;
+
+void commit(uint8_t idx, const TrainDef& staged) {
+  slots[idx] = staged;
+  defEpoch++;
+  lastWritten_ = idx;
+}
+
+uint8_t lastWritten() { return lastWritten_; }
 
 uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 

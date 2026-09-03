@@ -25,16 +25,7 @@ namespace SampleGen {
 SJ_HOT void rampStageInit(RampStage& st, uint32_t dur_us, uint32_t cycPerUs,
                    uint32_t targetDt_us, int32_t start0, int32_t end0,
                    int32_t start1, int32_t end1) {
-  // N <= 2^32/targetDt so it fits int32 for targetDt >= 2. Both operands are
-  // 32-bit, which is one hardware UDIV instead of a call into
-  // __aeabi_uldivmod -- but dur_us is only bounded by strtoul, so a duration
-  // within targetDt/2 of UINT32_MAX would wrap the rounding bias. That case
-  // keeps the 64-bit sum.
-  const uint32_t bias = targetDt_us / 2;
-  uint32_t N = (dur_us <= UINT32_MAX - bias)
-             ? (dur_us + bias) / targetDt_us
-             : (uint32_t)(((uint64_t)dur_us + bias) / targetDt_us);
-  if (N == 0) N = 1;
+  const uint32_t N = rampStageN(dur_us, targetDt_us);
   st.N = N;
 
   // durCyc = dur_us * cycPerUs reaches 2.4e11, so durCyc/N and durCyc%N are a

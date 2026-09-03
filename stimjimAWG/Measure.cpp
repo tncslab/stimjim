@@ -232,7 +232,36 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g) {
 
 namespace Measure {
 
-static Plan plan_[2];
+// Two plans per engine, and one invariant that everything below rests on:
+//
+//   plan_[eng][live[eng]] is the ONLY plan the player ISR of engine eng ever
+//   touches. The other one belongs to loop(), which may compile into it and
+//   clear it whenever it likes.
+//
+// live[eng] moves only inside armPlan, which runs with that engine's player
+// masked or stopped, so no reader ever sees it change under itself. What the
+// second buffer buys (docs/PLAN_plan-out-of-arm.md):
+//
+//   - the 3.1 us/point compile and the 0.55 us/point zeroing leave the arm,
+//     because loop() prepares the buffer the next arm will take;
+//   - a train re-armed before loop() drained its completion keeps its summary,
+//     which a single in-place plan could not.
+static Plan plan_[2][2];
+static volatile uint8_t live[2] = {0, 0};
+// Which buffer holds the train that just finished, and whether its summary is
+// still unprinted. Set in the player ISR at completion, cleared by
+// printSummary. loop() must not reuse or clear the buffer it names.
+static volatile uint8_t summaryIdx[2]     = {0, 0};
+static volatile bool    summaryPending[2] = {false, false};
+// The buffer holds accumulated results that have not been cleared yet.
+static volatile bool    dirty[2][2]       = {{false, false}, {false, false}};
+// loop() is writing the spare buffer of this engine right now. An arm that
+// lands in that window (a trigger ISR preempting loop()) reuses the live buffer
+// in place instead of taking the spare -- which is exactly what the
+// single-buffer firmware always did, so the fallback is a known-good path and
+// costs what it used to cost. Plain volatile is enough for the handshake: one
+// core, and ISR entry and exit serialize.
+static volatile bool    loopBusy[2]       = {false, false};
 static volatile bool notePending[2] = {false, false};
 
 // MDATA ring — SPSC: the player ISRs produce, poll() is the *only* consumer
@@ -254,44 +283,138 @@ void begin() {
   memset(plan_, 0, sizeof plan_);
 }
 
-bool hasPlan(uint8_t eng) { return plan_[eng].on; }
+bool hasPlan(uint8_t eng) { return plan_[eng][live[eng]].on; }
+
+// True when this buffer does not already describe that (slot, definition, CAL)
+// triple. Four loads, so both the arm and loop()'s warm can ask before doing
+// anything expensive.
+static inline bool tagMisses(const Plan& p, uint8_t slot,
+                             uint32_t defEpoch, uint32_t calEpoch) {
+  return !p.tagValid || p.tagSlot != slot ||
+         p.tagDefEpoch != defEpoch || p.tagCalEpoch != calEpoch;
+}
+
+static void planCompileTagged(Plan& p, uint8_t slot, const TrainDef& def,
+                              const Geometry& g, uint32_t defEpoch, uint32_t calEpoch) {
+  planCompile(p, slot, def, g);
+  p.tagValid    = true;
+  p.tagSlot     = slot;
+  p.tagDefEpoch = defEpoch;
+  p.tagCalEpoch = calEpoch;
+}
+
+// Which buffer the next arm of this engine will take. Not a claim -- callers
+// that intend to write it must go through claimSpare.
+static inline uint8_t spareIdx(uint8_t eng) { return (uint8_t)(live[eng] ^ 1); }
+
+// Claim the spare buffer for loop(). Returns SJ_NO_BUFFER when it must be left
+// alone: it still holds an unprinted summary, or an arm took it between reading
+// live[] and publishing the claim. The re-read of live[] after setting loopBusy
+// is what closes that second window -- an arm that beat us moved live, and an
+// arm that comes after us sees the flag and stays on its own buffer, so exactly
+// one of the two happens.
+#define SJ_NO_BUFFER 0xFF
+static uint8_t claimSpare(uint8_t eng) {
+  const uint8_t n = spareIdx(eng);
+  if (summaryPending[eng] && summaryIdx[eng] == n) return SJ_NO_BUFFER;
+  loopBusy[eng] = true;
+  if (live[eng] != (uint8_t)(n ^ 1)) { loopBusy[eng] = false; return SJ_NO_BUFFER; }
+  return n;
+}
+static inline void releaseSpare(uint8_t eng) { loopBusy[eng] = false; }
+
+bool planReady(uint8_t eng, uint8_t slot, uint32_t defEpoch, uint32_t calEpoch) {
+  const uint8_t n = spareIdx(eng);
+  if (summaryPending[eng] && summaryIdx[eng] == n) return false;
+  return !tagMisses(plan_[eng][n], slot, defEpoch, calEpoch);
+}
+
+void warmPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
+              uint32_t defEpoch, uint32_t calEpoch) {
+  const uint8_t n = claimSpare(eng);
+  if (n == SJ_NO_BUFFER) return;
+  Plan& p = plan_[eng][n];
+  if (tagMisses(p, slot, defEpoch, calEpoch)) {
+    planCompileTagged(p, slot, def, g, defEpoch, calEpoch);
+    // Always reset after a compile, never only when dirty: the new plan may
+    // have more points than the one whose clear this buffer last got.
+    planResetResults(p);
+    dirty[eng][n] = false;
+  }
+  releaseSpare(eng);
+}
+
+void housekeep(uint8_t eng) {
+  if (!dirty[eng][spareIdx(eng)]) return;      // nothing to do, and no claim needed
+  const uint8_t n = claimSpare(eng);
+  if (n == SJ_NO_BUFFER) return;
+  if (dirty[eng][n]) {                          // re-read under the claim
+    planResetResults(plan_[eng][n]);
+    dirty[eng][n] = false;
+  }
+  releaseSpare(eng);
+}
 
 void armPlan(uint8_t eng, uint8_t slot, const TrainDef& def, const Geometry& g,
              uint32_t defEpoch, uint32_t calEpoch) {
-  Plan& p = plan_[eng];
+  // Take the buffer the player is not using -- unless loop() is writing it, in
+  // which case stay on the live one and rewrite it in place. That fallback is
+  // what the single-buffer firmware always did: it costs the compile and the
+  // clear, and it can lose an unprinted summary, but it is never wrong. It
+  // needs a trigger edge to land inside loop()'s compile window to happen at
+  // all.
+  uint8_t n = loopBusy[eng] ? live[eng] : (uint8_t)(live[eng] ^ 1);
   // The compiled region depends on the slot, its definition and the CAL set --
   // never on the calibration offsets, which is why an offset recalibration is
-  // not in the tag. Re-arming an unedited slot therefore reuses it, and the
-  // 4.2 us compile drops out of every trigger edge after the first.
-  if (!p.tagValid || p.tagSlot != slot ||
-      p.tagDefEpoch != defEpoch || p.tagCalEpoch != calEpoch) {
-    planCompile(p, slot, def, g);
-    p.tagValid    = true;
-    p.tagSlot     = slot;
-    p.tagDefEpoch = defEpoch;
-    p.tagCalEpoch = calEpoch;
+  // not in the tag. loop() has normally compiled the spare already (warmPlan),
+  // so this misses only when loop() has not run since the last arm or the edit.
+  bool compiled = tagMisses(plan_[eng][n], slot, defEpoch, calEpoch);
+  if (compiled && n != live[eng]) {
+    // The spare describes some other slot, but the live buffer may still
+    // describe this one -- a repeated start of the same slot with loop()
+    // starved. Reusing it in place is free where compiling is not, and the
+    // only thing it gives up is the second buffer's other benefit: it must not
+    // take a buffer whose summary nobody has printed.
+    const bool liveHoldsSummary = summaryPending[eng] && summaryIdx[eng] == live[eng];
+    if (!liveHoldsSummary && !tagMisses(plan_[eng][live[eng]], slot, defEpoch, calEpoch)) {
+      n = live[eng];
+      compiled = false;
+    }
   }
-  // Always: an armed train starts from zeroed accumulators. Keeping this in the
-  // arm rather than deferring it to the end of the previous train is deliberate
-  // -- a trigger that re-arms the engine before loop() has drained the previous
-  // completion would otherwise have its own accumulators wiped by that drain
-  // (docs/PLAN_arm-cost.md).
-  planResetResults(p);
+  Plan& p = plan_[eng][n];
+  if (compiled) planCompileTagged(p, slot, def, g, defEpoch, calEpoch);
+  // An armed train starts from zeroed accumulators. loop() normally cleared
+  // them at housekeep time, so the usual case is neither branch. The dirty
+  // flag covers a buffer loop() has not reached; the compile covers a subtler
+  // one -- a plan cleared while it had fewer points than this one has leaves
+  // the points beyond that count holding an older train's sums, and only a
+  // reset taken *after* the compile knows how many points to clear.
+  if (compiled || dirty[eng][n]) planResetResults(p);
+  dirty[eng][n] = p.on;
+  live[eng]     = n;
   notePending[eng] = p.on;
 }
 
+// Called by the player ISR where it pushes the completion record: it freezes
+// the finished train's buffer so neither the next arm nor loop()'s housekeeping
+// takes it before printSummary has read it.
+void trainDone(uint8_t eng) {
+  summaryIdx[eng]     = live[eng];
+  summaryPending[eng] = true;
+}
+
 uint64_t nextDeadline(uint8_t eng, uint64_t pulseStart) {
-  Plan& p = plan_[eng];
+  Plan& p = plan_[eng][live[eng]];
   if (!p.on) return UINT64_MAX;
   while (p.next < p.nPoints && (p.skipMask & (1u << p.next))) p.next++;
   if (p.next >= p.nPoints) return UINT64_MAX;
   return pulseStart + p.atCyc[p.next];
 }
 
-void pulseDone(uint8_t eng) { plan_[eng].next = 0; }
+void pulseDone(uint8_t eng) { plan_[eng][live[eng]].next = 0; }
 
 void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15) {
-  Plan& p = plan_[eng];
+  Plan& p = plan_[eng][live[eng]];
   const uint8_t i = p.next;
   if (i >= p.nPoints) return;
   p.next = (uint8_t)(i + 1);
@@ -365,7 +488,7 @@ static inline void field(char* b, size_t n, bool have, double v) {
 // Runs once per armed plan, before the ring is drained in the same poll() call
 // — so the log block and the warnings always precede that train's rows.
 static void printNote(uint8_t eng) {
-  const Plan& p = plan_[eng];
+  const Plan& p = plan_[eng][live[eng]];
   if (p.report & 2) SdLog::noteTrain(p.slot);
   if (p.skipMask) {
     for (uint8_t i = 0; i < p.nPoints; i++) {
@@ -436,12 +559,21 @@ void poll() {
   }
 }
 
-void printSummary(uint8_t eng, uint8_t slot) {
-  Plan& p = plan_[eng];
-  if (!p.on) return;
+bool printSummary(uint8_t eng, uint8_t slot) {
+  // The finished train's buffer, not the live one: the engine may already have
+  // been re-armed onto the other buffer, and with two of them that no longer
+  // costs the summary anything. It takes two re-arms with no loop() pass
+  // between them to lose one now. Clearing summaryPending here is what releases
+  // the buffer back to loop()'s housekeeping, so this must be called for every
+  // completion, measured or not -- which is why the caller learns from the
+  // return value rather than from a separate query.
+  const uint8_t idx = summaryPending[eng] ? summaryIdx[eng] : live[eng];
+  Plan& p = plan_[eng][idx];
+  summaryPending[eng] = false;
+  if (!p.on) return false;
   if (p.slot != slot) {
-    Serial.printf("# MSUM: engine %u was re-armed before its summary printed — dropped\n", eng);
-    return;
+    Serial.printf("# MSUM: engine %u was re-armed twice before its summary printed — dropped\n", eng);
+    return true;
   }
   for (uint8_t i = 0; i < p.nPoints; i++) {
     char f[8][16];
@@ -474,6 +606,7 @@ void printSummary(uint8_t eng, uint8_t slot) {
   if (p.envSkipped)
     Serial.printf("# MSUM: %lu repetitions skipped inside the ENV ramps\n",
                   (unsigned long)p.envSkipped);
+  return true;
 }
 
 #endif // ARDUINO

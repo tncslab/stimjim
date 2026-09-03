@@ -58,6 +58,13 @@ void commit(uint8_t idx, const TrainDef& staged);   // atomic slot replacement
 // bookkeeping that would avoid it.
 uint32_t epoch();
 
+// The slot the last commit() wrote. A guess at what the operator is about to
+// start, and the only guess available for a `T`/`U` start, which names no slot
+// in advance the way a TRIG route does. Engine::warmPlans uses it to prepare a
+// plan for engines no route points at, so the first serial start of a freshly
+// edited slot does not compile inside its own start latency.
+uint8_t lastWritten();
+
 // ------------------------------------------------------ round-trip serializers
 // Canonical one-line set-commands (protocol §1 query contract), no spaces.
 void serializeTrain(uint8_t idx, const TrainDef& t, char* buf, size_t n);

@@ -111,8 +111,8 @@ port before anything is wired.
 independent route: two engines started by one edge cannot latch at the same instant and the
 second one lands ~9 µs late. See [docs/serial-protocol.md §4](docs/serial-protocol.md).
 
-A trigger edge puts signal on the output **60 µs later** (`CAL STARTLAT`, adjustable), repeatable
-to 42 ns, plus whatever `DELAY` asks for. The 60 µs is almost all the arm — the copy and
+A trigger edge puts signal on the output **45 µs later** (`CAL STARTLAT`, adjustable), repeatable
+to 42 ns, plus whatever `DELAY` asks for. The 45 µs is almost all the arm — the copy and
 precomputation the edge ISR does before it hands the train to the timer — not the DAC write, which
 is 2.75 µs. The edge ISR itself emits nothing: it timestamps the edge, computes `t0` and programs
 a timer, and every sample is latched from the timer ISR, which is why the latency does not depend

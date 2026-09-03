@@ -431,7 +431,7 @@ emits a line for each one that differs from the build default. The `IDN` `# engi
 | `ADCSWITCH` | 4 | extra cost of a control-register line switch |
 | `GUARD` | 1 | margin between the last read and the next preload window |
 | `SETTLE` | 9 | after a latch, before a reading means anything (`BENCHSETTLE`) |
-| `STARTLAT` | 60 | fixed start-request → first-latch latency |
+| `STARTLAT` | 45 | fixed start-request → first-latch latency |
 | `TRIGCOMP` | 0 | hardware pin edge → trigger-ISR entry, subtracted for trigger starts |
 
 All values are whole microseconds, 0…1000. They are **budgets, so they carry the measured worst
@@ -449,23 +449,26 @@ these checks at boot is dropped with a `#` line and the build defaults stay in f
 `t0` is measured from the *start request* — a trigger edge timestamps itself in the ISR's first
 instruction — so every microsecond `Engine::startTrain` spends comes out of the latency rather
 than being added to it. `BENCHARM,<slot>` measures that cost for one slot, and
-`tests/device/bench_arm.py` sweeps one slot per shape and prints what `STARTLAT` each needs. On a
-Teensy 3.5 with the register backends the phase-9 firmware measured 16.6 µs for a slot that drives
-nothing, 19.5 µs for an unmeasured two-channel `S` train, 23.8 µs with in-train measurement,
-28.7 µs for ten stages and 42 µs for a measured sine; `STARTLAT` must be at least that plus
-`PRELOAD + DACPROG2 + 3 µs`, which is where the 60 µs default comes from. Work has since been
-moved out of the arm — the measurement plan is compiled once per definition rather than per arm,
-the sine constants are derived when `W` is parsed, and the hot functions can execute from RAM —
-so those figures are now upper bounds, and the default stays at 60 µs until the sweep has been
-re-run on silicon ([timing.md](timing.md) §7).
+`tests/device/bench_arm.py` sweeps one slot per shape and prints what `STARTLAT` each needs.
+Measured on a Teensy 3.5 with the register backends: 8.8 µs for a slot that drives nothing,
+10.4 µs for a one-stage two-channel `S` train — measured or not, in-train measurement now costs
+the arm nothing — 10.8 µs for a sine, 17.5 µs for a ten-stage `S` train with a point on every
+stage, and 28.7 µs for a ten-stage `L` train, which is the worst case because a ramp stage costs
+the arm twice what a rectangular one does. `STARTLAT` must be at least that plus
+`PRELOAD + DACPROG2 + 3 µs`, which is where the 45 µs default comes from.
+
+Those figures assume `loop()` is running, because that is what prepares each engine's next
+measurement plan and clears the accumulators of the last train. An engine re-triggered so fast
+that `loop()` never ran in between falls back to doing both inside the arm, which costs about
+0.6 µs per measurement point and, if the slot also changed, another 3.1 µs per point.
 
 A `TRIG` route in independent mode (`mode 2`) arms **two** engines from one edge, inside one ISR,
-so it pays the arm twice before the second engine's first latch is due: two `S` or `L` trains fit
-in 60 µs, two sine trains need about 100. When an arm does not fit, the train still runs — its
-first latch is simply late — and the completion carries
+so it pays the arm twice before the second engine's first latch is due: two ten-stage `L` trains
+need about 70 µs, and everything else fits in 45. When an arm does not fit, the train still runs
+— its first latch is simply late — and the completion carries
 
 ```
-WARN engine: arming this train took longer than CAL STARTLAT (60 us), so its first latch could
+WARN engine: arming this train took longer than CAL STARTLAT (45 us), so its first latch could
 not be on time — set CAL STARTLAT >= <n> us (BENCHARM,<slot> measures the arm; a TRIG independent
 route arms twice)
 ```

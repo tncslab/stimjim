@@ -165,6 +165,10 @@ static Completion   compRing[8];
 static volatile uint8_t compHead = 0, compTail = 0;
 
 static void pushCompletion(uint8_t eng) {
+  // Freeze this train's measurement plan before anything can re-arm the engine
+  // onto the other buffer: printSummary reads the frozen one, and loop()'s
+  // housekeeping leaves it alone until the summary is out.
+  Measure::trainDone(eng);
   uint8_t h = compHead, next = (uint8_t)((h + 1) & 7);
   if (next == compTail) return;        // 8 unread completions — cannot happen in practice
   compRing[h].eng     = eng;
@@ -428,6 +432,15 @@ static SJ_HOT void playerRun(uint8_t p) {
 // next arm of a sine slot re-derives that one entry. `deriveSine` warms an
 // entry from command context right after a slot is written, so in practice the
 // arm only ever reads.
+//
+// Both loop() and a trigger ISR can reach the derivation (through
+// buildGeometry), so a warm can be preempted halfway through writing an entry.
+// That is harmless rather than lucky: the derivation is a pure function of the
+// definition, the definition cannot change under it (only loop() writes slots,
+// and it cannot preempt itself), and the valid bit is set after the write --
+// so the preempting arm finds the entry invalid, derives the identical 20
+// bytes itself, and reads back its own complete write. Two writers laying down
+// the same bytes cannot tear into a third value.
 static SampleGen::SineConst sineCache[SJ_NUM_SLOTS];
 static uint32_t sineCacheEpoch = 0;                        // 0 = nothing derived yet
 static uint32_t sineCacheValid[(SJ_NUM_SLOTS + 31) / 32];  // bit per slot
@@ -477,6 +490,90 @@ static int16_t ampToCode(int32_t amp, uint8_t mode, uint8_t ch) {
   return (int16_t)v;
 }
 
+// Everything the measurement plan is compiled against, derived from the slot's
+// definition and the CAL set and from nothing else -- no Player, no start time,
+// no calibration offsets. That last exclusion is why the plan tag does not
+// carry the offsets: recalibrating them cannot change any of this.
+//
+// It exists so the plan can be compiled in loop() as well as in the arm
+// (docs/PLAN_plan-out-of-arm.md), and there is exactly one copy of it because
+// two would let a warm plan carry a tag claiming a geometry it does not
+// describe. `cum` (SJ_MAX_STAGES+1 entries) and `stageN` (SJ_MAX_STAGES) are
+// the caller's storage; `geo` points into them. Returns false, with a reason in
+// `err` when that is non-NULL, for the trains startTrain refuses anyway.
+SJ_HOT bool buildGeometry(uint8_t slotIdx, const TrainDef& def, const Cal::Def& cal,
+                   uint64_t* cum, uint32_t* stageN, Measure::Geometry& geo,
+                   uint32_t* dtUsOut, char* err, size_t errsz) {
+  const uint8_t mask = driveMask(def);   // 0 = empty train: bookkeeping only
+  // Programming budget of one latch on this train: the preload spin plus the
+  // DAC write, which costs more when both channels are driven.
+  const uint32_t progUs = (uint32_t)cal.us[Cal::PRELOAD] +
+                          (mask == 0b11 ? cal.us[Cal::DACPROG2] : cal.us[Cal::DACPROG1]);
+  const uint32_t dtUs   = def.dt_us ? def.dt_us : (uint32_t)SJ_TARGET_DT_US;
+  *dtUsOut = dtUs;
+  if (def.type == PIECEWISE_RAMP && mask && dtUs < progUs + SJ_MIN_SCHEDULE_US) {
+    // A ramp interval below what one latch costs would schedule samples the
+    // player cannot program in time — every one of them late. Refused here
+    // rather than at parse time because the budget is a runtime quantity.
+    if (err)
+      snprintf(err, errsz, "ramp interval %lu us is below the %lu us this board needs "
+               "per sample — start dropped", (unsigned long)dtUs,
+               (unsigned long)(progUs + SJ_MIN_SCHEDULE_US));
+    return false;
+  }
+  if (def.type == SINE && mask) {
+    // Nyquist gate: above Fs/2 the phase increment exceeds half a turn per
+    // sample — unrepresentable. Checked here (not at parse time) because
+    // FS_MAX is an engine property (provisional pre-bench, plan §3.5).
+    uint64_t f0 = (mask & 1) ? def.sine.freq0_mHz : 0;
+    uint64_t f1 = (mask & 2) ? def.sine.freq1_mHz : 0;
+    if ((f0 > f1 ? f0 : f1) > (uint64_t)SJ_FS_MAX_HZ * 1000 / 2) {
+      if (err)
+        snprintf(err, errsz, "sine frequency above Fs/2 = %d Hz — start dropped",
+                 SJ_FS_MAX_HZ / 2);
+      return false;
+    }
+  }
+
+  const uint8_t type    = mask ? def.type : (uint8_t)PIECEWISE_HOLD;
+  const uint8_t nStages = mask ? def.nStages : (uint8_t)0;
+  uint64_t acc = 0;
+  cum[0] = 0;
+  for (uint8_t i = 0; i < nStages; i++) {
+    acc += SJ_US_TO_CYC(def.stages[i].dur_us);
+    cum[i + 1] = acc;
+    // The sample count is all the plan needs of a ramp stage; the Bresenham
+    // constants that go with it are the arm's business (SampleGen::rampStageN).
+    stageN[i] = (type == PIECEWISE_RAMP) ? SampleGen::rampStageN(def.stages[i].dur_us, dtUs) : 1;
+  }
+
+  geo.type         = type;
+  geo.chMask       = mask;
+  geo.nStages      = nStages;
+  geo.cum          = cum;
+  geo.stageN       = (type == PIECEWISE_RAMP) ? stageN : nullptr;
+  geo.preloadCyc   = (uint32_t)SJ_US_TO_CYC(progUs);
+  geo.adcReadCyc   = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCREAD]);
+  geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCSWITCH]);
+  geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::GUARD]);
+  geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::SETTLE]);
+  if (type == SINE) {
+    const SampleGen::SineConst& sc = sineConst(slotIdx, def, mask);
+    geo.sampleCyc    = sc.sampleCyc;
+    geo.burstCyc     = SJ_US_TO_CYC(def.sine.burst_us);
+    geo.phaseInit[0] = sc.phaseInit[0];
+    geo.phaseInit[1] = sc.phaseInit[1];
+    geo.phaseInc[0]  = sc.phaseInc[0];
+    geo.phaseInc[1]  = sc.phaseInc[1];
+  } else {
+    geo.sampleCyc    = 0;
+    geo.burstCyc     = 0;
+    geo.phaseInit[0] = geo.phaseInit[1] = 0;
+    geo.phaseInc[0]  = geo.phaseInc[1]  = 0;
+  }
+  return true;
+}
+
 SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
                 char* err, size_t errsz, uint64_t anchorCyc) {
   Player& pl = player[eng];
@@ -489,33 +586,17 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   // used for the whole arm, so a `CAL` line that lands mid-arm cannot make one
   // train use two different budgets.
   const Cal::Def cal = Cal::live();
-  const uint8_t mask = driveMask(def);   // 0 = empty train: bookkeeping only
-  // Programming budget of one latch on this train: the preload spin plus the
-  // DAC write, which costs more when both channels are driven.
-  const uint32_t progUs = (uint32_t)cal.us[Cal::PRELOAD] +
-                          (mask == 0b11 ? cal.us[Cal::DACPROG2] : cal.us[Cal::DACPROG1]);
-  const uint32_t dtUs   = def.dt_us ? def.dt_us : (uint32_t)SJ_TARGET_DT_US;
-  if (def.type == PIECEWISE_RAMP && mask && dtUs < progUs + SJ_MIN_SCHEDULE_US) {
-    // A ramp interval below what one latch costs would schedule samples the
-    // player cannot program in time — every one of them late. Refused here
-    // rather than at parse time because the budget is a runtime quantity.
-    snprintf(err, errsz, "ramp interval %lu us is below the %lu us this board needs "
-             "per sample — start dropped", (unsigned long)dtUs,
-             (unsigned long)(progUs + SJ_MIN_SCHEDULE_US));
+  // stageN is read only while the plan is compiled, so a stack copy is enough
+  // -- the Player does not carry the ramp sample counts.
+  uint32_t stageN[SJ_MAX_STAGES];
+  Measure::Geometry geo;
+  uint32_t dtUs;
+  // Writes pl.cum before the channel-conflict check below can refuse the start.
+  // Safe: the busy check above passed, so this engine's player is idle and
+  // nothing reads pl.cum until pl.active is set at the end of this function.
+  if (!buildGeometry(slotIdx, def, cal, pl.cum, stageN, geo, &dtUs, err, errsz))
     return false;
-  }
-  if (def.type == SINE && mask) {
-    // Nyquist gate: above Fs/2 the phase increment exceeds half a turn per
-    // sample — unrepresentable. Checked here (not at parse time) because
-    // FS_MAX is an engine property (provisional pre-bench, plan §3.5).
-    uint64_t f0 = (mask & 1) ? def.sine.freq0_mHz : 0;
-    uint64_t f1 = (mask & 2) ? def.sine.freq1_mHz : 0;
-    if ((f0 > f1 ? f0 : f1) > (uint64_t)SJ_FS_MAX_HZ * 1000 / 2) {
-      snprintf(err, errsz, "sine frequency above Fs/2 = %d Hz — start dropped",
-               SJ_FS_MAX_HZ / 2);
-      return false;
-    }
-  }
+  const uint8_t mask = geo.chMask;
   const Player& other = player[eng ^ 1];
   if (other.active && (mask & other.chMask)) {
     snprintf(err, errsz, "channel conflict with the running %c train — start dropped",
@@ -528,8 +609,8 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.outMode0 = def.mode0 & 1;
   pl.outMode1 = def.mode1 & 1;
   // undriven/empty trains degenerate to HOLD bookkeeping (0 stages, no events)
-  pl.type     = mask ? def.type : (uint8_t)PIECEWISE_HOLD;
-  pl.nStages  = mask ? def.nStages : 0;
+  pl.type     = geo.type;
+  pl.nStages  = geo.nStages;
   // inter-pulse park level = the mode's calibration offset (legacy state);
   // stage amplitudes become deltas from it so the envelope can scale them
   pl.off0 = (int16_t)(pl.outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
@@ -537,27 +618,25 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
 
   if (pl.type == SINE) {
     // The Fs choice and the phase coefficients depend only on the definition,
-    // and deriving them costs ~10 us — most of it soft-float double inside
-    // sinePhaseInc, which the M4F has no hardware for. Taking that out of the
-    // arm is worth more than anything else in this function, so it is derived
-    // when the slot is written and read from the cache here.
-    const SampleGen::SineConst& sc = sineConst(slotIdx, def, mask);
-    pl.sampleCyc  = sc.sampleCyc;
-    pl.phaseInc0  = sc.phaseInc[0];
-    pl.phaseInc1  = sc.phaseInc[1];
-    pl.phaseInit0 = sc.phaseInit[0];
-    pl.phaseInit1 = sc.phaseInit[1];
+    // and deriving them costs ~10 us -- most of it soft-float double inside
+    // sinePhaseInc, which the M4F has no hardware for. buildGeometry read them
+    // from the per-slot cache the `W` commit fills; only the amplitudes are
+    // computed here, because they need the calibration offsets.
+    pl.sampleCyc  = geo.sampleCyc;
+    pl.phaseInc0  = geo.phaseInc[0];
+    pl.phaseInc1  = geo.phaseInc[1];
+    pl.phaseInit0 = geo.phaseInit[0];
+    pl.phaseInit1 = geo.phaseInit[1];
     pl.sAmp0 = (mask & 1) ? ampToCode(def.sine.amp0, pl.outMode0, 0) - pl.off0 : 0;
     pl.sAmp1 = (mask & 2) ? ampToCode(def.sine.amp1, pl.outMode1, 1) - pl.off1 : 0;
-    pl.burstCyc = SJ_US_TO_CYC(def.sine.burst_us);
+    pl.burstCyc = geo.burstCyc;
   }
-  uint64_t acc = 0;
-  pl.cum[0] = 0;
+  // pl.cum was filled by buildGeometry; the amplitudes could not be, because
+  // they read the calibration offsets and those are deliberately outside the
+  // plan tag.
   for (uint8_t i = 0; i < pl.nStages; i++) {
     pl.d0[i] = (mask & 1) ? ampToCode(def.stages[i].a0, pl.outMode0, 0) - pl.off0 : 0;
     pl.d1[i] = (mask & 2) ? ampToCode(def.stages[i].a1, pl.outMode1, 1) - pl.off1 : 0;
-    acc += SJ_US_TO_CYC(def.stages[i].dur_us);
-    pl.cum[i + 1] = acc;
   }
   if (pl.type == PIECEWISE_RAMP) {
     // per-stage Bresenham constants; stage i ramps from stage i-1's end (0 =
@@ -571,7 +650,7 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
 
   pl.periodCyc   = SJ_US_TO_CYC(def.period_us);
   pl.durationCyc = SJ_US_TO_CYC(def.duration_us);
-  pl.preloadCyc  = (uint32_t)SJ_US_TO_CYC(progUs);
+  pl.preloadCyc  = geo.preloadCyc;
   pl.nPulses     = 0;
   pl.lateEvents  = 0;
   pl.maxLateCyc  = 0;
@@ -583,35 +662,11 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.evIdx       = 0;
   pl.evPhase     = EV_INIT;
 
-  // Compile the measurement plan from the geometry computed above. This is
-  // precomputation, so it must stay on this side of the t0 assignment below:
-  // anything done after t0 is taken is subtracted from START_LATENCY, and a
-  // plan build is not cheap enough to hide there (it cost the first latch of
-  // every measured train ~1.5 us of lateness until it moved here). stageN is
-  // read only during the build, so a stack copy of the ramp sample counts is
-  // enough — the Player does not need to carry it.
-  uint32_t stageN[SJ_MAX_STAGES];
-  for (uint8_t i = 0; i < pl.nStages; i++)
-    stageN[i] = (pl.type == PIECEWISE_RAMP) ? pl.rst[i].N : 1;
-  Measure::Geometry geo;
-  geo.type         = pl.type;
-  geo.chMask       = mask;
-  geo.nStages      = pl.nStages;
-  geo.cum          = pl.cum;
-  geo.stageN       = (pl.type == PIECEWISE_RAMP) ? stageN : nullptr;
-  geo.sampleCyc    = pl.sampleCyc;
-  geo.burstCyc     = pl.burstCyc;
-  geo.phaseInit[0] = pl.phaseInit0;
-  geo.phaseInit[1] = pl.phaseInit1;
-  geo.phaseInc[0]  = pl.phaseInc0;
-  geo.phaseInc[1]  = pl.phaseInc1;
-  geo.preloadCyc   = pl.preloadCyc;
-  geo.adcReadCyc   = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCREAD]);
-  geo.adcSwitchCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::ADCSWITCH]);
-  geo.guardCyc     = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::GUARD]);
-  geo.settleCyc    = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::SETTLE]);
-  // The plan is compiled only when the (slot, definition, CAL) triple it was
-  // compiled for has changed, so a re-armed unedited slot pays nothing here.
+  // Attach the measurement plan. This must stay on this side of the t0
+  // assignment below: anything done after t0 is taken is subtracted from
+  // START_LATENCY. Normally it is one index write -- loop() compiled the spare
+  // buffer for this slot already (Engine::warmPlans) and cleared its
+  // accumulators -- and it falls back to compiling here when it did not.
   Measure::armPlan(eng, slotIdx, def, geo, TrainStore::epoch(), Cal::epoch());
   pl.meas = Measure::hasPlan(eng);
 
@@ -973,6 +1028,48 @@ void begin() {
 
 void poll() {
   (void)FastIO::cycles64();   // keep the 64-bit extension alive while idle
+}
+
+// The slot an enabled TRIG route would start on engine `eng`, or -1. Joint mode
+// runs slot0 on engine 0 and nothing on engine 1; independent mode gives engine
+// e its own slot. The two inputs are scanned in order, so a board whose inputs
+// point different slots at one engine warms input 0's — the other one pays the
+// compile in its arm, exactly as it did before.
+static int16_t routedSlot(uint8_t eng) {
+  for (uint8_t in = 0; in < 2; in++) {
+    const TriggerRoute& r = Triggers::route(in);
+    if (r.mode == 1) { if (eng == 0 && r.slot0 >= 0) return r.slot0; }
+    else if (r.mode == 2) {
+      const int8_t s = eng ? r.slot1 : r.slot0;
+      if (s >= 0) return s;
+    }
+  }
+  // No route names this engine, so the best guess at its next train is the slot
+  // the operator just edited -- which is what a `T`/`U` start almost always
+  // follows. Wrong guesses cost nothing: a compile in loop() that the arm then
+  // does not use, and the arm compiles what it needs as it always did.
+  return TrainStore::lastWritten();
+}
+
+void warmPlans() {
+  const uint32_t defEpoch = TrainStore::epoch(), calEpoch = Cal::epoch();
+  for (uint8_t eng = 0; eng < 2; eng++) {
+    Measure::housekeep(eng);         // the deferred accumulator clear
+    const int16_t slot = routedSlot(eng);
+    if (slot < 0) continue;
+    // Four loads: cheap enough to ask every loop() pass, and it keeps the
+    // geometry build below out of the steady state entirely.
+    if (Measure::planReady(eng, (uint8_t)slot, defEpoch, calEpoch)) continue;
+    const TrainDef& def = TrainStore::slotConst((uint8_t)slot);
+    uint64_t cum[SJ_MAX_STAGES + 1];
+    uint32_t stageN[SJ_MAX_STAGES], dtUs;
+    Measure::Geometry geo;
+    // A train the arm would refuse has no plan to warm; the refusal message is
+    // the arm's to print, so no error buffer is passed.
+    if (!buildGeometry((uint8_t)slot, def, Cal::live(), cum, stageN, geo, &dtUs, nullptr, 0))
+      continue;
+    Measure::warmPlan(eng, (uint8_t)slot, def, geo, defEpoch, calEpoch);
+  }
 }
 
 } // namespace Engine

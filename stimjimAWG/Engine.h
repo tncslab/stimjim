@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "WaveformDef.h"
+#include "Cal.h"       // Cal::Def, the budget buildGeometry is derived against
+#include "Measure.h"   // Measure::Geometry, what buildGeometry fills
 
 namespace Engine {
 
@@ -27,6 +29,28 @@ void begin();
 // Housekeeping from loop(): keeps cycles64 alive. Completion records are
 // drained by Commands::poll() (all printing happens in loop context).
 void poll();
+
+// Prepare, in loop() context, the measurement plan of whatever slot a TRIG
+// route would start next, and clear the accumulators a finished train left
+// behind. Both used to happen inside the arm and cost 3.1 µs and 0.55 µs per
+// measurement point of the start latency (docs/PLAN_plan-out-of-arm.md); here
+// they cost nothing. Purely an optimisation: if loop() never gets to it, the
+// arm does the work itself exactly as before. Call after the completion ring
+// has been drained, so a summary is never overwritten before it is printed.
+void warmPlans();
+
+// Everything the measurement plan is compiled against, derived from a slot's
+// definition and the CAL set alone. `cum` (SJ_MAX_STAGES+1) and `stageN`
+// (SJ_MAX_STAGES) are the caller's storage and `geo` points into them, so both
+// must outlive the compile — nothing keeps the pointers afterwards. `dtUsOut`
+// receives the ramp sample interval in force. Returns false for a train that
+// startTrain would refuse (ramp interval below the board's per-sample budget,
+// sine above Fs/2), with the reason in `err` when that is non-NULL. Shared by
+// the arm and the loop()-side warm so a warmed plan's tag cannot describe a
+// geometry the arm would compute differently.
+bool buildGeometry(uint8_t slotIdx, const TrainDef& def, const Cal::Def& cal,
+                   uint64_t* cum, uint32_t* stageN, Measure::Geometry& geo,
+                   uint32_t* dtUsOut, char* err, size_t errsz);
 
 uint8_t  pitChannelOf(uint8_t player);   // hardware PIT channel index owned by player 0/1
 uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU cycles)

@@ -12,11 +12,11 @@ Build status (Teensyduino 1.62.0, `--warnings more`, zero warnings):
 
 | Target | Command | Result |
 |---|---|---|
-| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 169 700 B flash, 47 820 B RAM (`hot=RAM`) |
-| Teensy 3.5 (register, code in flash) | as above `-DSJ_CODE_IN_RAM=0` | 169 536 B flash, 41 404 B RAM — the 6416 B difference is the four hot functions |
-| Teensy 3.5 (portable backends) | as above `-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | 170 808 B flash, 47 764 B RAM |
-| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | FLASH code 144 588 B, RAM1 variables 63 680 B |
-| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | FLASH code 100 708 B — no SD, see below |
+| Teensy 3.5 (register backends) | `--fqbn teensy:avr:teensy35` | 170 812 B flash, 50 100 B RAM (`hot=RAM`) |
+| Teensy 3.5 (register, code in flash) | as above `-DSJ_CODE_IN_RAM=0` | the difference is the ~6.4 kB of RAM the five hot functions occupy |
+| Teensy 3.5 (portable backends) | as above `-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` | 171 928 B flash, 50 364 B RAM |
+| Teensy 4.1 | `--fqbn teensy:avr:teensy41` | FLASH code 145 740 B, RAM1 variables 66 144 B |
+| Teensy 4.0 | `--fqbn teensy:avr:teensy40 -DSJ_EEPROM_SLOTS=6` | FLASH code 101 860 B — no SD, see below |
 
 Only the Teensy 3.5 register build has been run on hardware. The others compile and are
 structurally correct; they are untested silicon until someone runs the bench list in §4.
@@ -53,7 +53,7 @@ the build:
 |---|---|---|
 | `SJ_FASTIO_REGISTER` | SPI0 driven through its DSPI registers, CTAR0/CTAR1 preconfigured for DAC and ADC, MISO swapped by writing the PORT mux | `SPI.beginTransaction()` per DAC word or ADC frame, `SPI.setMISO()` for the mux |
 | `SJ_TIMER_REGISTER` | two PIT channels claimed through `IntervalTimer`, then their vectors and NVIC priorities taken over one by one | `IntervalTimer::begin()` re-armed per event, with the core's own dispatcher |
-| `SJ_CODE_IN_RAM` | `Engine::startTrain`, `Engine::playerRun`, `SampleGen::rampStageInit` and `SampleGen::rampStep` are placed in `.fastrun`, which the core copies into SRAM at boot, so they execute without flash wait states — 6.3 kB of RAM, `IDN` says `hot=RAM`, and it is worth 13–17 % of the arm ([timing.md](timing.md) §7) | the four functions execute from flash (`hot=flash`). On Teensy 4.x the switch is off because the core runs *all* code from ITCM already (`hot=ITCM`) |
+| `SJ_CODE_IN_RAM` | `Engine::startTrain`, `Engine::buildGeometry`, `Engine::playerRun`, `SampleGen::rampStageInit` and `SampleGen::rampStep` are placed in `.fastrun`, which the core copies into SRAM at boot, so they execute without flash wait states — about 6.4 kB of RAM, `IDN` says `hot=RAM`, and it is worth 13–17 % of the arm ([timing.md](timing.md) §7) | the five functions execute from flash (`hot=flash`). On Teensy 4.x the switch is off because the core runs *all* code from ITCM already (`hot=ITCM`) |
 
 Forcing the portable backends on a Teensy 3.5 (`-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0`)
 is the intended way to measure the portable route's constants: it isolates the backend change
@@ -124,12 +124,18 @@ in this order:
 `STARTLAT` has two floors. The one `Cal::validate` enforces is `PRELOAD + DACPROG2 + 3 µs` beyond
 `TRIGCOMP`. The one that actually sizes it is **the cost of `Engine::startTrain`**, because `t0`
 is measured from the start request and every microsecond of arming is spent inside the latency
-rather than added to it. `BENCHARM` measures that per slot: 19–24 µs for `S` and `L` trains on
-the Teensy 3.5 register build, 42 µs for a measured sine, roughly double on the portable route.
-The defaults are 60 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one
-edge and so needs twice the arm; when an arm does not fit, the train's completion says so and
-names the `STARTLAT` that would have covered it, so this is one of the values a board can be
-qualified for over the serial port alone.
+rather than added to it. `BENCHARM` measures that per slot, and `tests/device/bench_arm.py` sweeps the
+shapes: on the Teensy 3.5 register build, 8.8 µs for a slot that drives nothing, 10–11 µs for a
+one-stage `S`, `L` or `W` train, 17.5 µs for a ten-stage `S` and 28.7 µs for a ten-stage `L`, with
+in-train measurement costing nothing on any of them. Roughly double on the portable route. The
+defaults are 45 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one edge
+and so needs twice the arm; when an arm does not fit, the train's completion says so and names the
+`STARTLAT` that would have covered it, so this is one of the values a board can be qualified for
+over the serial port alone.
+
+Those figures assume a running `loop()`, which is what prepares each engine's next measurement plan
+and clears the last train's accumulators. That is portable code with no backend behind it, so it
+carries over to any target; what does not is the cost of the arm itself.
 
 Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
 which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the
