@@ -224,37 +224,42 @@
 // checked by Cal::validate:
 //
 //   1. a preload plus a dual-channel DAC program plus SJ_MIN_SCHEDULE_US,
-//      because the first latch is programmed one preload window before t0;
-//   2. the whole of Engine::startTrain, because t0 is measured from the start
-//      request (a trigger edge timestamps itself) and every microsecond the
-//      arm spends comes out of the latency.
+//      because the first latch is programmed one preload window before t0.
+//      That sum is 12 us on this board and it is a hard floor: no scheduling
+//      change reaches below it, only the pre-armed NLDAC path of
+//      docs/timing.md section 3, which is not built.
+//   2. whatever Engine::startTrain still spends after the start request,
+//      because t0 is measured from that request (a trigger edge timestamps
+//      itself) and every microsecond the arm spends comes out of the latency.
 //
-// Term 2 dominates: BENCHARM measures it per slot and tests/device/bench_arm.py
-// sweeps the shapes. Measured on a Teensy 3.5 at 120 MHz with the register
-// backends, on a board whose loop() is running (which is what prepares each
-// engine's next measurement plan -- Engine::warmPlans): 9.3 us for a slot that
-// drives nothing, 11-12 us for a one-stage `S`/`L`/`W` train measured or not,
-// 13.3 us for a ten-stage `S` train with a measurement point on every stage,
-// and 15.0 us for a ten-stage `L` train -- the worst case, because a ramp stage
-// costs the arm more than a rectangular one does. It barely depends on stage
-// count any more: the player derives stage i+1 while stage i plays, so what the
-// arm still pays per stage is one cumulative-boundary add and one sample-count
-// division (SJ_STAGE_DERIVE_US, docs/timing.md §7).
+// Term 2 used to dominate and no longer does. Engine::prepareArms builds the
+// whole of an arm in loop() -- the geometry, the copy-on-arm, stage 0, the
+// scalars, the envelope's reciprocals -- into the engine's spare player, for
+// whichever slot a TRIG route would fire next, and the edge then only places
+// t0, attaches the plan, swaps the player and programs the timer
+// (docs/PLAN_prearm.md). What is left after the edge is two cycles64() reads,
+// one pitProgram and a few dozen instructions.
 //
-// The worst of those needs 15.0 + PRELOAD + DACPROG2 = 24 us, which is what the
-// engine itself asks for when 23 is set and a trigger edge starts that train.
-// An engine re-triggered so fast that loop() never ran in between prepares its
-// measurement plan inside the arm and needs 29 us. 35 covers both.
+// The number below is deliberately NOT the estimate that follows from that. It
+// is the phase-13 measurement of the arm this firmware no longer performs on
+// the prepared path, and it is left in place because a start latency is
+// measured, not derived: run tests/device/bench_arm.py, read the warmed
+// column, and set CAL,STARTLAT,<warmed arm + PRELOAD + DACPROG2> (never below
+// 12) followed by P. Until that is done on a given board the board is merely
+// slower than it needs to be, which is the safe direction.
 //
-// What it does not cover is a TRIG independent route -- which arms two engines
-// from one edge, paying term 2 twice -- of two ten-stage `L` slots, which needs
-// about 39 us. That case still plays; the engine names the STARTLAT that would
-// have covered the arm at train end, and CAL sets it without a rebuild.
+// The one path that still pays the old cost is a start whose prepared player
+// describes something else -- loop() starved, or the slot edited since it last
+// ran -- and 35 us covers the worst of those (a ten-stage L train, 15.0 us
+// measured, plus a ten-point plan compiled in the arm, 20.0 us). A TRIG
+// independent route arms two engines from one edge and pays the remainder
+// twice; on the prepared path that is now a few microseconds rather than the
+// ~39 us two ten-stage L slots used to need.
 //
 // Raising this default rather than lowering it is the safe direction, so a
 // board that has an EEPROM image saved keeps whatever budget it stored -- the
 // image is not rejected over this, because a stored 45 or 60 us is merely
-// conservative, not wrong. `CAL,STARTLAT,35` then `P` adopts the new one.
+// conservative, not wrong.
 //
 // A trigger-started train subtracts the CAL TRIGCOMP parameter from it, so the
 // sum of the two is what the hardware actually has to cover.
@@ -265,20 +270,26 @@
 #endif
 #define SJ_TARGET_DT_US      20        // default ramp sample interval; per-train override: TrainDef.dt_us
 // What one stage's lazy derivation costs the player: two amplitude conversions
-// and, for an `L` train, SampleGen::rampStageInit. The player derives stage i+1
-// while stage i plays (Engine::deriveAhead), and only when the gap to the next
-// wake-up is wider than this — so the number gates opportunistic work, and
-// being wrong in either direction is bounded. Too small and a derivation can
-// run into the tail of a gap, which the per-latch deadline counters report; too
-// large and the look-ahead is skipped and the stage boundary derives on demand
-// instead, which is where the work used to happen anyway.
+// and, for an `L` train, SampleGen::rampStageInit. The player derives the next
+// stage while the current one plays (Engine::deriveAhead), and this is the
+// entry guard on that -- do not start a derivation with less than this left
+// before the wake-up the player is about to program.
+//
+// It is the only clock reading the look-ahead makes. How far ahead to look is
+// decided by the definition instead: a 0-duration stage is the one kind that
+// yields no gap of its own, so the derivation runs on while the stage it just
+// derived has 0 duration, and stops otherwise. Being wrong in either direction
+// is bounded -- too small and a derivation can run into the tail of a gap,
+// which the per-latch deadline counters report; too large and the look-ahead is
+// skipped and the stage boundary derives on demand instead, which is where the
+// work used to happen anyway (ensureDerived is the guarantee, not this).
 //
 // Unlike the CAL budgets this is a property of this firmware's code on this
 // MCU, not of the analog path or the SPI route, so it stays a compile-time
 // constant. Measured at 1.7 us for an `L` stage and 0.6 us for an `S` one on a
-// Teensy 3.5 at 120 MHz with SJ_CODE_IN_RAM (docs/timing.md §7); 4 us carries
-// the worst of those with margin and still fits the 11 us gap a default 20 us
-// ramp interval leaves.
+// Teensy 3.5 at 120 MHz with SJ_CODE_IN_RAM (docs/timing.md section 7); 4 us
+// carries the worst of those with margin and still fits the 11 us gap a
+// default 20 us ramp interval leaves.
 #define SJ_STAGE_DERIVE_US   4
 // SJ_MAX_DELAY_US (per-slot post-trigger delay ceiling) lives in WaveformDef.h:
 // the host-testable parser validates against it and never includes this file.

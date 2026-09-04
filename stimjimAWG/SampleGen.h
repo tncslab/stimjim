@@ -116,8 +116,23 @@ struct EnvCoef {
   uint64_t t0, inEnd;         // ramp-in spans [t0, inEnd)
   uint64_t outStart, tEnd;    // ramp-out spans (outStart, tEnd]
   float    invIn, invOut;     // 1 / ramp length in cycles (arm-time reciprocals)
+  // The three lengths the four absolute anchors above are built from, kept so
+  // a prepared envelope can be placed on a t0 the preparation did not know
+  // (envRebase). Nothing reads them per event.
+  uint64_t durCyc, inCyc, outCyc;
 };
 
+// The t0-independent half: the two reciprocals -- the only divisions the
+// envelope needs -- and the lengths envRebase places. Derived when an arm is
+// prepared, which is before the trigger edge (Engine::prepareArm).
+void envShape(EnvCoef& e, uint64_t durCyc, uint64_t rampInCyc, uint64_t rampOutCyc);
+
+// Place a derived shape on an absolute start time: four 64-bit adds, no
+// division. This is the whole of what the envelope costs after a trigger edge.
+void envRebase(EnvCoef& e, uint64_t t0);
+
+// Both at once, for callers that know t0 already (the cold arm path and the
+// host tests). Exactly envShape followed by envRebase.
 void envInit(EnvCoef& e, uint64_t t0, uint64_t durCyc,
              uint64_t rampInCyc, uint64_t rampOutCyc);
 

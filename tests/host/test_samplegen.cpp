@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <initializer_list>
 
 using namespace SampleGen;
 
@@ -218,6 +219,43 @@ static void testEnv() {
   CHECK_EQ(envQ15(ei, 1101), 0);                    // overrunning events still clamp
 }
 
+// envInit is envShape followed by envRebase, and the split is what lets a
+// prepared arm carry the two reciprocals across a trigger edge that has not
+// happened yet (docs/PLAN_prearm.md). The two halves must reproduce envInit
+// field for field, and rebasing an already-placed shape onto a new t0 must be
+// indistinguishable from initialising it there.
+static void testEnvSplit() {
+  const uint64_t in = 100 * CYC, out = 200 * CYC, dur = 1000 * CYC;
+  for (uint64_t t0 : {(uint64_t)0, (uint64_t)5000000, (uint64_t)0x1FFFFFFFFFull}) {
+    EnvCoef ref, split;
+    envInit(ref, t0, dur, in, out);
+    envShape(split, dur, in, out);
+    envRebase(split, t0);
+    CHECK_EQ(split.on, ref.on);
+    CHECK_EQ(split.t0, ref.t0);
+    CHECK_EQ(split.inEnd, ref.inEnd);
+    CHECK_EQ(split.outStart, ref.outStart);
+    CHECK_EQ(split.tEnd, ref.tEnd);
+    CHECK(split.invIn == ref.invIn);
+    CHECK(split.invOut == ref.invOut);
+  }
+  // one shape, placed twice: the second placement leaves no trace of the first
+  EnvCoef moved, fresh;
+  envShape(moved, dur, in, out);
+  envRebase(moved, 111111);
+  envRebase(moved, 777777);
+  envInit(fresh, 777777, dur, in, out);
+  CHECK_EQ(moved.inEnd, fresh.inEnd);
+  CHECK_EQ(moved.outStart, fresh.outStart);
+  CHECK_EQ(moved.tEnd, fresh.tEnd);
+  CHECK_EQ(envQ15(moved, 777777 + in / 2), envQ15(fresh, 777777 + in / 2));
+  // an off envelope stays off through a rebase
+  EnvCoef flat;
+  envShape(flat, dur, 0, 0);
+  envRebase(flat, 42);
+  CHECK(!flat.on);
+}
+
 static void testScaleQ15() {
   CHECK_EQ(scaleQ15(12345, 32768), 12345);          // identity is exact
   CHECK_EQ(scaleQ15(-12345, 32768), -12345);
@@ -280,6 +318,7 @@ int main() {
   testRamp();
   testRampDivisionPaths();
   testEnv();
+  testEnvSplit();
   testScaleQ15();
   testSine();
   if (failures == 0) printf("test_samplegen: all checks passed\n");

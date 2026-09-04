@@ -4,7 +4,9 @@
 //    Two timer channels are reserved from the Teensyduino core, their vectors
 //    taken over at SJ_PLAYER_PRIO and K_RELOAD self-calibrated at boot (the
 //    portable backend leaves the channels under IntervalTimer control).
-//    Each ChannelPlayer does copy-on-arm start/stop against absolute deadlines,
+//    Each ChannelPlayer does copy-on-arm start/stop against absolute deadlines
+//    -- the copy taken in loop() ahead of the start request, into the spare one
+//    of the engine's two player buffers --
 //    programming early and latching on the deadline, with seqlock status and a
 //    completion ring. It plays all three slot types: HOLD (`S`) stage latches,
 //    RAMP (`L`) Bresenham samples with 0-duration jump chains, and SINE (`W`)
@@ -30,14 +32,16 @@ void begin();
 // drained by Commands::poll() (all printing happens in loop context).
 void poll();
 
-// Prepare, in loop() context, the measurement plan of whatever slot a TRIG
-// route would start next, and clear the accumulators a finished train left
-// behind. Both used to happen inside the arm and cost 3.1 µs and 0.55 µs per
-// measurement point of the start latency (docs/PLAN_plan-out-of-arm.md); here
-// they cost nothing. Purely an optimisation: if loop() never gets to it, the
-// arm does the work itself exactly as before. Call after the completion ring
-// has been drained, so a summary is never overwritten before it is printed.
-void warmPlans();
+// Prepare, in loop() context, everything the next start of whatever slot a
+// TRIG route would fire does not need the start *time* for: the spare player
+// (the whole of what the arm used to be) and the spare measurement plan, plus
+// the accumulator clear a finished train left behind. Purely an optimisation:
+// if loop() never gets to it, the arm does the work itself exactly as before,
+// and a trigger edge always plays the slot's current definition because the
+// preparation is tagged with the definition and CAL epochs, not snapshotted.
+// Call after the completion ring has been drained, so a summary is never
+// overwritten before it is printed (docs/PLAN_prearm.md).
+void prepareArms();
 
 // Everything the measurement plan is compiled against, derived from a slot's
 // definition and the CAL set alone. `cum` (SJ_MAX_STAGES+1) and `stageN`
@@ -64,6 +68,12 @@ uint32_t kReloadCycles();                // calibrated scheduling overhead (CPU 
 // conflict with the other engine, sine frequency above Fs/2, ramp interval
 // below the board's per-sample budget) — caller prints the WARN/ERR
 // (ignore-and-warn policy, plan §2.5).
+//
+// prepareArms() normally has the engine's spare player ready for this exact
+// slot, in which case all this does is place t0, attach the plan, swap the
+// player and program the timer. It falls back to preparing the player itself
+// when the prepared one describes something else, which is the only path that
+// still costs what the arm cost before phase 14.
 //
 // anchorCyc: the cycle count at which the start was *requested*, or 0 for
 // "now". The trigger ISRs timestamp the edge at entry and pass it, which keeps

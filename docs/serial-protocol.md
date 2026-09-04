@@ -179,11 +179,29 @@ are accepted at parse time but **refused at start** with a `WARN` (Nyquist).
 Known hardware limit (see [hardware-notes.md](hardware-notes.md)): amplitudes above 3000 µA
 convert incorrectly on the DAC → `WARN` on set.
 
+**Stage boundaries closer than one latch.** An `S`/`L` line whose stages put two DAC latches
+closer together than one latch costs on this board is accepted with
+
+```
+WARN S: <gap> us between two latches is under the <need> us one latch costs on this board — those latches will be late
+```
+
+`need` is `CAL PRELOAD` + `CAL DACPROG1`/`DACPROG2` + 3 µs, so it moves with the budget: 12 µs on
+a two-channel train with the measured defaults. The gap a definition asks for is the stage duration
+for an `S` train and `dur_us / N` for an `L` stage of `N` samples — and a nonzero `L` stage under
+half the ramp interval gets `N` = 1, which lands its single sample at the stage *end*, so a 3 µs
+stage asks for two latches 3 µs apart. A 0-duration stage is exempt: an instant jump *means* two
+latches at one instant, and the second of a coincident pair is late by definition.
+
+It is a warning and not a refusal. The figure is runtime state, the train's own deadline counters
+report what actually happened at completion, and nothing under about 10 µs settles at the output
+anyway (`CAL SETTLE` is 9 µs).
+
 ## 3. Execution, trigger and immediate commands
 
 | Cmd | Syntax | Reply / notes |
 |---|---|---|
-| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy reply lines kept: `\r\nStarted T train with parameters of PulseTrain <idx>` / `Forcing T train to stop` / `Invalid PulseTrain index.`. Busy engine or channel conflict with the other engine → drop + `WARN` (decision: ignore-and-warn). Strict index parse: `Tfoo` → `ERR` (legacy `atoi` silently started train 0). Train completion prints `Train #<n> complete. Delivered <p> pulses.` from `loop()`; `MSUM` lines will follow it once the measurement engine exists. |
+| `T` | `T<idx>` start slot on engine 0; `T-1` stop engine 0 | legacy reply lines kept: `\r\nStarted T train with parameters of PulseTrain <idx>` / `Forcing T train to stop` / `Invalid PulseTrain index.`. Busy engine or channel conflict with the other engine → drop + `WARN` (decision: ignore-and-warn). Strict index parse: `Tfoo` → `ERR` (legacy `atoi` silently started train 0). Train completion prints `Train #<n> complete. Delivered <p> pulses.` from `loop()`; `MSUM` lines will follow it once the measurement engine exists. **A serial start carries no latency figure and none is claimed:** USB delivery is quantized to the 1 ms frame and the command then waits for the current `loop()` pass, so `T` means "first latch one `CAL STARTLAT` from now" with millisecond-scale, host-dependent jitter ahead of that "now" — everything *inside* the train is still exact from `t0`, and a start that must land at a known instant belongs on a trigger edge or on a `DELAY` long enough to swallow the jitter. |
 | `U` | `U<idx>` / `U-1` | same, engine 1 (players are per-engine; a train drives the channels its modes activate) |
 | `R` | `R<trig>,<idx>[,<output>]` | **legacy alias** writing the `TRIG` table: `output≠0` → marker mode (`TRIG<t>,3,-1,-1,0`); else joint start of `idx` on rising edge (`TRIG<t>,1,<idx>,-1,0`). `R<t>?` renders the legacy view. NOTE: the old README documented the 3rd arg as an edge selector — the code's actual meaning is the output-marker flag; edge selection lives in `TRIG`. |
 | `M` | `M<ch>,<mode>` | exactly 1 line: `Set channel <ch> to mode <mode>`. Modes: 0 voltage, 1 current, 2 disconnected (hi-Z), 3 grounded — original numbering, mapping 1:1 onto the OE decoder (§6.8). 90/91 are train-definition sugar and are rejected here. `M<ch>?` returns shadow state (new); running trains switch the OE pins autonomously (driven channels end grounded, shadow tracks that). |

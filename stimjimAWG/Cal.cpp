@@ -31,6 +31,11 @@ static const uint16_t MIN_US[N_ID] = {
   0,  // TRIGCOMP
 };
 
+uint16_t minLatchUs(const Def& c, bool bothChannels) {
+  return (uint16_t)(c.us[PRELOAD] + (bothChannels ? c.us[DACPROG2] : c.us[DACPROG1]) +
+                    SJ_CAL_MIN_SLACK_US);
+}
+
 int8_t indexOf(const char* name) {
   for (uint8_t i = 0; i < N_ID; i++)
     if (!strcmp(name, NAME[i])) return (int8_t)i;

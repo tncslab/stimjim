@@ -88,17 +88,28 @@ void rampEnter(RampCursor& c, const RampStage& st, uint64_t stageStartCyc,
 
 // ----------------------------------------------------------------- envelope
 
-void envInit(EnvCoef& e, uint64_t t0, uint64_t durCyc,
-             uint64_t rampInCyc, uint64_t rampOutCyc) {
-  e.on       = (rampInCyc | rampOutCyc) != 0;
-  e.t0       = t0;
-  e.tEnd     = t0 + durCyc;
-  e.inEnd    = t0 + rampInCyc;
-  e.outStart = e.tEnd - rampOutCyc;
-  // A 0-length ramp has an empty region (strict comparisons below), so its
+void envShape(EnvCoef& e, uint64_t durCyc, uint64_t rampInCyc, uint64_t rampOutCyc) {
+  e.on     = (rampInCyc | rampOutCyc) != 0;
+  e.durCyc = durCyc;
+  e.inCyc  = rampInCyc;
+  e.outCyc = rampOutCyc;
+  // A 0-length ramp has an empty region (strict comparisons in envQ15), so its
   // reciprocal is never used — 0.0f keeps the float deterministic anyway.
   e.invIn  = rampInCyc  ? 1.0f / (float)rampInCyc  : 0.0f;
   e.invOut = rampOutCyc ? 1.0f / (float)rampOutCyc : 0.0f;
+}
+
+void envRebase(EnvCoef& e, uint64_t t0) {
+  e.t0       = t0;
+  e.tEnd     = t0 + e.durCyc;
+  e.inEnd    = t0 + e.inCyc;
+  e.outStart = e.tEnd - e.outCyc;
+}
+
+void envInit(EnvCoef& e, uint64_t t0, uint64_t durCyc,
+             uint64_t rampInCyc, uint64_t rampOutCyc) {
+  envShape(e, durCyc, rampInCyc, rampOutCyc);
+  envRebase(e, t0);
 }
 
 int32_t envQ15(const EnvCoef& e, uint64_t t) {

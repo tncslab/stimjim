@@ -65,6 +65,14 @@ extern const char* const NAME[N_ID];
 // Cal.cpp static_asserts that against Config.h.
 #define SJ_CAL_MIN_SLACK_US 3
 
+// The shortest interval between two consecutive DAC latches this budget can
+// deliver. The player wakes PRELOAD before a latch and programs the DAC inside
+// that window, and an event closer than SJ_CAL_MIN_SLACK_US is not a future
+// event the scheduler can program at all, so a stage boundary closer to its
+// predecessor than this schedules a latch that cannot be on time.
+// `bothChannels` selects the dual-channel program cost.
+uint16_t minLatchUs(const Def& c, bool bothChannels);
+
 // Index of `name` (case-sensitive, as printed), or -1 when unknown.
 int8_t indexOf(const char* name);
 

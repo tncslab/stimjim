@@ -213,6 +213,26 @@ static void handleTrain(char letter, const char* args) {
     return;
   }
   if (warnbuf[0]) warn(cmd, warnbuf);
+  // A caveat the parser cannot make, because what it would have to compare
+  // against is runtime state: a stage boundary closer to its predecessor than
+  // one latch costs schedules a latch that cannot be on time. Every such latch
+  // shows up in the train's own deadline counters at the end, but by then the
+  // waveform has already played, so say it here. A warning and not a refusal --
+  // the figure moves with `CAL`, and nothing under about 10 us settles at the
+  // output anyway (`CAL SETTLE` is 9).
+  {
+    const uint32_t dtUs = staged.dt_us ? staged.dt_us : (uint32_t)SJ_TARGET_DT_US;
+    const uint32_t gap  = TrainStore::minLatchGapUs(staged, dtUs);
+    const uint16_t need = Cal::minLatchUs(Cal::live(), staged.mode0 < 2 && staged.mode1 < 2);
+    if (gap < need) {
+      char note[SJ_MSG_MAX];
+      snprintf(note, sizeof note,
+               "%lu us between two latches is under the %u us one latch costs on this "
+               "board — those latches will be late",
+               (unsigned long)gap, (unsigned)need);
+      warn(cmd, note);
+    }
+  }
   TrainStore::commit(idx, staged);
   // Precompute what this definition alone decides, here in command context
   // where microseconds are free, rather than inside the start latency.

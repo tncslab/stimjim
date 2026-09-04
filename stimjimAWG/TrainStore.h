@@ -47,6 +47,19 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
 const char* validateEnv(const TrainDef& t, const EnvDef& e);
 const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t warnsz);
 
+// The shortest nonzero interval this definition puts between two consecutive
+// DAC latches, in microseconds; UINT32_MAX when it asks for fewer than two.
+// Compared against Cal::minLatchUs to warn about stage boundaries the board
+// cannot deliver -- which the parser cannot do on its own, because the figure
+// it would have to compare against is runtime state.
+//
+// Gaps of 0 are excluded: an instant jump *means* two latches at one instant,
+// and the second of a coincident pair is late by definition. `dtUs` is the ramp
+// sample interval in force (never 0 -- the caller resolves the default). A sine
+// is exempt: its sample grid comes from the engine's Fs policy rather than from
+// the definition, and the Nyquist gate at start covers it.
+uint32_t minLatchGapUs(const TrainDef& t, uint32_t dtUs);
+
 void commit(uint8_t idx, const TrainDef& staged);   // atomic slot replacement
 
 // Bumped by every write to any slot — commit(), begin() and the EEPROM
@@ -60,7 +73,7 @@ uint32_t epoch();
 
 // The slot the last commit() wrote. A guess at what the operator is about to
 // start, and the only guess available for a `T`/`U` start, which names no slot
-// in advance the way a TRIG route does. Engine::warmPlans uses it to prepare a
+// in advance the way a TRIG route does. Engine::prepareArms uses it to prepare a
 // plan for engines no route points at, so the first serial start of a freshly
 // edited slot does not compile inside its own start latency.
 uint8_t lastWritten();

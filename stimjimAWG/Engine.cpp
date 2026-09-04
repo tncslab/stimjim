@@ -96,7 +96,10 @@ static inline void pitStop(uint8_t p) {
 
 // ------------------------------------------------------------------ players
 //
-// Copy-on-arm state (plan §3.3/§3.5). Stage amplitudes are converted to
+// Copy-on-arm state (plan §3.3/§3.5), written by prepareArm rather than by the
+// arm itself: everything below that does not depend on *when* the train starts
+// is prepared in loop() into the engine's spare buffer, and the arm only places
+// t0 and swaps that buffer in (docs/PLAN_prearm.md). Stage amplitudes are converted to
 // DAC-code *deltas relative to the channel offset* (so the envelope scales
 // them without moving the baseline) and stage boundaries to cumulative cycle
 // offsets, so a latch event costs no unit math. The conversion of stage i > 0
@@ -144,6 +147,25 @@ struct Player {
   uint64_t burstCyc;
   uint64_t periodCyc, durationCyc, delayCyc;
   uint32_t preloadCyc;                 // DAC programming budget + CYCCNT spin margin
+  // The arm's own two budgets, folded in when the arm is prepared because the
+  // tag below carries Cal::epoch(): a prepared arm reads no CAL value at all.
+  uint32_t startLatCyc, trigCompCyc;
+  // The geometry the measurement plan is compiled against and the ramp sample
+  // counts it points at. Held here rather than on the arm's stack so a
+  // prepared buffer is self-sufficient: the arm can hand it to
+  // Measure::armPlan even on the path that has to compile the plan itself.
+  Measure::Geometry geo;
+  uint32_t stageN[SJ_MAX_STAGES];
+  // Pre-arm tag. `armReady` is set only by prepareArm and cleared only by the
+  // arm that consumes the buffer, so a buffer that has ever played is never
+  // mistaken for a prepared one -- its counters, evIdx, evPhase, nDerived and
+  // ramp cursor are all mid-train state. The epochs are the measurement plan's
+  // tag: an edge whose prepared buffer no longer describes the current
+  // definition prepares it again in place, so a slot edit is never ignored and
+  // pre-arming costs nothing in correctness.
+  bool     armReady;
+  uint8_t  armSlot;
+  uint32_t armDefEpoch, armCalEpoch;
   uint64_t t0;
   // live state
   uint64_t pulseStart;                 // current pulse's absolute start
@@ -165,7 +187,23 @@ struct Player {
   volatile bool active;
   volatile uint32_t seq;               // seqlock: odd while the ISR updates
 };
-static Player player[2];
+// Two players per engine, exactly as each engine holds two measurement plans
+// (phase 12): the ISR plays *live[eng] while loop() prepares *warm[eng], which
+// is what lets the whole arm happen before the trigger edge instead of inside
+// it (docs/PLAN_prearm.md). An arm swaps the two pointers, so the buffer that
+// has just played is the next one loop() prepares. Only an idle engine is
+// armed, so the buffer handed back is never mid-train.
+static Player  playerBuf[2][2];
+static Player* live[2] = {&playerBuf[0][0], &playerBuf[1][0]};
+static Player* warm[2] = {&playerBuf[0][1], &playerBuf[1][1]};
+// Set while loop() is writing *warm[eng]. A trigger edge that lands inside that
+// window must not take the buffer half-written, and it must not wait either --
+// masking the trigger ISR would delay the edge timestamp the whole latency is
+// anchored to, and delay it invisibly. So it arms the *live* buffer in place
+// instead, which is idle (the busy check passed) and is exactly what the
+// single-buffer firmware always did. Same handshake as the plan buffers of
+// phase 12, for the same reason and with the same fallback.
+static volatile bool prepBusy[2];
 
 enum : uint8_t { EV_INIT = 0, EV_SAMP = 1, EV_OFF = 2 };
 
@@ -181,22 +219,22 @@ static void pushCompletion(uint8_t eng) {
   uint8_t h = compHead, next = (uint8_t)((h + 1) & 7);
   if (next == compTail) return;        // 8 unread completions — cannot happen in practice
   compRing[h].eng     = eng;
-  compRing[h].slot    = player[eng].slot;
-  compRing[h].chMask  = player[eng].chMask;
-  compRing[h].nPulses = player[eng].nPulses;
-  compRing[h].lateEvents = player[eng].lateEvents;
-  compRing[h].maxLateCyc = player[eng].maxLateCyc;
-  compRing[h].overdueEvents = player[eng].overdueEvents;
-  compRing[h].maxOverdueCyc = player[eng].maxOverdueCyc;
-  compRing[h].startNeedUs   = player[eng].startNeedUs;
+  compRing[h].slot    = live[eng]->slot;
+  compRing[h].chMask  = live[eng]->chMask;
+  compRing[h].nPulses = live[eng]->nPulses;
+  compRing[h].lateEvents = live[eng]->lateEvents;
+  compRing[h].maxLateCyc = live[eng]->maxLateCyc;
+  compRing[h].overdueEvents = live[eng]->overdueEvents;
+  compRing[h].maxOverdueCyc = live[eng]->maxOverdueCyc;
+  compRing[h].startNeedUs   = live[eng]->startNeedUs;
   compHead = next;
 }
 
 void timingFaults(uint8_t eng, Completion& out) {
-  out.lateEvents    = player[eng].lateEvents;
-  out.maxLateCyc    = player[eng].maxLateCyc;
-  out.overdueEvents = player[eng].overdueEvents;
-  out.maxOverdueCyc = player[eng].maxOverdueCyc;
+  out.lateEvents    = live[eng]->lateEvents;
+  out.maxLateCyc    = live[eng]->maxLateCyc;
+  out.overdueEvents = live[eng]->overdueEvents;
+  out.maxOverdueCyc = live[eng]->maxOverdueCyc;
 }
 
 bool popCompletion(Completion& out) {
@@ -317,21 +355,27 @@ static inline void ensureDerived(Player& pl, uint8_t upto) {
   while (pl.nDerived <= upto && pl.nDerived < pl.nStages) deriveStage(pl, pl.nDerived);
 }
 
-// Derive stages while there is measurably room before `wake`, the instant the
-// player is about to sleep until — idle time by construction, since the
-// caller's next act is to program the timer for it and return.
+// Derive the stage that is due next, in the gap before a latch the player is
+// already waiting for -- idle time by construction, since the caller's next
+// act is to program the timer for `wake` and return.
 //
-// It derives as many as fit rather than exactly one, and that is what covers a
-// 0-duration `L` jump: its single sample shares a deadline with the previous
-// stage's last one, so entering it yields no gap of its own and the stage after
-// it has to be ready already. Two 0-duration stages in a row are refused at
-// parse time, so the chain is at most two stages long.
+// What decides how far to look ahead is the definition, not the clock. A stage
+// of 0 duration is the one kind that yields no gap of its own: its single
+// sample shares a deadline with the previous stage's last one, so entering it
+// hands the player no idle time and the stage behind it has to be ready
+// already. Deriving on while the stage just derived has 0 duration covers
+// exactly those chains -- the `L` pair (a second 0-duration stage in a row is
+// refused at parse time) and an `S` run of any length, which nothing refuses.
+//
+// The one clock reading left is the entry guard: do not start a derivation
+// with less than SJ_STAGE_DERIVE_US left before the wake-up. `ensureDerived`
+// at each use site is what makes correctness independent of all of this.
 static SJ_HOT void deriveAhead(Player& pl, uint64_t wake) {
   const uint32_t cost = (uint32_t)SJ_US_TO_CYC(SJ_STAGE_DERIVE_US);
-  while (pl.nDerived < pl.nStages) {
-    if ((int64_t)(wake - FastIO::cycles64()) <= (int64_t)cost) return;
+  if ((int64_t)(wake - FastIO::cycles64()) <= (int64_t)cost) return;
+  do {
     deriveStage(pl, pl.nDerived);
-  }
+  } while (pl.nDerived < pl.nStages && pl.stages[pl.nDerived - 1].dur_us == 0);
 }
 
 // The player event loop, entered from the PIT ISR. Future events are scheduled
@@ -339,7 +383,7 @@ static SJ_HOT void deriveAhead(Player& pl, uint64_t wake) {
 // preload + MIN_SCHEDULE of now are processed inline in the same pass so
 // 0-duration jump chains and overlong pulses never re-enter through the NVIC.
 static SJ_HOT void playerRun(uint8_t p) {
-  Player& pl = player[p];
+  Player& pl = *live[p];
   pitStop(p);
   if (!pl.active) return;
 
@@ -388,8 +432,8 @@ static SJ_HOT void playerRun(uint8_t p) {
       if ((int64_t)(wake - now) > (int64_t)SJ_US_TO_CYC(SJ_MAX_SLICE_US))
         wake = now + SJ_US_TO_CYC(SJ_MAX_SLICE_US);
       // The only genuinely idle point in the player: everything below returns
-      // to the NVIC and waits for `wake`. Stages the arm no longer derives are
-      // derived here, as many as the gap has room for.
+      // to the NVIC and waits for `wake`. The stage the arm no longer derives
+      // is derived here (plus, for a 0-duration jump, the one behind it).
       if (pl.nDerived < pl.nStages) deriveAhead(pl, wake);
       pitProgram(p, wake, true);
       return;
@@ -645,45 +689,51 @@ SJ_HOT bool buildGeometry(uint8_t slotIdx, const TrainDef& def, const Cal::Def& 
   return true;
 }
 
-SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
-                char* err, size_t errsz, uint64_t anchorCyc) {
-  Player& pl = player[eng];
-  if (pl.active) {
-    snprintf(err, errsz, "engine busy (slot %u) — start dropped, stop with %c-1",
-             pl.slot, eng ? 'U' : 'T');
-    return false;
-  }
+// Everything a start does that does not depend on *when* the start happens,
+// written into the engine's spare player. Normally called from loop()
+// (prepareArms) for whatever slot a TRIG route would fire next; startTrain
+// calls it in place when the prepared buffer describes something else.
+//
+// This is the whole of what used to be the start latency. Moving it here works
+// for the same reason phase 12's plan warm did: there are two buffers per
+// engine and the ISR only ever reads the live one, so this needs no lock even
+// while a train plays. Returns false, with the reason in `err` when that is
+// non-NULL, for the trains startTrain refuses on geometry grounds; the buffer
+// is left unready, so a later arm re-runs this and produces the message.
+// Does this buffer's preparation describe that exact start? The tag is the
+// measurement plan's: slot plus the definition and CAL epochs. armReady is what
+// separates a preparation from a buffer that has merely played the same slot.
+static inline bool armFresh(const Player& pl, uint8_t slotIdx,
+                            uint32_t defEpoch, uint32_t calEpoch) {
+  return pl.armReady && pl.armSlot == slotIdx &&
+         pl.armDefEpoch == defEpoch && pl.armCalEpoch == calEpoch;
+}
+
+static SJ_HOT bool prepareArm(Player& pl, uint8_t slotIdx, const TrainDef& def,
+                              char* err, size_t errsz) {
+  pl.armReady = false;                 // half-prepared is never usable
   // The timing budgets are runtime state (Cal.h): one copy is taken here and
-  // used for the whole arm, so a `CAL` line that lands mid-arm cannot make one
-  // train use two different budgets.
+  // used for the whole preparation, so a `CAL` line that lands mid-way cannot
+  // make one train use two different budgets. Cal::epoch() goes into the tag,
+  // so a `CAL` line after this point invalidates the preparation instead.
   const Cal::Def cal = Cal::live();
-  // stageN is read only while the plan is compiled, so a stack copy is enough
-  // -- the Player does not carry the ramp sample counts.
-  uint32_t stageN[SJ_MAX_STAGES];
-  Measure::Geometry geo;
+  const uint32_t defEpoch = TrainStore::epoch(), calEpoch = Cal::epoch();
   uint32_t dtUs;
-  // Writes pl.cum before the channel-conflict check below can refuse the start.
-  // Safe: the busy check above passed, so this engine's player is idle and
-  // nothing reads pl.cum until pl.active is set at the end of this function.
-  if (!buildGeometry(slotIdx, def, cal, pl.cum, stageN, geo, &dtUs, err, errsz))
+  if (!buildGeometry(slotIdx, def, cal, pl.cum, pl.stageN, pl.geo, &dtUs, err, errsz))
     return false;
-  const uint8_t mask = geo.chMask;
-  const Player& other = player[eng ^ 1];
-  if (other.active && (mask & other.chMask)) {
-    snprintf(err, errsz, "channel conflict with the running %c train — start dropped",
-             eng ? 'T' : 'U');
-    return false;
-  }
+  const uint8_t mask = pl.geo.chMask;
 
   pl.slot     = slotIdx;
   pl.chMask   = mask;
   pl.outMode0 = def.mode0 & 1;
   pl.outMode1 = def.mode1 & 1;
   // undriven/empty trains degenerate to HOLD bookkeeping (0 stages, no events)
-  pl.type     = geo.type;
-  pl.nStages  = geo.nStages;
+  pl.type     = pl.geo.type;
+  pl.nStages  = pl.geo.nStages;
   // inter-pulse park level = the mode's calibration offset (legacy state);
-  // stage amplitudes become deltas from it so the envelope can scale them
+  // stage amplitudes become deltas from it so the envelope can scale them.
+  // startTrain re-reads these two, because a recalibration between here and
+  // the trigger edge would otherwise park the outputs on a stale level.
   pl.off0 = (int16_t)(pl.outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
   pl.off1 = (int16_t)(pl.outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
 
@@ -693,14 +743,14 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
     // sinePhaseInc, which the M4F has no hardware for. buildGeometry read them
     // from the per-slot cache the `W` commit fills; only the amplitudes are
     // computed here, because they need the calibration offsets.
-    pl.sampleCyc  = geo.sampleCyc;
-    pl.phaseInc0  = geo.phaseInc[0];
-    pl.phaseInc1  = geo.phaseInc[1];
-    pl.phaseInit0 = geo.phaseInit[0];
-    pl.phaseInit1 = geo.phaseInit[1];
+    pl.sampleCyc  = pl.geo.sampleCyc;
+    pl.phaseInc0  = pl.geo.phaseInc[0];
+    pl.phaseInc1  = pl.geo.phaseInc[1];
+    pl.phaseInit0 = pl.geo.phaseInit[0];
+    pl.phaseInit1 = pl.geo.phaseInit[1];
     pl.sAmp0 = (mask & 1) ? ampToDelta(def.sine.amp0, pl.outMode0, pl.off0) : 0;
     pl.sAmp1 = (mask & 2) ? ampToDelta(def.sine.amp1, pl.outMode1, pl.off1) : 0;
-    pl.burstCyc = geo.burstCyc;
+    pl.burstCyc = pl.geo.burstCyc;
   }
   // pl.cum was filled by buildGeometry; the stage amplitudes could not be,
   // because they read the calibration offsets and those are deliberately
@@ -714,14 +764,16 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   if (pl.nStages) memcpy(pl.stages, def.stages, (size_t)pl.nStages * sizeof(StageDef));
   // Stage 0 is the only stage whose values are due at t0 itself, inside the
   // first latch's preload window; every later stage is derived by the player in
-  // the gap before a latch it is already waiting for, which is what makes the
-  // arm's cost independent of stage count (docs/PLAN_lazy-stages.md).
+  // the gap before a latch it is already waiting for (docs/PLAN_lazy-stages.md).
   pl.nDerived = 0;
   if (pl.nStages) deriveStage(pl, 0);
 
   pl.periodCyc   = SJ_US_TO_CYC(def.period_us);
   pl.durationCyc = SJ_US_TO_CYC(def.duration_us);
-  pl.preloadCyc  = geo.preloadCyc;
+  pl.delayCyc    = SJ_US_TO_CYC(def.delay_us);
+  pl.preloadCyc  = pl.geo.preloadCyc;
+  pl.startLatCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::STARTLAT]);
+  pl.trigCompCyc = (uint32_t)SJ_US_TO_CYC(cal.us[Cal::TRIGCOMP]);
   pl.nPulses     = 0;
   pl.lateEvents  = 0;
   pl.maxLateCyc  = 0;
@@ -730,58 +782,114 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   pl.startNeedUs   = 0;
   pl.evOverdue     = false;
   pl.prevEvDl      = ~(uint64_t)0;     // cannot match a real deadline
-  pl.evIdx       = 0;
-  pl.evPhase     = EV_INIT;
+  pl.evIdx         = 0;
 
-  // Attach the measurement plan. This must stay on this side of the t0
-  // assignment below: anything done after t0 is taken is subtracted from
-  // START_LATENCY. Normally it is one index write -- loop() compiled the spare
-  // buffer for this slot already (Engine::warmPlans) and cleared its
-  // accumulators -- and it falls back to compiling here when it did not.
-  Measure::armPlan(eng, slotIdx, def, geo, TrainStore::epoch(), Cal::epoch());
-  pl.meas = Measure::hasPlan(eng);
+  // The envelope's shape -- its two reciprocals, which are the only divisions
+  // it needs -- is derived here; envRebase places it on t0 in the arm.
+  SampleGen::envShape(pl.env, pl.durationCyc,
+                      SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
+  if (!mask) pl.env.on = false;
 
-  // t0 is taken *after* all precomputation so the arm->first-latch latency
-  // stays the fixed STARTLAT regardless of train complexity. The slot's
-  // delay_us is added on top: the train's whole timebase (pulse grid, envelope,
-  // duration) starts at t0, so the delay shifts the waveform without changing
-  // its length. It applies to every start path — trigger edge, T/U and menu —
-  // so a delay can be verified over the serial port before it is wired to a
-  // trigger.
-  //
-  // A caller that knows *when* the start was requested passes that cycle count
-  // as `anchorCyc` (the trigger ISR timestamps the edge at its entry). t0 is
-  // then measured from the request instead of from the end of this function,
-  // so neither interrupt entry nor the precomputation above shows up in the
-  // delivered latency, whatever the train's complexity. TRIGCOMP is the one
-  // part that remains outside software's view — the hardware pin-to-ISR-entry
-  // delay — and is subtracted so that edge + STARTLAT is what the output sees.
-  // It defaults to 0: uncompensated until someone measures it on a scope.
-  pl.delayCyc    = SJ_US_TO_CYC(def.delay_us);
-  const uint64_t base = anchorCyc ? anchorCyc - SJ_US_TO_CYC(cal.us[Cal::TRIGCOMP])
-                                  : FastIO::cycles64();
-  pl.t0          = base + SJ_US_TO_CYC(cal.us[Cal::STARTLAT]) + pl.delayCyc;
-  pl.pulseStart  = pl.t0;
   if (pl.type == SINE) {               // first burst starts at t0
     pl.evPhase = EV_SAMP;
     pl.sampK   = 0;
     pl.ph0     = pl.phaseInit0;
     pl.ph1     = pl.phaseInit1;
-    pl.sampT   = pl.t0;
+  } else {
+    pl.evPhase = EV_INIT;
   }
-  SampleGen::envInit(pl.env, pl.t0, pl.durationCyc,
-                     SJ_US_TO_CYC(def.env.rampIn_us), SJ_US_TO_CYC(def.env.rampOut_us));
-  if (!mask) pl.env.on = false;
 
+  pl.armSlot     = slotIdx;
+  pl.armDefEpoch = defEpoch;
+  pl.armCalEpoch = calEpoch;
+  pl.armReady    = true;
+  return true;
+}
+
+SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
+                char* err, size_t errsz, uint64_t anchorCyc) {
+  Player* cur = live[eng];             // the buffer that last played
+  if (cur->active) {
+    snprintf(err, errsz, "engine busy (slot %u) — start dropped, stop with %c-1",
+             cur->slot, eng ? 'U' : 'T');
+    return false;
+  }
+  // Which buffer this arm plays from: the prepared one, unless loop() is in the
+  // middle of writing it, in which case the live one is armed in place.
+  const bool takeWarm = !prepBusy[eng];
+  Player* pl = takeWarm ? warm[eng] : cur;
+  // A prepared buffer that does not describe this exact start is prepared right
+  // here, which costs what the whole arm used to -- loop() starved, the slot
+  // edited since it last ran, or the in-place path above.
+  if (!armFresh(*pl, slotIdx, TrainStore::epoch(), Cal::epoch()) &&
+      !prepareArm(*pl, slotIdx, def, err, errsz))
+    return false;
+  const uint8_t mask = pl->chMask;
+  const Player* other = live[eng ^ 1];
+  if (other->active && (mask & other->chMask)) {
+    snprintf(err, errsz, "channel conflict with the running %c train — start dropped",
+             eng ? 'T' : 'U');
+    return false;
+  }
+
+  // The park codes are the one thing the preparation cannot freeze: `A`/`B`/`C`
+  // and the boot calibration move them, they are outside the tag, and the ISR
+  // latches them directly as the inter-pulse level. Two loads. The stage
+  // amplitudes need no such treatment -- ampToDelta returns a delta the offset
+  // cancels out of, except at saturation, where a recalibration between the
+  // preparation and the edge can shift a code that was already out of range and
+  // WARNed at parse time.
+  pl->off0 = (int16_t)(pl->outMode0 ? Stimjim.currentOffsets[0] : Stimjim.voltageOffsets[0]);
+  pl->off1 = (int16_t)(pl->outMode1 ? Stimjim.currentOffsets[1] : Stimjim.voltageOffsets[1]);
+
+  // Attach the measurement plan. This must stay on this side of the t0
+  // assignment below: anything done after t0 is taken is subtracted from
+  // START_LATENCY. Normally it is one index write -- loop() compiled the spare
+  // buffer for this slot already (Engine::prepareArms) and cleared its
+  // accumulators -- and it falls back to compiling here when it did not, which
+  // is why the prepared player carries the geometry that compile needs.
+  Measure::armPlan(eng, slotIdx, def, pl->geo, TrainStore::epoch(), Cal::epoch());
+  pl->meas = Measure::hasPlan(eng);
+
+  // t0 is taken *after* all precomputation so the arm->first-latch latency
+  // stays the fixed STARTLAT regardless of train complexity. The slot's
+  // delay_us is added on top: the train's whole timebase (pulse grid, envelope,
+  // duration) starts at t0, so the delay shifts the waveform without changing
+  // its length. It applies to every start path — trigger edge, T/U and menu
+  // — so a delay can be verified over the serial port before it is wired to
+  // a trigger.
+  //
+  // A caller that knows *when* the start was requested passes that cycle count
+  // as `anchorCyc` (the trigger ISR timestamps the edge at its entry). t0 is
+  // then measured from the request instead of from the end of this function, so
+  // neither interrupt entry nor the preparation shows up in the delivered
+  // latency, whatever the train's complexity. TRIGCOMP is the one part that
+  // remains outside software's view — the hardware pin-to-ISR-entry delay
+  // — and is subtracted so that edge + STARTLAT is what the output sees.
+  // It defaults to 0: uncompensated until someone measures it on a scope.
+  const uint64_t base = anchorCyc ? anchorCyc - pl->trigCompCyc : FastIO::cycles64();
+  pl->t0         = base + pl->startLatCyc + pl->delayCyc;
+  pl->pulseStart = pl->t0;
+  if (pl->type == SINE) pl->sampT = pl->t0;
+  SampleGen::envRebase(pl->env, pl->t0);   // four adds; the divisions were prepared
 
   if (mask & 1) digitalWriteFast(LED0, HIGH);   // lit from arm, i.e. through the delay
   if (mask & 2) digitalWriteFast(LED1, HIGH);
-  pl.active = true;
+  // Hand the prepared buffer to the ISR and give loop() back the one that just
+  // played. Nothing reads *pl until `active` is set below and the timer fires,
+  // and `cur` is idle by the busy check above, so neither side needs a lock.
+  // The in-place path plays from `cur` and swaps nothing.
+  pl->armReady = false;
+  if (takeWarm) {
+    live[eng] = pl;
+    warm[eng] = cur;
+  }
+  pl->active = true;
   // First latch in ISR context, never in the caller's. A delay longer than one
   // slice is chunked here the same way playerRun() chunks long inter-event
-  // gaps — the timers cannot be loaded with an arbitrary number of cycles, and
-  // the intermediate wakeups keep the 64-bit CYCCNT extension alive.
-  uint64_t wake = pl.t0 - pl.preloadCyc;
+  // gaps — the timers cannot be loaded with an arbitrary number of cycles,
+  // and the intermediate wakeups keep the 64-bit CYCCNT extension alive.
+  uint64_t wake = pl->t0 - pl->preloadCyc;
   uint64_t now  = FastIO::cycles64();
   // Everything this function did since `base` was taken came out of STARTLAT.
   // If the first latch's preload window has already opened, the latch cannot
@@ -794,8 +902,8 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
   if ((int64_t)(now - wake) > 0) {
     uint64_t shortCyc = now - wake;
     uint32_t shortUs  = (uint32_t)((shortCyc + SJ_CYC_PER_US - 1) / SJ_CYC_PER_US);
-    uint32_t needUs   = (uint32_t)cal.us[Cal::STARTLAT] + shortUs;
-    pl.startNeedUs = (needUs > 0xFFFFu) ? 0xFFFFu : (uint16_t)needUs;
+    uint32_t needUs   = (uint32_t)SJ_CYC_TO_US(pl->startLatCyc) + shortUs;
+    pl->startNeedUs = (needUs > 0xFFFFu) ? 0xFFFFu : (uint16_t)needUs;
   }
   if ((int64_t)(wake - now) > (int64_t)SJ_US_TO_CYC(SJ_MAX_SLICE_US))
     wake = now + SJ_US_TO_CYC(SJ_MAX_SLICE_US);
@@ -804,7 +912,7 @@ SJ_HOT bool startTrain(uint8_t eng, uint8_t slotIdx, const TrainDef& def,
 }
 
 void stopTrain(uint8_t eng) {
-  Player& pl = player[eng];
+  Player& pl = *live[eng];
   FastIO::busLock();                   // masks the player ISRs (BASEPRI)
   bool wasActive = pl.active;
   pl.active = false;
@@ -820,12 +928,12 @@ void stopTrain(uint8_t eng) {
   FastIO::busUnlock();
 }
 
-uint8_t claimedMask(uint8_t eng) { return player[eng].active ? player[eng].chMask : 0; }
-int16_t activeSlot(uint8_t p)    { return player[p].active ? (int16_t)player[p].slot : -1; }
-bool    anyActive()              { return player[0].active || player[1].active; }
+uint8_t claimedMask(uint8_t eng) { return live[eng]->active ? live[eng]->chMask : 0; }
+int16_t activeSlot(uint8_t p)    { return live[p]->active ? (int16_t)live[p]->slot : -1; }
+bool    anyActive()              { return live[0]->active || live[1]->active; }
 
 void status(uint8_t eng, EngineStatus& out) {
-  Player& pl = player[eng];
+  Player& pl = *live[eng];
   if (!pl.active) { out = EngineStatus{-1, 0, 0, 0, 0, 0, false}; return; }
   uint32_t n;
   do {                                 // seqlock: retry while the ISR is mid-update
@@ -889,7 +997,7 @@ static void benchIsrBody() {
 
 bool benchPitLatency(uint32_t period_us, uint32_t reps, uint32_t preload_us,
                      PitBenchResult* out) {
-  if (bench.active || player[0].active) return false;   // bench borrows player 0's PIT
+  if (bench.active || live[0]->active) return false;   // bench borrows player 0's PIT
   bench.res = PitBenchResult();
   bench.res.minErr = INT32_MAX;
   bench.res.maxErr = INT32_MIN;
@@ -1071,7 +1179,7 @@ static bool grabChannels(void (*isr0)(void), void (*isr1)(void)) {
 
 void begin() {
   bench.active = false;
-  memset(player, 0, sizeof(player));
+  memset(playerBuf, 0, sizeof(playerBuf));   // clears every armReady too
   isrFn[0] = player0Isr;
   isrFn[1] = player1Isr;
 #if SJ_TIMER_REGISTER
@@ -1122,24 +1230,39 @@ static int16_t routedSlot(uint8_t eng) {
   return TrainStore::lastWritten();
 }
 
-void warmPlans() {
+void prepareArms() {
   const uint32_t defEpoch = TrainStore::epoch(), calEpoch = Cal::epoch();
   for (uint8_t eng = 0; eng < 2; eng++) {
     Measure::housekeep(eng);         // the deferred accumulator clear
     const int16_t slot = routedSlot(eng);
     if (slot < 0) continue;
-    // Four loads: cheap enough to ask every loop() pass, and it keeps the
-    // geometry build below out of the steady state entirely.
-    if (Measure::planReady(eng, (uint8_t)slot, defEpoch, calEpoch)) continue;
+    const bool planFresh = Measure::planReady(eng, (uint8_t)slot, defEpoch, calEpoch);
+    // An unsynchronised first look, taken only to decide whether there is work
+    // at all: a trigger edge that swaps the buffers between here and the flag
+    // below costs this pass and nothing else, because the next pass prepares
+    // whatever it left behind. Eight loads, which is what keeps both
+    // preparations out of the steady state.
+    if (armFresh(*warm[eng], (uint8_t)slot, defEpoch, calEpoch) && planFresh) continue;
     const TrainDef& def = TrainStore::slotConst((uint8_t)slot);
-    uint64_t cum[SJ_MAX_STAGES + 1];
-    uint32_t stageN[SJ_MAX_STAGES], dtUs;
-    Measure::Geometry geo;
-    // A train the arm would refuse has no plan to warm; the refusal message is
-    // the arm's to print, so no error buffer is passed.
-    if (!buildGeometry((uint8_t)slot, def, Cal::live(), cum, stageN, geo, &dtUs, nullptr, 0))
-      continue;
-    Measure::warmPlan(eng, (uint8_t)slot, def, geo, defEpoch, calEpoch);
+    // From the flag on, warm[eng] cannot move: an edge landing inside this
+    // window arms the live buffer in place and swaps nothing. The pointer is
+    // read *after* the flag goes up for exactly that reason -- reading it first
+    // would leave this writing a player that had meanwhile started playing.
+    prepBusy[eng] = true;
+    Player* w = warm[eng];
+    // A train the arm would refuse has nothing to prepare and no plan to warm;
+    // the refusal message is the arm's to print, so no error buffer is passed.
+    const bool ok = armFresh(*w, (uint8_t)slot, defEpoch, calEpoch) ||
+                    prepareArm(*w, (uint8_t)slot, def, nullptr, 0);
+    prepBusy[eng] = false;
+    // w->geo now describes this slot at these epochs, so the plan warm needs no
+    // geometry of its own -- which is what keeps exactly one copy of
+    // buildGeometry in the firmware, because two would let a warmed plan's tag
+    // claim a geometry the arm computes differently. An edge that armed from
+    // this buffer since the flag dropped does not spoil it: it is the *live*
+    // player now, playing the same slot, and geo is not touched during playback.
+    if (ok && !planFresh)
+      Measure::warmPlan(eng, (uint8_t)slot, def, w->geo, defEpoch, calEpoch);
   }
 }
 

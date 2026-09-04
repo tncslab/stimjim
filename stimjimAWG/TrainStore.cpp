@@ -4,6 +4,7 @@
 //    GPL-3.0-or-later; see Config.h header.
 
 #include "TrainStore.h"
+#include "SampleGen.h"   // rampStageN: how many latches a ramp stage asks for
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,24 @@ TrainDef&       slot(uint8_t idx)      { return slots[idx]; }
 const TrainDef& slotConst(uint8_t idx) { return slots[idx]; }
 
 static uint8_t lastWritten_ = 0;
+
+uint32_t minLatchGapUs(const TrainDef& t, uint32_t dtUs) {
+  // An undriven train latches nothing at all (both modes 2/3 = not driven).
+  if ((t.mode0 >= 2 && t.mode1 >= 2) || t.type == SINE) return UINT32_MAX;
+  uint32_t worst = UINT32_MAX;
+  for (uint8_t i = 0; i < t.nStages; i++) {
+    const uint32_t dur = t.stages[i].dur_us;
+    if (!dur) continue;                  // instant jump: coincident by definition
+    // `S`: one latch per stage, so consecutive latches are dur apart. `L`: the
+    // stage's N samples are spread over it, dur/N apart -- and a stage under
+    // dtUs/2 gets N = 1, which lands its single sample dur after the previous
+    // stage's last one.
+    const uint32_t gap = (t.type == PIECEWISE_RAMP)
+                       ? dur / SampleGen::rampStageN(dur, dtUs) : dur;
+    if (gap < worst) worst = gap;
+  }
+  return worst;
+}
 
 void commit(uint8_t idx, const TrainDef& staged) {
   slots[idx] = staged;

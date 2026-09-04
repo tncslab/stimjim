@@ -338,6 +338,29 @@ int main() {
   CHECK(TrainStore::isDefaultMeas(cur));
   CHECK(TrainStore::defaultWhen(SINE) == 3 && TrainStore::defaultWhen(PIECEWISE_HOLD) == 0);
 
+  // ------------------------------------------------------- minLatchGapUs
+  // The shortest nonzero interval a definition puts between two consecutive DAC
+  // latches. The S/L/W handler compares it with Cal::minLatchUs and warns about
+  // stage boundaries this board cannot deliver.
+  CHECK(parse('S', ",0,0,10000,500000;5000,5000,1000;5000,5000,40", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 20) == 40u);      // S: the stage duration itself
+  // a 0-duration S stage is a coincident pair by definition, not a short gap
+  CHECK(parse('S', ",0,0,10000,500000;5000,5000,0;5000,5000,300", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 20) == 300u);
+  // an undriven train latches nothing at all
+  CHECK(parse('S', ",3,3,10000,500000;5000,5000,40", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 20) == UINT32_MAX);
+  // L: a long stage is sampled at dt, so it reports dt and not its duration
+  CHECK(parse('L', ",0,0,10000,500000,0,50;5000,5000,1000", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 50) == 50u);
+  // L: a stage under dt/2 gets one sample, at its *end* -- the case the warning
+  // exists for, and there the gap is the whole stage duration
+  CHECK(parse('L', ",0,0,10000,500000,0,20;5000,5000,1000;0,0,3", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 20) == 3u);
+  // W is exempt: its sample grid comes from the engine's Fs policy
+  CHECK(parse('W', ",0,0,10000,500000;5000,5000,5000;1000,1000,0;0,0,0", t, err, warn));
+  CHECK(TrainStore::minLatchGapUs(t, 20) == UINT32_MAX);
+
   if (failures == 0) printf("all checks passed\n");
   else               printf("%d check(s) FAILED\n", failures);
   return failures;
