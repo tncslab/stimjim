@@ -433,6 +433,13 @@ CALDEF            →  the whole set, then OK   restore this build's defaults
 
 ![the timing budgets to scale](../figs/stimjim-timing-latch.png)
 
+The rows are execution contexts: what `loop()` prepares before the edge, what the trigger
+ISR does after it, what the player ISR does per latch, and what the analog path adds. Every
+`NLDAC` pulse — the only thing that moves an output — comes from the player row. The figure
+is drawn at `STARTLAT` = 20 µs, which is what the pre-armed path makes reachable rather than
+the build default of 35; see [timing.md](timing.md) §1 for how to qualify a lower value on
+a board.
+
 Every number the scheduler and the measurement engine budget for a hardware operation is runtime
 state, not a compiled constant. `Config.h` supplies the defaults per board and backend; `CAL`
 adjusts them on one bench without a rebuild, `P` persists them in the EEPROM image, and `DUMP`

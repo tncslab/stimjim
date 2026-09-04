@@ -153,14 +153,17 @@ Every hardware timing budget the scheduler works from is runtime state, not a co
 CAL?                     list all nine budgets
 BENCHDAC2,2000           measure what dacProgramBoth actually costs
 BENCHARM,0,200           measure what arming slot 0 costs
-CAL,STARTLAT,80          widen the trigger-to-output latency
+CAL,STARTLAT,20          set the trigger-to-output latency
 P                        persist it
 ```
 
 The defaults in [stimjimAWG/Config.h](stimjimAWG/Config.h) are measured on a Teensy 3.5 at
 120 MHz with the register backends. On any other board, re-measure with the `BENCH` group before
 trusting the firmware for stimulation. [figs/stimjim-timing-latch.png](figs/stimjim-timing-latch.png)
-shows what each budget pays for, drawn to scale.
+shows what each budget pays for, drawn to scale, with one row per execution context — what
+`loop()` prepares before a trigger edge, what the edge ISR does, and what the timer ISR does per
+latch. [figs/stimjim-timing-contexts.png](figs/stimjim-timing-contexts.png) is the same division
+over a whole train.
 
 The engine checks itself: if a latch or an arm misses its budget, the train's completion says so
 and names the value that would have covered it. No oscilloscope is needed for that.

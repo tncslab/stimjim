@@ -36,6 +36,8 @@ A trigger start delivers its first DAC latch at
 t0 = <edge timestamp> − CAL TRIGCOMP + CAL STARTLAT + <slot delay_us>
 ```
 
+![the start path, by execution context](../figs/stimjim-timing-latch.png)
+
 `STARTLAT` is **35 µs** by default on a Teensy 3.5 at 120 MHz with the register backends, and
 120 µs on the portable (Arduino-SPI + `IntervalTimer`) build. It is runtime state:
 `CAL,STARTLAT,<us>` changes it, `P` persists it, `CAL?` reports what a running board uses. A board
@@ -193,6 +195,8 @@ The edge ISR emits no signal. It timestamps the edge, arms the player (copy-on-a
 fixed-point precomputation), computes `t0`, and programs that player's PIT channel to wake
 `CAL PRELOAD` before `t0`. The first DAC latch — like every later one — happens in the PIT player
 ISR. **The interrupt supplies the time reference; the clock emits the samples.**
+
+![where a whole train's work sits](../figs/stimjim-timing-contexts.png)
 
 This is deliberate, and it removes the original firmware's first-pulse-in-caller-context behaviour
 by construction:
