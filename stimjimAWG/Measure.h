@@ -152,6 +152,21 @@ void planBuild(Plan& pl, uint8_t slot, const TrainDef& def, const Geometry& g);
 // k = ceil(((target - phaseInit) mod 2^32) / phaseInc). phaseInc > 0 required.
 uint32_t peakSampleIndex(uint32_t phaseInit, uint32_t phaseInc, uint32_t target);
 
+// ------------------------------------------- decimal text without vfprintf
+//
+// `BENCHFMT` measured a formatted row at 171 us and `BENCHSD` measured the card
+// write after it at 56 us, so what bounds the log's row rate is newlib's
+// `vfprintf` -- entered five times per row at roughly 34 us a call -- and
+// neither the card nor the arithmetic. These appenders replace all five. Each
+// writes at `p`, returns the new end and terminates nothing; the caller sizes
+// the buffer. They are byte-identical to the `%lu` and `%s%lu.%02lu` they
+// replace, which test_measure.cpp checks exhaustively.
+char* putU32(char* p, uint32_t v);
+char* putU64(char* p, uint64_t v);
+// `centi` in hundredths of a unit; `neg` is the sign of the value *before*
+// rounding, so a small negative reading still prints as -0.00.
+char* putCenti(char* p, int32_t centi, bool neg);
+
 // Mean and sample standard deviation of an accumulator, in raw ADC codes.
 // Returns false when n == 0 (nothing measured); sd is 0 when n == 1.
 bool accumStats(const Accum& a, double& mean, double& sd);

@@ -129,8 +129,10 @@ I     99.5  -100.0 uA
 R    1.01k   1.00k
 ```
 
-The title bar (inverted, as row 0 always is) carries the train counter, the engine, the sample
-count, the point's label — stage index for `S`/`L`, degrees for `W` — and the page's position
+The title bar (inverted, as row 0 always is) carries the run number `#n` — the one the
+`Train #n complete` line prints — then the engine *and the slot* as `T04`, which reads the way
+the STATUS header's engine tags do. Without the slot the page said what was measured but not what
+was played. Then the sample count, the point's label — stage index for `S`/`L`, degrees for `W` — and the page's position
 within the result pages. Each data row is a three-character tag, then per channel a
 seven-character value and a one-character marker, then the unit: 3 + 8 + 8 + 2 = 21. The marker
 column comes out of the gap between the channels, not out of the numbers.
@@ -315,31 +317,52 @@ every calibration offset the library can produce (a multiple of 0.01, from a 100
 That is documented in the protocol reference under `LOG`, because it is a change a host comparing
 old and new log files could otherwise be puzzled by.
 
-`BENCHFMT[,n]` times exactly this: `Measure::benchFormatRow()` builds a synthetic record whose
-codes sweep the range (so nothing is hoisted out of the loop), converts its four fields and formats
-the row, with no serial write and no card.
+`BENCHFMT[,n]` times the formatting and `BENCHSD[,rows]` times the card write that follows it, so
+between them they account for the whole write path. Measured, n = 2000, a 46-byte row:
 
-**Measured, n = 2000, both paths in one binary** (the `%.2f` variant was a temporary second bench
-kept only long enough to take the reading, then deleted):
-
-| Row path | min / avg / max | Rows per second |
+| Stage | min / avg / max | Rows per second |
 |---|---|---|
-| 0.7.0, `snprintf("%.2f")` per field | 285.8 / 336.7 / 350.1 us | ~2 970 |
-| 0.8.0, fixed point | 160.9 / 171.1 / 180.2 us | ~5 850 |
+| `BENCHFMT`, 0.7.0: `snprintf("%.2f")` per field | 285.8 / 336.7 / 350.1 us | 2 970 |
+| `BENCHFMT`, fixed point but still `snprintf` | 160.9 / 171.1 / 180.2 us | 5 850 |
+| `BENCHFMT`, fixed point + hand-rolled decimals | **10.0 / 11.7 / 13.9 us** | 85 000 |
+| `BENCHSD`, the card after it | 9.9 / 56.4 / 4 140 us | 17 254 |
 
-So the change is worth 1.97x, and the plan's estimate for the *old* path — "tens of microseconds
-per conversion, so 100-300 us per row, a ceiling of a few thousand rows per second" — was right.
+**The measurement corrected the plan twice.** The plan's estimate for the *old* path was right
+@EM@ "tens of microseconds per conversion, 100-300 us per row, a ceiling of a few thousand rows per
+second". Its estimate for the fixed-point path was wrong by an order of magnitude: it expected "a
+few microseconds per field" and got 171 us per row, because what remained after `_dtoa_r` was
+newlib's `vfprintf` machinery itself, entered five times per row at roughly 34 us a call. Removing
+the doubles saved 166 us (about 41 us per field); plain integer `snprintf` cost the rest.
 
-**Its estimate for the new path was wrong by an order of magnitude, and the reason is worth
-recording.** The plan expected fixed point to leave "a few microseconds per field". It leaves 171
-us per row, because what remains is not arithmetic but newlib's `vfprintf` machinery itself,
-entered five times per row (four fields and the row) at roughly 34 us a call. Removing `_dtoa_r`
-saved 166 us, about 41 us per field; plain integer `snprintf` costs the rest. If the row rate ever
-needs to go further, the next step is hand-rolled integer-to-decimal appends in place of those five
-`snprintf` calls — still ASCII, still byte-identical, plausibly 10-20 us — and *not* the binary
-format the plan's step 3 sketched. It is not built, because 5 850 rows/s already clears the MDATA
-ring's drain requirement by a wide margin and nothing on this bench produces rows that fast.
+So the row path went through a second step the plan did not contain: three integer appenders
+(`putU32`, `putU64`, `putCenti`) replace all five `snprintf` calls, and an `MDATA` line and a log
+row are now built from one shared tail rather than formatted twice. That took the row from 171 us
+to 11.7 us. The output bytes are unchanged, and `tests/host/test_measure.cpp` proves it: each
+appender is compared against the `printf` conversion it replaced, exhaustively over the ranges it
+can see (every value below 5 000 for `putU32`, a contiguous +-20 000 block for `putCenti`, plus the
+decade boundaries and the 32- and 64-bit edges).
 
+**And it disposed of the plan's step 3.** A binary log format was offered as the fallback "if step
+2 is not enough". It is not needed: a row now costs 68 us end to end, of which the card is 56, and
+the card is where the cost belongs. The plan's own recommendation against a binary format stands,
+now with a measurement behind it.
+
+**Floating point: audited, and there is nothing to gain.** The Cortex-M4F has a single-precision
+FPU, so `float` is hardware and `double` is a software library; the obvious question is whether the
+log path would go faster in `float`. A disassembly audit of the linked image @EM@ which functions
+call `__aeabi_d*`, `_dtoa_r` or `sqrt` @EM@ answers no, for a better reason than "not much":
+
+- **the row path, the player ISRs, the arm and `Measure::fire` contain no floating point at all.**
+  The waveform and logging paths are integer end to end, so there is nothing to convert.
+- What is left @EM@ `accumStats`, `printSummary`, `resultSnapshot`, `noteOffsets`,
+  `SampleGen::sineDerive`, the human `printf`s @EM@ runs once per train, per command or per slot
+  definition. Never per row, per sample or per latch.
+- `accumStats` **must** stay double, and it is exactly the "risk of losing important digits" case:
+  its variance is `sumsq - sum*sum/n`, where at 500 repetitions `sum*sum` is around 1.7e13 and a
+  24-bit float mantissa carries an absolute error near 1e6 on a difference that can itself be 1e4.
+
+The lesson worth keeping is the other one: **on this libc `snprintf` costs tens of microseconds a
+call whatever the conversion**, so any per-event formatting is worth doing by hand.
 
 ## 2. Files
 
@@ -427,6 +450,20 @@ No EEPROM change: nothing new needs persisting, so the image version stays at v6
 - **The fixed-point conversion was compared against `%.2f`** over 13.1 million conversions on the
   host — the whole code range crossed with 801 offsets — which is where the numbers in §1.5 come
   from.
+**A second silicon round, after `BENCHSD` and the appenders.**
+
+- `SDINFO,1` **never worked**, and the audit that found the `SCREEN,1` argument bug found it too.
+  `parseFields` deliberately refuses the separating comma and every call site behind one skips it
+  with a `p + 1`; two sites passed `args` unskipped, so `SDINFO,1` silently behaved exactly like a
+  bare `SDINFO` and never scanned the used space. Both now go through a `skipComma()` helper, and
+  the board answers `SD,1,30554112,128,...` where it used to answer `-1`.
+- `smoke.py`'s `screen()` wrote its capture file only *after* its check passed, so a failing run
+  left the previous run's file in place — which is what made a stale capture look like a
+  firmware regression for several minutes. It now writes the capture first.
+- `SCREEN` prints text by default and `SCREEN,1` adds the pixel block, so the suite asks for pixels
+  only when it has somewhere to put them. That takes a capture from about 4 KB to about 150 bytes.
+- The full suite passes again, and the RESULT capture reads `#2 T04 n=5 s0 1/2`.
+
 - **Not tested: the buttons.** Nothing here can press one. The firmware path they share with the
   serial commands (`Triggers::fireRoute`, the page advance) is exercised, but the ISR, the
   arm/re-arm debounce and the no-route warning are not.

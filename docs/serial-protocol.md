@@ -545,10 +545,10 @@ every 64 rows, or once a second, whichever comes first.
 ISR (priority 64, preempting `loop()` unconditionally) only pushes a record into the 128-entry
 `MDATA` ring, and `loop()` formats it and hands it to SdFat, which buffers into a 512-byte block.
 A stall therefore loses records once it exceeds `128 / (measurement points per second)` — 64 ms at
-2000 rows/s — and says so with `WARN MEAS: MDATA ring overflowed`. SD write latency itself has
-never been timed on this board (there is no `BENCHSD`); cards are typically well under a
-millisecond per buffered block with occasional stalls of tens of milliseconds. See
-[timing.md](timing.md) §6.
+2000 rows/s — and says so with `WARN MEAS: MDATA ring overflowed`. `BENCHSD` measures the write
+path at 56 µs for the average row and 4.1 ms for the worst on this board and card, against 12 µs to
+format the row; a cheap card can stall for hundreds of milliseconds where this one stalls for four.
+See [timing.md](timing.md) §6.
 
 A log has to be readable on its own, including when the trains were fired by trigger edges with
 no host attached, so the file carries:
@@ -579,9 +579,9 @@ housekeeping, and the long-running card and serial loops (`SDLIST`, `SDGET`, the
 call it explicitly for this reason. Nothing a host does can break the guarantee; it is recorded
 here because it is the one way the column can go wrong.
 
-**Rounding note (firmware 0.8.0).** The `V*_mV` and `I*_uA` fields are converted in fixed point
-rather than through `printf("%.2f")`, which takes newlib's `_dtoa_r` and its allocation out of the
-row path. Both scales are exact hundredths of their unit (2.44 mV and 0.85 uA per code) and the
+**Rounding note (firmware 0.8.0).** The `V*_mV` and `I*_uA` fields are converted in fixed point and
+rendered by hand rather than through `printf`, which takes a row from 337 us to 12 us
+([timing.md](timing.md) §4). Both scales are exact hundredths of their unit (2.44 mV and 0.85 uA per code) and the
 calibration offset is cached in Q16, so the conversion is exact and the output bytes are the same
 — with one systematic exception. Where the exact value lands on a `.005` boundary, the old code
 rounded the nearest *double* of a product involving the inexact 0.85 and the new code rounds the
@@ -702,7 +702,7 @@ On a board whose source is not `build`, SD files also get real FAT modification 
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
 | `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>, hot=<RAM\|ITCM\|flash>` and `# engine: …, K_RELOAD=<n> cycles, cal=<default|custom>`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)); `cal` says whether they are still the ones the board runs on, or a hand-calibrated set (`CAL?`); `hot` says whether the arm and the player loop execute from RAM or from flash, which changes what `BENCHARM` reports (`SJ_CODE_IN_RAM`, [timing.md](timing.md) §7). |
-| `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, a `# page <i>/<n> <name>, panel <present\|absent>` line, one `# row<r>: "..."` line per text row, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. It works with no panel connected — the framebuffer is composed either way — and it re-probes the bus first, so a panel plugged in after boot is picked up by sending `SCREEN` once. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
+| `SCREEN` | What the panel shows, as text: a `# SCREEN 128x32` header, a `# page <i>/<n> <name>, panel <present\|absent>` line, one `# row<r>: "..."` line per text row, a `# bar: <n>%` line when a progress bar replaces row 2, then `OK`. About 150 bytes. `SCREEN,1` appends the framebuffer as ASCII art, one `\|`-delimited line per pixel row (`#` = lit) — 32 lines of 130 characters, so it is opt-in: the text answers most questions and the pixels are what a layout regression needs. Either form works with no panel connected (the framebuffer is composed either way) and re-probes the bus first, so a panel plugged in after boot is picked up by sending `SCREEN` once. |
 | `PAGE` | display page: bare `PAGE` advances one (the same action as the page button, wrapping at the end), `PAGE,<n>` selects one, `PAGE?` queries. All three reply `PAGE,<index>,<count>,<name>`, where `name` is `STATUS`, `RESULT` or `SYSTEM`. The page list is `STATUS`, then one `RESULT` page per measurement point of the last completed train (at most 4), then `SYSTEM`, so `count` grows and shrinks with what the last train measured. Paired with `SCREEN` this makes every page reviewable with no panel attached. |
 | `CLK` | the wall clock — see below. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
@@ -727,6 +727,7 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 | `BENCHCYC[,n]` | `cycles64()` overhead |
 | `BENCHK[,n]` | re-run the `K_RELOAD` self-calibration, print residual min/med/max (item 6) |
 | `BENCHFMT[,n]` | the number formatting of one `MDATA`/log row: four field conversions plus the row, with no serial write and no card. What it bounds is the sustainable row rate and through that the `MDATA` ring's headroom — never waveform timing |
+| `BENCHSD[,rows]` | the card write after the formatting: SdFat's buffered `println` plus the flush policy, driven as `loop()` drives it. Writes and then deletes `BENCHSD.CSV`, and is refused while a log is open |
 | `BENCHARM,slot[,n]` | `Engine::startTrain` on that slot — the arm cost `CAL STARTLAT` has to cover. The train is stopped again inside the same bus lock, so nothing plays and the outputs stay parked |
 | `BENCHSETTLE,ch,code,dmax_us[,n]` | the same DAC step latched over and over and read back at delays 0…`dmax_us`, so the delay at which the readings stop moving is `CAL SETTLE`. Drives the output — set the channel's mode first (`M<ch>,0`) and print a `WARN` |
 | `BENCHPIT,period_us,n[,preload_us]` | PIT wake (preload 0) or post-spin latch jitter vs absolute deadline, histogram in 0.5 µs bins |

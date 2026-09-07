@@ -47,21 +47,33 @@ def eq(got, want, what):
 
 
 def screen(sj, name, outdir):
-    """Capture the OLED framebuffer as ASCII art."""
-    lines = sj.cmd("SCREEN", quiet=0.6, limit=15)
+    """Read what the panel shows; save the pixel art too when capturing.
+
+    `SCREEN` is the composed text, about 150 bytes. `SCREEN,1` adds 32 lines of
+    pixels, about 4 KB, which over USB CDC costs more than everything else this
+    helper does -- so the art is asked for only when there is a directory to
+    put it in.
+    """
+    pixels = bool(outdir)
+    lines = sj.cmd("SCREEN,1" if pixels else "SCREEN", quiet=0.6, limit=15)
     art = [l for l in lines if l.startswith("|")]
     # The firmware also reports the composed row text, so a capture is readable
     # without decoding the bitmap font.
     text = [l for l in lines if l.startswith("# row") or l.startswith("# bar")
             or l.startswith("# page")]
-    if not check(len(art) == 32 and lines[-1] == "OK", f"SCREEN {name}: 32 rows + OK"):
+    # Written before the check, so a failure leaves the capture that caused it
+    # rather than the previous run's file to be misread as current.
+    if outdir:
+        p = pathlib.Path(outdir) / f"screen-{name}.txt"
+        p.write_text("\n".join(text + art) + "\n", encoding="ascii")
+    want = 32 if pixels else 0
+    if not check(len(art) == want and lines[-1] == "OK",
+                 f"SCREEN {name}: {want} pixel row(s) + OK"):
         print("   ", lines[:4])
         return None
     for t in text:
         print("       ", t)
     if outdir:
-        p = pathlib.Path(outdir) / f"screen-{name}.txt"
-        p.write_text("\n".join(text + art) + "\n", encoding="ascii")
         print(f"       -> {p}")
     # The composed text, not the pixels: that is what a layout check reads.
     return text

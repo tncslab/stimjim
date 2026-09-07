@@ -149,7 +149,9 @@ default.
 
 **The box runs headless.** With no OLED and no SD card it boots, plays, triggers and measures the
 same; it says so at boot and nothing later waits on either. The panel is probed once, at boot, and
-never again on its own — send `SCREEN` after plugging one in.
+never again on its own — send `SCREEN` after plugging one in. `SCREEN` prints what the panel
+shows as text; `SCREEN,1` adds the pixel art, which is 4 KB and only worth asking for when a
+layout is being reviewed.
 
 **Three buttons.** Btn0 (pin 17) walks the display pages. Btn1 (pin 39) and Btn2 (pin 16) fire the
 routes of trigger inputs 0 and 1, so a train configured with `TRIG` can be started by hand. A
@@ -168,11 +170,15 @@ read low for 25 ms.
 A `RESULT` page is three rows, channel 0 left and channel 1 right:
 
 ```
-#7 T n=500 s0 1/2
+#7 T04 n=500 s0 1/2
 V    100.2   -99.8 mV
 I     99.5  -100.0 uA
 R    1.01k   1.00k
 ```
+
+The title bar names the run (`#7`, the number the `Train #n complete` line prints), the engine and
+the slot it played (`T04`), the repetitions behind the numbers, the measurement point, and the page
+within the set.
 
 The resistance is `V/I` printed to the precision the measurement supports and no further: the
 standard errors of the two means, floored at 1 % for the ADC path's uncharacterised gain accuracy,

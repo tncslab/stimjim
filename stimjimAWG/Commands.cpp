@@ -62,6 +62,12 @@ static int8_t parseFields(const char* p, long* out, int8_t maxN) {
   }
 }
 
+// The separating comma of a long-form command's argument list. parseFields is
+// deliberately strict about it and every call site that sits behind one skips
+// it; this is that skip, written so an empty argument list stays empty rather
+// than walking off the end.
+static inline const char* skipComma(const char* p) { return (*p == ',') ? p + 1 : p; }
+
 // Clock-independent: 1000 ns / cycles-per-us. 8.33 ns at 120 MHz (Teensy 3.5),
 // 1.67 ns at 600 MHz (Teensy 4.x). uint64 intermediate so long BENCH intervals
 // cannot overflow the multiply.
@@ -1048,6 +1054,7 @@ static void benchList() {
   Serial.println("# BENCHCYC[,n]                 cycles64() overhead");
   Serial.println("# BENCHK[,n]                   K_RELOAD recalibration, residual stats");
   Serial.println("# BENCHFMT[,n]                 one MDATA/log row's number formatting (row rate)");
+  Serial.println("# BENCHSD[,rows]               the card write after it: buffered println + flush policy");
   Serial.println("# BENCHARM,slot[,n]            Engine::startTrain cost (what CAL STARTLAT must cover)");
   Serial.println("# BENCHSETTLE,ch,code,dmax_us[,n]   ADC reading vs delay after a latch (CAL SETTLE)");
   Serial.println("# BENCHPIT,period_us,n[,preload_us]  PIT wake/latch jitter vs deadline");
@@ -1227,6 +1234,61 @@ static void benchSquare(const char* args, bool legacyPath) {
 }
 
 // sub = command word after "BENCH", args = rest of line
+// BENCHSD,<rows> -- what a log row costs *after* the formatting: SdFat's
+// buffered println plus the flush policy SdLog::poll() applies, driven exactly
+// as loop() drives it. Together with BENCHFMT this accounts for the whole write
+// path, which docs/timing.md section 6 had never timed.
+//
+// It writes to the card and then deletes its own file, so it refuses to run
+// while a log is open rather than appending benchmark rows to real data.
+static void benchSdWrite(const char* args) {
+#if SJ_USE_SD
+  long v[2];
+  uint32_t rows = parseLongs(args, v, 1) ? (uint32_t)v[0] : 2000;
+  if (rows < 1 || rows > 100000) { err("BENCHSD", "rows must be 1-100000"); return; }
+  if (SdLog::isOpen()) {
+    err("BENCHSD", "a log is open -- close it first (LOG0); this bench writes its own file");
+    return;
+  }
+  warn("BENCHSD", "writing and then deleting BENCHSD.CSV on the card");
+  SdLog::openLog("BENCHSD.CSV");
+  if (!SdLog::isOpen()) return;                 // openLog printed the reason
+
+  // A representative row: the same shape and length Measure::poll() produces.
+  char row[144];
+  Measure::benchFormatRow(row, sizeof row, 1);
+  const uint32_t t0 = ARM_DWT_CYCCNT;
+  uint32_t mn = UINT32_MAX, mx = 0;
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < rows; i++) {
+    const uint32_t a = ARM_DWT_CYCCNT;
+    SdLog::writeRow(row);
+    SdLog::poll();                              // the flush policy, as loop() applies it
+    const uint32_t dt = ARM_DWT_CYCCNT - a;
+    if (dt < mn) mn = dt;
+    if (dt > mx) mx = dt;
+    sum += dt;
+    FastIO::cycles64();                         // a long run must not starve the timebase
+  }
+  SdLog::flushNow();
+  const uint32_t total = ARM_DWT_CYCCNT - t0;
+  printStat("SD", rows, mn, sum, mx);
+  // The maximum is the number that matters: a card's internal housekeeping
+  // stall is what empties the MDATA ring, and an average hides it.
+  Serial.printf("# BENCHSD: %lu rows of %u bytes in %lu us -- %lu rows/s sustained, "
+                "worst single row %lu us\n",
+                (unsigned long)rows, (unsigned)strlen(row),
+                (unsigned long)(total / SJ_CYC_PER_US),
+                (unsigned long)((uint64_t)rows * 1000000ull / (total / SJ_CYC_PER_US)),
+                (unsigned long)(mx / SJ_CYC_PER_US));
+  SdLog::closeLog();
+  SdLog::del("BENCHSD.CSV");
+#else
+  (void)args;
+  err("BENCHSD", "no SD support in this build");
+#endif
+}
+
 static void benchDispatch(const char* sub, const char* args) {
   if (!*sub) { benchList(); return; }   // "BENCH" and "BENCH?" both list
   if (Engine::anyActive()) {
@@ -1303,6 +1365,8 @@ static void benchDispatch(const char* sub, const char* args) {
     benchRun("FMT", n, [&row](uint32_t i) { (void)Measure::benchFormatRow(row, sizeof row, i); });
     Serial.printf("# BENCHFMT: last row was %u bytes: %s\n", (unsigned)strlen(row), row);
     ok();
+  } else if (!strcmp(sub, "SD")) {
+    benchSdWrite(args);
   } else if (!strcmp(sub, "ARM")) {
     benchArm(args);
   } else if (!strcmp(sub, "SETTLE")) {
@@ -1342,7 +1406,7 @@ static void help() {
   Serial.println("#   D / D?                          print offsets (human / CSV)");
   Serial.println("#   P                               save slots 0-9 + triggers to EEPROM");
   Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
-  Serial.println("#   SCREEN                          dump the OLED framebuffer as ASCII art");
+  Serial.println("#   SCREEN / SCREEN,1               what the panel shows: text / text + pixel art");
   Serial.println("#   PAGE / PAGE,<n> / PAGE?         display page: advance / select / query");
   Serial.println("#   TRIG<t>,<mode>,<s0>,<s1>,<edge> route input 0/1: 0 off, 1 joint, 2 independent,");
   Serial.println("#                                   3 stimulus marker out; edge 0 rising, 1 falling");
@@ -1414,7 +1478,12 @@ void handleLine(const char* line) {
   } else if (!strcmp(word, "CLK")) {
     handleClk(args);
   } else if (!strcmp(word, "SCREEN")) {
-    UiMenu::dumpScreen();
+    // `SCREEN` is the composed text; `SCREEN,1` adds the 4 KB pixel block.
+    // parseFields is strict about the separating comma, which every other call
+    // site skips with a `p + 1`; there is nothing to skip when there are no
+    // arguments at all.
+    long v;
+    UiMenu::dumpScreen((parseFields(skipComma(args), &v, 1) == 1) && v != 0);
   } else if (!strcmp(word, "PAGE")) {
     handlePage(args);
   } else if (!strcmp(word, "ENV")) {
@@ -1431,7 +1500,10 @@ void handleLine(const char* line) {
     sdGroupList();
   } else if (!strcmp(word, "SDINFO")) {
     long v;
-    bool withUsed = (parseFields(args, &v, 1) == 1) && v != 0;
+    // Was `parseFields(args, ...)`, which never matched: `args` still carries
+    // the comma and parseFields refuses one, so `SDINFO,1` silently behaved
+    // exactly like a bare `SDINFO` and never scanned the used space.
+    bool withUsed = (parseFields(skipComma(args), &v, 1) == 1) && v != 0;
     if (withUsed && Engine::anyActive())
       err("SDINFO", "the used-space scan takes seconds — not while a train runs");
     else

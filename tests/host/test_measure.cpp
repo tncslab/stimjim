@@ -29,6 +29,11 @@ static int failures = 0;
       printf("FAIL %s:%d  %s=%lld != %s=%lld\n", __FILE__, __LINE__, #a, va, #b, vb); } \
   } while (0)
 
+#define CHECK_STR(got, want) do { \
+    if (strcmp((got), (want))) { failures++; \
+      printf("FAIL %s:%d  \"%s\" != \"%s\"\n", __FILE__, __LINE__, (got), (want)); } \
+  } while (0)
+
 #define CHECK_NEAR(a, b, tol) do { \
     double va = (double)(a), vb = (double)(b); \
     if (fabs(va - vb) > (tol)) { failures++; \
@@ -612,6 +617,63 @@ static void testAccumStats() {
   CHECK_NEAR(sd, sqrt(50.0), 1e-12);
 }
 
+// The decimal appenders that replaced the row path's five snprintf calls. They
+// only earn their place if they are byte-identical to what they replaced, so
+// this compares them against snprintf over the whole range each one can see.
+static void testDecimalAppenders() {
+  char got[32], want[32];
+
+  // putU32 over every decade boundary and either side of it, plus the ceiling.
+  uint32_t probes[] = {0u, 1u, 9u, 10u, 99u, 100u, 999u, 1000u, 65535u,
+                       999999u, 1000000u, 2147483647u, 4294967295u};
+  for (uint32_t v : probes) {
+    *putU32(got, v) = '\0';
+    snprintf(want, sizeof want, "%lu", (unsigned long)v);
+    CHECK_STR(got, want);
+  }
+  // ... and exhaustively over the first few thousand, where the carry logic is.
+  for (uint32_t v = 0; v < 5000u; v++) {
+    *putU32(got, v) = '\0';
+    snprintf(want, sizeof want, "%lu", (unsigned long)v);
+    if (strcmp(got, want)) { CHECK_STR(got, want); break; }
+  }
+
+  // putU64 past the 32-bit edge, which is where the log timestamp lives after
+  // 71 minutes of uptime.
+  uint64_t big[] = {0ull, 4294967295ull, 4294967296ull, 1000000000000ull,
+                    18446744073709551615ull};
+  for (uint64_t v : big) {
+    *putU64(got, v) = '\0';
+    snprintf(want, sizeof want, "%llu", (unsigned long long)v);
+    CHECK_STR(got, want);
+  }
+
+  // putCenti against the exact format it replaced, over the full range a
+  // reading can reach (+-15 V in hundredths of a millivolt is +-1.5e6) and both
+  // signs, including the -0.00 case the `neg` flag exists for.
+  int32_t centi[] = {0, 1, 9, 10, 99, 100, 101, 999, 1000, 1500000,
+                     -1, -99, -100, -1500000};
+  for (int32_t c : centi) {
+    for (int pass = 0; pass < 2; pass++) {
+      const bool neg = (pass == 1);
+      *putCenti(got, c, neg) = '\0';
+      const uint32_t a = (c < 0) ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
+      snprintf(want, sizeof want, "%s%lu.%02lu", (neg || c < 0) ? "-" : "",
+               (unsigned long)(a / 100u), (unsigned long)(a % 100u));
+      CHECK_STR(got, want);
+    }
+  }
+  // Exhaustive over a contiguous block, so no carry between the whole part and
+  // the two decimals goes unchecked.
+  for (int32_t c = -20000; c <= 20000; c++) {
+    *putCenti(got, c, false) = '\0';
+    const uint32_t a = (c < 0) ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
+    snprintf(want, sizeof want, "%s%lu.%02lu", (c < 0) ? "-" : "",
+             (unsigned long)(a / 100u), (unsigned long)(a % 100u));
+    if (strcmp(got, want)) { CHECK_STR(got, want); break; }
+  }
+}
+
 int main() {
   testPeakSolver();
   testHoldPlan();
@@ -630,6 +692,7 @@ int main() {
   testRotationShortTrain();
   testRotateSine();
   testAccumStats();
+  testDecimalAppenders();
   printf(failures ? "%d check(s) failed\n" : "all checks passed\n", failures);
   return failures;
 }

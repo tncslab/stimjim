@@ -31,12 +31,15 @@ namespace UiMenu {
 void begin();
 void tick();          // drain UiInput events, re-render if changed (loop only)
 
-// `SCREEN`: render now and print the framebuffer as ASCII art, one line per
-// pixel row, ending with OK. The panel is small and unphotographable over a
-// serial link, so this is how display changes get reviewed and regression-
-// checked — the captures in docs/progress/ are its raw output. It re-probes the
-// bus first, so a panel plugged in after boot is picked up by sending `SCREEN`.
-void dumpScreen();
+// `SCREEN`: render now and print what the panel shows — a header, the page and
+// panel state, and the composed text of each row. With `withPixels` it also
+// prints the framebuffer as ASCII art, one line per pixel row: 32 lines of 130
+// characters against about 150 bytes for the text, so it is opt-in (`SCREEN,1`).
+// The panel is small and unphotographable over a serial link, so the art is how
+// layout changes get reviewed and regression-checked — the captures in
+// docs/progress/ are its raw output. Either form re-probes the bus first, so a
+// panel plugged in after boot is picked up by sending `SCREEN` once.
+void dumpScreen(bool withPixels);
 
 // ------------------------------------------------------------ `PAGE` backend
 // Every entry point prints one `PAGE,<index>,<count>,<name>` status line.

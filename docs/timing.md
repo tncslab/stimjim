@@ -252,14 +252,14 @@ SDIO rather than the DAC/ADC SPI bus, a card write cannot delay a latch, lengthe
 the bus lock.
 
 What card latency *can* cost is measurement records. SD write latency is dominated by the card's
-own controller: typically well under a millisecond for a buffered block, with occasional stalls of
-tens of milliseconds — hundreds on cheap cards — during internal housekeeping. **Those figures are
-the general behaviour of SD cards, not a measurement on this board: there is no `BENCHSD`, and the
-card write itself has never been timed here.** What *has* been timed is everything before it: the
-formatting costs 171 us per row, so the firmware can hand SdFat about 5 850 rows a second — see
-the `BENCHFMT` table below. The exposure is the ring's headroom — a stall costs records once it
-exceeds `128 / (measurement points per second)`, which is 64 ms at 2000 rows/s and 22 ms at the
-ceiling the formatting allows. An overflow is never silent; it prints
+own controller: `BENCHSD` on this board and this card measures 56 us for the average row and
+**4.1 ms for the worst**, the latter being internal housekeeping during a flush. The worst case is
+the number that matters, because it is what empties the MDATA ring rather than the average, and a
+cheap card can stall for hundreds of milliseconds where this one stalls for four.
+
+The exposure is the ring's headroom — a stall costs records once it exceeds
+`128 / (measurement points per second)`, which is 64 ms at 2 000 rows/s, so a 4 ms stall costs
+nothing and a hundred-millisecond one would. An overflow is never silent; it prints
 
 ```
 WARN MEAS: MDATA ring overflowed — <n> records dropped (the host is not reading fast enough)
@@ -269,36 +269,60 @@ Two card operations do block `loop()` for a long time: `SDINFO,1` walks the whol
 chain (seconds, and it is refused while a train runs), and `SDGET` streams a file over the serial
 port. Neither disturbs a waveform, for the reason above.
 
-**What the row costs before it reaches the card.** `BENCHFMT,<n>` times exactly the
-per-row work `Measure::poll()` does — four field conversions plus the row itself — with no
-serial write and no card in the loop.
+**The write path, measured end to end.** `BENCHFMT,<n>` times the per-row work `Measure::poll()`
+does @EM@ four field conversions plus the row @EM@ with no serial write and no card. `BENCHSD,<rows>`
+times what follows it: SdFat's buffered `println` plus the flush policy `SdLog::poll()` applies,
+driven exactly as `loop()` drives it. Teensy 3.5 at 120 MHz, register backends, n = 2000, a 46-byte
+row:
 
-**Measured on a Teensy 3.5 at 120 MHz, register backends, n = 2000**, the two paths side by side
-in one binary (the `%.2f` variant was a temporary bench kept only long enough to take this
-reading):
-
-| Row path | min / avg / max | Rows per second |
+| Stage | min / avg / max | Rows per second |
 |---|---|---|
-| 0.7.0: `snprintf("%.2f")` per field | 285.8 / 336.7 / 350.1 µs | ~2 970 |
-| 0.8.0: fixed point | 160.9 / 171.1 / 180.2 µs | ~5 850 |
+| `BENCHFMT`, 0.7.0: `snprintf("%.2f")` per field | 285.8 / 336.7 / 350.1 µs | 2 970 |
+| `BENCHFMT`, fixed point but still `snprintf` | 160.9 / 171.1 / 180.2 µs | 5 850 |
+| `BENCHFMT`, fixed point + hand-rolled decimals | **10.0 / 11.7 / 13.9 µs** | 85 000 |
+| `BENCHSD`, the card after it | 9.9 / 56.4 / 4 140 µs | 17 254 |
 
-**The conversion is now half the row's cost, and it is no longer the dominant half.** The Teensy
-3.5 links full newlib (`teensy35.build.flags.libs` carries no `nano.specs`), so `%f` went through
-`_dtoa_r`: double software arithmetic plus a `_Bigint` allocation, four times per row. Removing it
-saved 166 µs, about 41 µs per field. What is left is not arithmetic @EM@ the integer conversion is a
-multiply and a divide @EM@ but newlib's `vfprintf` machinery itself, entered five times per row
-(four fields and the row), at roughly 34 µs a call.
+So a log row costs about **68 µs** end to end and the card is now the dominant term, which is where
+the cost belongs. It was 393 µs in 0.7.0.
 
-So the plan's expectation that fixed point would leave "a few microseconds per field" was wrong by
-an order of magnitude, and for a reason the plan did not consider: plain integer `snprintf` is
-expensive on this libc too. **If the row rate ever needs to go further, the next step is
-hand-rolled integer-to-decimal appends in place of those five `snprintf` calls, not a binary
-format** @EM@ that would keep the output bytes identical and should reach the 10-20 µs range. It is
-not built: 5 850 rows/s already clears the MDATA ring's drain requirement by a wide margin (128
-records is 22 ms of headroom at that rate), and nothing on this bench produces rows that fast.
+**What the two steps actually bought, and what they teach.** The first step took the four `%f`
+conversions out. The Teensy 3.5 links full newlib (`teensy35.build.flags.libs` carries no
+`nano.specs`), so `%f` went through `_dtoa_r`: double software arithmetic plus a `_Bigint`
+allocation, four times per row. That saved 166 µs, about 41 µs per field. It did *not* leave "a few
+microseconds per field" as expected, because what remained was newlib's `vfprintf` machinery
+itself, entered five times per row at roughly 34 µs a call. The second step replaced those five
+calls with three integer appenders (`putU32`, `putU64`, `putCenti`) and took the row from 171 µs to
+11.7 µs. The output bytes are unchanged; `tests/host/test_measure.cpp` checks each appender against
+the `printf` conversion it replaced, exhaustively over the ranges they can see.
 
-The `MSUM` mean takes the same fixed-point path straight from the integer sums; only the spread
-still multiplies in floating point, because it comes out of a `sqrt`.
+The general lesson for this firmware: **on this libc `snprintf` costs tens of microseconds a call
+whatever the conversion**, so any per-event formatting is worth doing by hand. The `MSUM` mean takes
+the same fixed-point path from the integer sums; only the spread still multiplies in floating point,
+because it comes out of a `sqrt`.
+
+**The card's worst case is the number that matters.** 4.1 ms for a single row, against 56 µs
+average: that is the card's internal housekeeping during a flush, and it is what empties the MDATA
+ring rather than the average. 128 records is 64 ms of headroom at 2 000 rows/s, so a single stall of
+this size costs nothing; a hundred-millisecond stall on a cheap card would.
+
+**Floating point: where it is, and why none of it is worth changing.** The Cortex-M4F on a Teensy
+3.5 has a *single*-precision FPU, so `float` is hardware and `double` is a software library. A
+disassembly audit of the linked image (which functions call `__aeabi_d*`, `_dtoa_r`, `sqrt`) says:
+
+- **nothing in the row path, the player ISRs, the arm, or `Measure::fire` touches floating point at
+  all.** The waveform and logging paths are integer end to end, so there is nothing for single
+  precision to speed up.
+- What remains is `Measure::accumStats`, `printSummary`, `resultSnapshot`, `noteOffsets`,
+  `SampleGen::sineDerive` and the human `printf`s in `Commands`. Every one of them runs once per
+  train, per command or per slot definition @EM@ never per row, per sample or per latch.
+- `accumStats` **must** stay double. Its variance is `sumsq - sum*sum/n`; at 500 repetitions
+  `sum*sum` is around 1.7e13, and a 24-bit float mantissa carries an absolute error near 1e6 on a
+  difference that can itself be 1e4. That is catastrophic cancellation, and it is exactly the
+  "losing important digits" case. The means and spreads it feeds are also close to float's ~7
+  significant digits, which a `%.2f` of a five-digit millivolt value would expose.
+
+So the answer is that single precision has nothing to gain here and something to lose. The speedup
+available in this firmware is integer formatting, and it has now been taken.
 
 **The clock hierarchy, and the one rule that keeps it working.** Three clocks, three jobs:
 

@@ -85,6 +85,14 @@ static void fmtUptime(char* out, size_t n, uint32_t sec) {
                                  (unsigned long)((sec / 3600) % 24));
 }
 
+// Sample count for a title bar, compact enough that a five-digit n cannot push
+// the page indicator off a 21-column row: below 10000 as it is, above that
+// rounded to thousands. `MSUM` carries the exact figure.
+static void fmtCount(char* out, size_t n, uint32_t v) {
+  if (v < 10000) snprintf(out, n, "%lu", (unsigned long)v);
+  else           snprintf(out, n, "%luk", (unsigned long)(v / 1000));
+}
+
 // Output mode as one character: the original 0-3 numbering (protocol §2).
 static char modeChar(uint8_t m) {
   static const char c[4] = {'V', 'I', '-', 'G'};
@@ -223,14 +231,18 @@ static void composeResult(uint8_t k) {
   const Measure::ResultChan& c0 = result.ch[k][0];
   const Measure::ResultChan& c1 = result.ch[k][1];
 
-  // Title bar: which train, which engine, how many repetitions are behind the
-  // numbers, which measurement point, and where this page sits in the set. A
-  // sine train's points are peaks, so they are labelled in degrees.
-  char lbl[8];
-  if (result.type == SINE) snprintf(lbl, sizeof lbl, "%ud", (unsigned)result.label[k]);
+  // Title bar: which run (`#n`, the number the completion line prints), which
+  // engine and *which slot* -- `T03` reads the same way the STATUS header's
+  // engine tags do, and without it the page says what was measured but not what
+  // was played. Then the repetitions behind the numbers, the measurement point,
+  // and where this page sits in the set. A sine train's points are peaks, so
+  // they are labelled in degrees rather than as a stage index.
+  char lbl[8], cnt[12];   // "4294967k" plus room the compiler can prove
+  if (result.type == SINE) snprintf(lbl, sizeof lbl, "%u", (unsigned)result.label[k]);
   else                     snprintf(lbl, sizeof lbl, "s%u", (unsigned)result.label[k]);
-  setRow(0, "#%lu %c n=%lu %s %u/%u", (unsigned long)result.trainNo,
-         result.eng ? 'U' : 'T', (unsigned long)result.nMax, lbl,
+  fmtCount(cnt, sizeof cnt, result.nMax);
+  setRow(0, "#%lu %c%02u n=%s %s %u/%u", (unsigned long)result.trainNo,
+         result.eng ? 'U' : 'T', (unsigned)result.slot, cnt, lbl,
          (unsigned)(k + 1), (unsigned)resultPages());
 
   char a[SJ_UI_FIELD_MAX], b[SJ_UI_FIELD_MAX];
@@ -464,7 +476,7 @@ void tick() {
 #endif
 }
 
-void dumpScreen() {
+void dumpScreen(bool withPixels) {
 #if SJ_USE_DISPLAY
   if (!framebufferOk) { Serial.println("ERR SCREEN: no framebuffer"); return; }
   // An explicit, human-initiated command, so one 20 ms bus timeout is
@@ -483,6 +495,10 @@ void dumpScreen() {
     Serial.printf("# row%u: \"%s\"%s\n", r, rowText[r],
                   (r == 2 && barPct >= 0) ? "  (replaced by the progress bar)" : "");
   if (barPct >= 0) Serial.printf("# bar: %d%%\n", barPct);
+  // The pixel block is 32 lines of 130 characters -- about 4 KB over a link
+  // where the composed text above is 150 bytes and answers most questions. It
+  // is what a layout regression needs and nothing else does, so it is opt-in.
+  if (!withPixels) { Serial.println("OK"); return; }
   for (int y = 0; y < SJ_OLED_HEIGHT; y++) {
     char line[SJ_OLED_WIDTH + 3];
     line[0] = '|';
@@ -496,6 +512,7 @@ void dumpScreen() {
   }
   Serial.println("OK");
 #else
+  (void)withPixels;
   Serial.println("ERR SCREEN: display disabled at build time (SJ_USE_DISPLAY)");
 #endif
 }

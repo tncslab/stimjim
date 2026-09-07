@@ -33,6 +33,47 @@ bool accumStats(const Accum& a, double& mean, double& sd) {
   return true;
 }
 
+// ------------------------------------------------- decimal text without printf
+//
+// `BENCHFMT` measured one formatted row at 171 us and `BENCHSD` measured the
+// card write that follows it at 56 us, so what bounds the log's row rate is not
+// the card and not the arithmetic: it is newlib's `vfprintf`, entered five
+// times per row (four fields and the row) at roughly 34 us a call. These
+// appenders replace all five. Each writes at `p` and returns the new end, so a
+// row is assembled by chaining them; none of them terminates the string, and
+// the caller sizes the buffer (a row is at most 8 fields of 12 characters).
+//
+// They are exact by construction and byte-identical to the `%lu` / `%s%lu.%02lu`
+// they replace, which tests/host/test_measure.cpp checks exhaustively.
+
+char* putU32(char* p, uint32_t v) {
+  char tmp[10];
+  uint8_t n = 0;
+  do { tmp[n++] = (char)('0' + (v % 10u)); v /= 10u; } while (v);
+  while (n) *p++ = tmp[--n];
+  return p;
+}
+
+char* putU64(char* p, uint64_t v) {
+  char tmp[20];
+  uint8_t n = 0;
+  do { tmp[n++] = (char)('0' + (uint32_t)(v % 10u)); v /= 10u; } while (v);
+  while (n) *p++ = tmp[--n];
+  return p;
+}
+
+char* putCenti(char* p, int32_t centi, bool neg) {
+  // `neg` is the sign of the value *before* rounding, so a small negative
+  // reading still prints as -0.00 the way the `%.2f` this replaced did.
+  if (neg || centi < 0) *p++ = '-';
+  const uint32_t a = (centi < 0) ? (uint32_t)(-(int64_t)centi) : (uint32_t)centi;
+  p = putU32(p, a / 100u);
+  *p++ = '.';
+  *p++ = (char)('0' + (a / 10u) % 10u);
+  *p++ = (char)('0' + a % 10u);
+  return p;
+}
+
 // ADC window `nr` reads need: the conversions themselves plus the margin
 // before the next latch starts programming the DAC.
 static inline uint32_t windowCyc(uint8_t nr, const Geometry& g) {
@@ -514,22 +555,13 @@ static inline int32_t q16RoundDiv(int64_t v) {
   return (int32_t)((v >= 0) ? ((v + 32768) / 65536) : -((-v + 32768) / 65536));
 }
 
-// Hundredths as text. `neg` carries the sign of the *unrounded* value, so a
-// small negative reading still prints as -0.00 the way the `%.2f` it replaces
-// did.
-static inline void putCenti(char* b, size_t n, int32_t centi, bool neg) {
-  const uint32_t a = (centi < 0) ? (uint32_t)(-(int64_t)centi) : (uint32_t)centi;
-  snprintf(b, n, "%s%lu.%02lu", (neg || centi < 0) ? "-" : "",
-           (unsigned long)(a / 100u), (unsigned long)(a % 100u));
-}
-
 // One numeric field of an MDATA record: a single raw code, offset-corrected and
-// scaled. Empty where the line was not read.
-static inline void fieldRaw(char* b, size_t n, bool have, int16_t raw,
-                            uint8_t ch, uint8_t line) {
-  if (!have) { b[0] = '\0'; return; }
+// scaled. Writes at `p`, returns the new end; an unread line contributes
+// nothing, which is the empty field the format calls for.
+static inline char* fieldRaw(char* p, bool have, int16_t raw, uint8_t ch, uint8_t line) {
+  if (!have) return p;
   const int64_t v = (((int64_t)raw << 16) - adcOffsetQ16[ch]) * centiScale(line);
-  putCenti(b, n, q16RoundDiv(v), v < 0);
+  return putCenti(p, q16RoundDiv(v), v < 0);
 }
 
 // The mean field of an MSUM line, straight from the integer sums: the Q16
@@ -538,18 +570,20 @@ static inline void fieldRaw(char* b, size_t n, bool have, int16_t raw,
 // exact where the double quotient was not.
 static inline void fieldMean(char* b, size_t n, bool have, const Accum& a,
                              uint8_t ch, uint8_t line) {
+  (void)n;
   if (!have) { b[0] = '\0'; return; }
   const int64_t q = ((int64_t)a.sum << 16) / (int64_t)a.n;
   const int64_t v = (q - adcOffsetQ16[ch]) * centiScale(line);
-  putCenti(b, n, q16RoundDiv(v), v < 0);
+  *putCenti(b, q16RoundDiv(v), v < 0) = '\0';
 }
 
 // The spread field. A standard deviation comes out of a sqrt, so this is the one
 // field that still multiplies in floating point — but it no longer prints
 // through `_dtoa_r`, and a spread is never negative.
 static inline void fieldSpread(char* b, size_t n, bool have, double sdRaw, uint8_t line) {
+  (void)n;
   if (!have) { b[0] = '\0'; return; }
-  putCenti(b, n, (int32_t)llround(sdRaw * (double)centiScale(line)), false);
+  *putCenti(b, (int32_t)llround(sdRaw * (double)centiScale(line)), false) = '\0';
 }
 
 // Runs once per armed plan, before the ring is drained in the same poll() call
@@ -590,20 +624,19 @@ static void printNote(uint8_t eng) {
                   "channel has a different frequency or phase\n", p.slot, p.peakChannel);
 }
 
-// The four physical fields of one record, in the order the row prints them.
-static void recFields(const Rec& r, char f[4][16]) {
+// Everything an MDATA line and a log row have in common, appended at `p`:
+// slot, pulse, point and the four values. The two forms differ only in what
+// precedes this — `MDATA,` or the timestamp — so it is built once per record.
+static char* recTail(char* p, const Rec& r) {
+  p = putU32(p, r.slot);       *p++ = ',';
+  p = putU32(p, r.pulse);      *p++ = ',';
+  p = putU32(p, r.label);
   for (uint8_t ch = 0; ch < 2; ch++)
-    for (uint8_t ln = 0; ln < 2; ln++)
-      fieldRaw(f[ch * 2 + ln], 16, (r.valid >> (ch * 2 + ln)) & 1, r.raw[ch][ln], ch, ln);
-}
-
-// The CSV row itself. Microseconds since boot outgrow 32 bits after 71 minutes,
-// so the timestamp is rendered by hand rather than trusting printf's %llu.
-static void recRow(char* row, size_t n, const Rec& r, char f[4][16]) {
-  char ts[24];
-  Protocol::u64str(SJ_CYC_TO_US(r.tCyc), ts);
-  snprintf(row, n, "%s,%u,%lu,%u,%s,%s,%s,%s",
-           ts, r.slot, (unsigned long)r.pulse, r.label, f[0], f[1], f[2], f[3]);
+    for (uint8_t ln = 0; ln < 2; ln++) {
+      *p++ = ',';
+      p = fieldRaw(p, (r.valid >> (ch * 2 + ln)) & 1, r.raw[ch][ln], ch, ln);
+    }
+  return p;
 }
 
 void poll() {
@@ -612,14 +645,23 @@ void poll() {
 
   while (rTail != rHead) {
     const Rec& r = ring[rTail];
-    char f[4][16];
-    recFields(r, f);
-    if (r.report & 1)
-      Serial.printf("MDATA,%u,%lu,%u,%s,%s,%s,%s\n", r.slot, (unsigned long)r.pulse,
-                    r.label, f[0], f[1], f[2], f[3]);
+    // One buffer, built once: the streamed line and the logged row share
+    // everything after their first field.
+    char tail[128];
+    const size_t tlen = (size_t)(recTail(tail, r) - tail);
+    if (r.report & 1) {
+      Serial.write("MDATA,", 6);
+      Serial.write((const uint8_t*)tail, tlen);
+      Serial.write('\n');
+    }
     if (r.report & 2) {
-      char row[144];
-      recRow(row, sizeof row, r, f);
+      // Microseconds since boot outgrow 32 bits after 71 minutes, so the
+      // timestamp is rendered by hand rather than trusting printf's %llu.
+      char row[160];
+      char* q = putU64(row, SJ_CYC_TO_US(r.tCyc));
+      *q++ = ',';
+      memcpy(q, tail, tlen);
+      q[tlen] = '\0';
       SdLog::writeRow(row);
     }
     rTail = (uint16_t)((rTail + 1) & (SJ_MDATA_RING - 1));
@@ -647,10 +689,12 @@ uint16_t benchFormatRow(char* row, size_t n, uint32_t i) {
   for (uint8_t ch = 0; ch < 2; ch++)
     for (uint8_t ln = 0; ln < 2; ln++)
       r.raw[ch][ln] = (int16_t)((int32_t)((i * 37u + ch * 11u + ln * 5u) % 8191u) - 4096);
-  char f[4][16];
-  recFields(r, f);
-  recRow(row, n, r, f);
-  return (uint16_t)strlen(row);
+  (void)n;
+  char* q = putU64(row, SJ_CYC_TO_US(r.tCyc));
+  *q++ = ',';
+  q = recTail(q, r);
+  *q = '\0';
+  return (uint16_t)(q - row);
 }
 
 void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out) {
