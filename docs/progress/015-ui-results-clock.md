@@ -15,10 +15,10 @@ than changing its CSV columns. Finally the per-row number formatting moved from
 sustainable row rate, and `BENCHFMT` was added to measure what is left. Firmware version is now
 0.8.0; the EEPROM image stays at v6 because nothing new needs persisting.
 
-Everything below was verified by compiling all four target configurations and running five host
-suites. **Nothing in this phase has run on silicon** — no board was attached to the machine it was
-written on — so every claim about behaviour on hardware is a code claim, and the two placeholder
-figures say so.
+Everything below was verified on a Teensy 3.5 at 120 MHz with a panel, a card and a VBAT battery
+fitted, as well as by compiling all four target configurations and running five host suites. The
+one thing that could not be tested from here is the buttons themselves, because pressing them
+needs a hand on the bench.
 
 
 ## 1. What was built, and why each choice
@@ -315,10 +315,30 @@ every calibration offset the library can produce (a multiple of 0.01, from a 100
 That is documented in the protocol reference under `LOG`, because it is a change a host comparing
 old and new log files could otherwise be puzzled by.
 
-`BENCHFMT[,n]` was added to time exactly this: `Measure::benchFormatRow()` builds a synthetic
-record whose codes sweep the range (so nothing is hoisted out of the loop), converts its four
-fields and formats the row, with no serial write and no card. **It has not been run on silicon**,
-so `docs/timing.md` §6 carries a placeholder that says so rather than a number.
+`BENCHFMT[,n]` times exactly this: `Measure::benchFormatRow()` builds a synthetic record whose
+codes sweep the range (so nothing is hoisted out of the loop), converts its four fields and formats
+the row, with no serial write and no card.
+
+**Measured, n = 2000, both paths in one binary** (the `%.2f` variant was a temporary second bench
+kept only long enough to take the reading, then deleted):
+
+| Row path | min / avg / max | Rows per second |
+|---|---|---|
+| 0.7.0, `snprintf("%.2f")` per field | 285.8 / 336.7 / 350.1 us | ~2 970 |
+| 0.8.0, fixed point | 160.9 / 171.1 / 180.2 us | ~5 850 |
+
+So the change is worth 1.97x, and the plan's estimate for the *old* path — "tens of microseconds
+per conversion, so 100-300 us per row, a ceiling of a few thousand rows per second" — was right.
+
+**Its estimate for the new path was wrong by an order of magnitude, and the reason is worth
+recording.** The plan expected fixed point to leave "a few microseconds per field". It leaves 171
+us per row, because what remains is not arithmetic but newlib's `vfprintf` machinery itself,
+entered five times per row (four fields and the row) at roughly 34 us a call. Removing `_dtoa_r`
+saved 166 us, about 41 us per field; plain integer `snprintf` costs the rest. If the row rate ever
+needs to go further, the next step is hand-rolled integer-to-decimal appends in place of those five
+`snprintf` calls — still ASCII, still byte-identical, plausibly 10-20 us — and *not* the binary
+format the plan's step 3 sketched. It is not built, because 5 850 rows/s already clears the MDATA
+ring's drain requirement by a wide margin and nothing on this bench produces rows that fast.
 
 
 ## 2. Files
@@ -342,52 +362,102 @@ No EEPROM change: nothing new needs persisting, so the image version stays at v6
 
 ## 3. Verification
 
+**On a Teensy 3.5 at 120 MHz, register backends, panel + card + VBAT battery fitted.**
+
+- `tests/device/smoke.py COM4 --screens tmp/screens`: **all checks pass**, including the new page
+  walk, `CLK` before and after a host set, and a RESULT page checked against the `MSUM` line it was
+  built from (panel `4494` mV against `MSUM` `4493.58`).
+- Two bugs the run found, both in the test harness rather than the firmware, both fixed:
+  - `sjcon.cmd1()` could not cope with a setter answering "accepted, with a caveat" — one `WARN`
+    line and then the canonical echo. Phase 14 added exactly such a warning for a short latch gap
+    and was never run on silicon, so this had been broken since then. `cmd1` now sets the warning
+    aside like a comment, unless the `WARN` is the only line, which several checks assert on.
+  - the page checks assumed a fresh boot. The suite has to be re-runnable, so it now selects page 0
+    and the last page rather than asserting what the previous run left behind.
+- One cosmetic firmware fix the render showed: `SYSTEM Teensy3.5 0.8.0` clipped its last digit at
+  21 columns. The board name moved to row 1, next to the code placement and the uptime.
+- **The limit markers, on hardware.** A slot driving 12 000 mV into the bench load measured
+  `MSUM,9,5,0,9386.39,...` and the panel rendered
+
+  ```
+  #1 T n=5 s0 1/1
+  V     9386*     -- mV
+  I     2645      -- uA
+  R    3.55k*     --
+  ```
+
+  — the voltage past its 9 V threshold marked, the current at 2 645 uA below its 3 mA threshold
+  not marked, the marker carried through to the resistance derived from the flagged reading, and
+  the undriven channel `--` on all three rows.
+- **The log anchors, on the card.** A file with two trains gave one `# clock:` at open and one
+  before each `# train:` block. The arithmetic ties out: the anchor `us=78020018` at
+  `10:52:34.236Z` and the first data row at `78022020` us, 2.0 ms later.
+- **`BENCHFMT`**: 160.9 / 171.1 / 180.2 us per row, against 285.8 / 336.7 / 350.1 us for the
+  `%.2f` path measured beside it. See §1.5 and `docs/timing.md` §6.
+- **The clock source heuristic behaves as designed on a battery-backed board.** After an upload it
+  reports `batt`, not `build` — correct, and it is what the documentation predicts: the core only
+  re-sets the RTC from `__rtc_localtime` when its VBAT "known-stale" flag is still set, and a
+  battery-backed board cleared that flag at the first upload after the cell went in. So later
+  uploads leave the clock alone and the reading stays far from the compile time. **The `build`
+  branch has therefore not been exercised on silicon** — that needs a board with the cell removed.
+- **`arduino-cli` was found**, bundled with Arduino IDE 2.3.10 at
+  `resources/app/lib/backend/resources/arduino-cli.exe` (CLI 1.5.1), so all four configurations
+  were really built and linked this time:
+
+  | Configuration | Flash | RAM |
+  |---|---|---|
+  | Teensy 3.5, register | 180 588 B | 53 532 B |
+  | Teensy 3.5, portable | 181 696 B | 53 788 B |
+  | Teensy 4.1 | code 153 612 B | RAM1 variables 71 648 B |
+  | Teensy 4.0, `SJ_EEPROM_SLOTS=6` | code 109 284 B | RAM1 variables 66 432 B |
+
+- **A build-system bug in earlier phases, found while doing this.** The Teensy platform's
+  `recipe.cpp.o.pattern` never references `{compiler.cpp.extra_flags}` (`platform.txt:47`), so the
+  `--build-property compiler.cpp.extra_flags=-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0` recorded
+  in `tmp/a3-portable/build.options.json` was accepted and silently dropped. **Every "Teensy 3.5
+  portable" build this project has reported was in fact a register build.** The property that works
+  is `build.flags.defs`, which replaces the board's own value and so must repeat it; the Teensy 4.0
+  build always used it and was therefore genuine. The four working command lines are now in
+  `tests/device/README.md`, with a one-line way to check that a define arrived.
 - **Host suites, all five clean at `-Wall -Wextra` and passing:** `test_cal`, `test_samplegen`,
-  `test_trainstore`, `test_measure`, and the new `test_uifmt` — the ohm/kilohm/megohm selection
-  and the decimal rule across the range, the 1 % floor from both sides, `open`, `--`, the short
-  case, `int64` headroom at +-15 V and +-3.33 mA, the limit markers, the field widths, and the
+  `test_trainstore`, `test_measure`, and the new `test_uifmt` — the ohm/kilohm/megohm selection and
+  the decimal rule across the range, the 1 % floor from both sides, `open`, `--`, the short case,
+  `int64` headroom at +-15 V and +-3.33 mA, the limit markers, the field widths, and the
   ISO 8601 / civil-date conversion including leap days and the `uint32` ceiling.
-- **All four target configurations compile clean at `-Wall -Wextra`:** Teensy 3.5 register,
-  Teensy 3.5 portable (`-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0`), Teensy 4.1, Teensy 4.0
-  with `-DSJ_EEPROM_SLOTS=6`.
-- **A caveat about how those builds were checked.** `arduino-cli` is not installed on the machine
-  this phase was written on, so the four builds were run as per-translation-unit
-  `arm-none-eabi-g++ -fsyntax-only` with the same compiler, flags, defines and include set the
-  IDE uses (taken from the `compile_commands.json` of the previous phase's build directories).
-  That catches everything except the link step, so **flash and RAM figures are not reported this
-  phase and link errors would not have been caught.** Re-run the real four builds before flashing.
 - **The fixed-point conversion was compared against `%.2f`** over 13.1 million conversions on the
   host — the whole code range crossed with 801 offsets — which is where the numbers in §1.5 come
   from.
-- **Not run on silicon.** No board was attached. `BENCHFMT` has never executed, the panel probe
-  has never met a real missing panel, no button has been pressed, and the RTC classification has
-  never seen a real VBAT flag.
-
+- **Not tested: the buttons.** Nothing here can press one. The firmware path they share with the
+  serial commands (`Triggers::fireRoute`, the page advance) is exercised, but the ISR, the
+  arm/re-arm debounce and the no-route warning are not.
 
 ## 4. Next entry point
 
-In order, on a board:
+**The buttons.** They are the one thing this phase built that has never been exercised. On the
+bench: Btn0 should walk the pages and wrap; Btn1 and Btn2 should start whatever `TRIG0`/`TRIG1`
+route, exactly once per press, and print `WARN button: input <t> has no train routed` when nothing
+is. Hold one for a second and release it — one train, not two. That last check is the whole point
+of the arm/re-arm debounce and the only way to confirm it.
 
-1. `python tests/device/smoke.py COM4 --screens tmp/screens` with everything attached, then again
-   **with the panel unplugged and the card removed** — that second run is the headless regression,
-   and the suite is written to pass it (the SD section skips itself with a note, `SCREEN` composes
-   the framebuffer either way).
-2. Press each button. Btn0 should walk the pages and wrap; Btn1 and Btn2 should start whatever
-   `TRIG0`/`TRIG1` route, once per press, and warn when nothing is routed. Hold one for a second
-   and release it: exactly one train.
-3. `BENCHFMT,2000` and put the figure into `docs/timing.md` §6, replacing the placeholder. If a
-   0.7.0 binary is still around, the comparison is worth one line.
-4. `CLK?` before and after `CLK,<host unix>` on a board with and without a VBAT battery, to see
-   whether the `build`/`batt` heuristic actually separates them. This is the part of the phase
-   most likely to be wrong on hardware.
-5. Read a log file back with `SDGET` and check that the `# clock:` anchors are where they should
-   be — at open, before each train, and about once a minute during a long measured train.
+**The `build` clock branch.** On this board the source classifies as `batt`, correctly, and the
+`build` path is therefore untested. Pulling the VBAT cell and power-cycling should give `build`; so
+should a Teensy 4.x, which has no cell at all.
 
-Still outstanding from earlier phases and untouched here: **measure the prepared arm and lower
-`CAL STARTLAT`** (phase 14's next-entry-point; `SJ_START_LATENCY_US` is still 35 and
-`bench_arm.py` has not been re-run on silicon).
+Still outstanding from earlier phases and untouched here:
 
-Two thresholds in this phase are working figures rather than measurements and are named so they
-can be replaced without touching logic: `SJ_UI_REL_FLOOR_PPM` (1 %, standing in for the ADC path's
-gain accuracy) and `SJ_UI_VLIMIT_UV` (9 V, standing in for the output driver's saturation point).
-Either one measured on the bench is a one-line change.
+- **Measure the prepared arm and lower `CAL STARTLAT`** — phase 14's next entry point.
+  `SJ_START_LATENCY_US` is still 35, the board's stored budget is 60, and `bench_arm.py` has not
+  been re-run on silicon.
+- **Re-check anything that was ever A/B'd against a "portable" build**, because §3 shows those
+  builds were register builds. The portable backend's `CAL` defaults in `Config.h` are marked
+  RECALIBRATE and were never measured anyway, so nothing published is wrong — but the portable path
+  has now compiled and linked for the first time, and has still never run.
+
+Two thresholds in this phase are working figures rather than measurements, named so they can be
+replaced without touching logic: `SJ_UI_REL_FLOOR_PPM` (1 %, standing in for the ADC path's gain
+accuracy) and `SJ_UI_VLIMIT_UV` (9 V, standing in for the output driver's saturation point). Either
+one measured on the bench is a one-line change.
+
+**If the log row rate ever matters**, §1.5 says what to do and what not to: replace the five
+`snprintf` calls with hand-rolled integer-to-decimal appends, keeping the bytes identical, rather
+than adopting a binary format.

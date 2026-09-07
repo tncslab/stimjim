@@ -77,6 +77,15 @@ class StimJim:
         keep = [x for x in r if not x.startswith(self.ASYNC) and not x.startswith("#")]
         self.async_lines = [x for x in r if x.startswith(self.ASYNC)]
         self.comments = [x for x in r if x.startswith("#")]
+        # A setter may answer "accepted, with a caveat": one WARN line and then
+        # the canonical echo. The echo is the record; the caveat goes beside the
+        # comments. A WARN that arrives *alone* is still the record, because
+        # several checks assert on exactly that.
+        if len(keep) > 1 and any(x.startswith("WARN ") for x in keep):
+            self.warnings = [x for x in keep if x.startswith("WARN ")]
+            keep = [x for x in keep if not x.startswith("WARN ")]
+        else:
+            self.warnings = []
         assert len(keep) == 1, f"{line!r} -> expected 1 record line, got {r}"
         return keep[0]
 

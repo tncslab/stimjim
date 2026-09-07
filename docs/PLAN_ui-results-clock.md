@@ -16,7 +16,7 @@ no waveform can see them, so they bound the sustainable row rate and nothing els
 on the row format: keep ASCII, replace the `%f` conversions with integer fixed-point, and measure
 the result with a new `BENCHFMT` bench rather than estimating it.
 
-Status: done, 2026-09-05 — implemented in phase 015 (docs/progress/015-ui-results-clock.md),
+Status: done, 2026-09-07 — implemented in phase 015 (docs/progress/015-ui-results-clock.md),
 with one addition the plan did not carry: the limit markers of section 3.3's follow-up note, in the
 narrower form of a `*` on a reading at the driver's 9 V ceiling or the current pump's 3 mA design
 limit. The Pulser's compliance markers, which compare against the *requested* amplitude, are still

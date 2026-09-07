@@ -258,11 +258,13 @@ static void composeResult(uint8_t k) {
 }
 
 static void composeSystem() {
-  setRow(0, "SYSTEM %s %s", SJ_HW_NAME, SJ_FW_VERSION);
+  // The board name shares row 1 with the code placement and the uptime: all
+  // three in the title bar clipped the version's last digit at 21 columns.
+  setRow(0, "SYSTEM  fw %s", SJ_FW_VERSION);
 
   char up[12];
   fmtUptime(up, sizeof up, (uint32_t)(SJ_CYC_TO_US(FastIO::cycles64()) / 1000000u));
-  setRow(1, "%s code  up %s", SJ_HOT_NAME, up);
+  setRow(1, "%s %s up %s", SJ_HW_NAME, SJ_HOT_NAME, up);
 
 #if SJ_USE_SD
   const char* card = SdLog::cardPresent() ? "yes" : "no";

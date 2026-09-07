@@ -250,10 +250,16 @@ def main():
            "S8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500", "S keeps 0-duration steps")
 
         print("\n[screens: status page, and the page walk]")
-        idx, count, name = page(sj)
-        eq(idx, 0, "boot page is 0")
-        eq(name, "STATUS", "page 0 is STATUS")
-        eq(count, 2, "with no train finished there are two pages: STATUS and SYSTEM")
+        # Page 0 is always STATUS and the last page is always SYSTEM; how many
+        # sit between them depends on what the last train measured, which on a
+        # re-run is whatever the previous run left behind. So the suite selects
+        # rather than assuming, and checks the two ends of the list.
+        _, count, name = page(sj)
+        check(count >= 2, f"at least STATUS and SYSTEM exist: {count}")
+        f = sj.cmd1("PAGE,0", quiet=0.3).split(",")
+        eq(f[3], "STATUS", "page 0 is STATUS")
+        idx = int(f[1])
+        eq(idx, 0, "PAGE,0 selects page 0")
         first = screen(sj, "1-status", a.screens) or []
         # SCREEN works with or without a panel -- the framebuffer is composed
         # either way -- so the suite runs headless. Which of the two this is
@@ -263,9 +269,10 @@ def main():
         if pline and "panel absent" in pline[0]:
             notes.append("no OLED panel connected: SCREEN rendered the framebuffer only")
         # Advancing wraps, and every page has to render.
-        eq(page_next(sj)[2], "SYSTEM", "PAGE advances to SYSTEM")
+        eq(sj.cmd1(f"PAGE,{count - 1}", quiet=0.3).split(",")[3], "SYSTEM",
+           "the last page is SYSTEM")
         screen(sj, "2-system", a.screens)
-        eq(page_next(sj)[0], 0, "PAGE wraps back to the first page")
+        eq(page_next(sj)[0], 0, "PAGE wraps from the last page back to 0")
         check(sj.cmd1(f"PAGE,{count}").startswith("ERR"), "PAGE past the end is refused")
         eq(page(sj)[0], 0, "a refused PAGE leaves the page alone")
 
@@ -489,6 +496,7 @@ def main():
         # would describe a board the running waveform is not using.
         check(sj.cmd1("CAL,SETTLE,5").startswith("ERR"), "CAL refused while a train runs")
         check(sj.cmd1("CALDEF").startswith("ERR"), "CALDEF refused while a train runs")
+        sj.cmd1("PAGE,0", quiet=0.3)   # a running train lives on STATUS; the page is sticky
         screen(sj, "2-waiting", a.screens)
         while stat(sj)["el0"] == 0 and stat(sj)["n0"] == 0:
             pass                                         # wait out the delay

@@ -131,10 +131,39 @@ The Arduino IDE keeps no `arduino-cli.yaml`, so a bare `arduino-cli` invocation 
 Teensy board index and reports "Platform 'teensy:avr' not found". `tmp/arduino-cli.yaml` (created
 on demand, not tracked) supplies the index URL and the IDE's data/user directories:
 
+The Arduino IDE bundles `arduino-cli` and does not put it on `PATH`; on this machine it is at
+`C:\Users\stipp\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`
+(IDE 2.3.10 ships CLI 1.5.1).
+
 ```
 arduino-cli --config-file tmp/arduino-cli.yaml compile --fqbn teensy:avr:teensy35 --warnings more stimjimAWG
 arduino-cli --config-file tmp/arduino-cli.yaml upload  --fqbn teensy:avr:teensy35 -p COM4 stimjimAWG
 ```
+
+**Passing extra defines: use `build.flags.defs`, not `compiler.cpp.extra_flags`.** The Teensy
+platform's `recipe.cpp.o.pattern` never references `{compiler.cpp.extra_flags}`
+(`platform.txt:47`), so `--build-property compiler.cpp.extra_flags=...` is accepted and then
+silently dropped — a build meant to be portable-backend comes out identical to the register one.
+`build.flags.defs` is in the recipe, so it works, but it *replaces* the board's own value, which
+must therefore be repeated. The four configurations are:
+
+```
+# 1. Teensy 3.5, register backends (the default)
+compile --fqbn teensy:avr:teensy35
+
+# 2. Teensy 3.5, portable backends
+compile --fqbn teensy:avr:teensy35 --build-property \
+  "build.flags.defs=-D__MK64FX512__ -DTEENSYDUINO=160 -DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0"
+
+# 3. Teensy 4.1
+compile --fqbn teensy:avr:teensy41
+
+# 4. Teensy 4.0 (no SD socket, smaller EEPROM)
+compile --fqbn teensy:avr:teensy40 --build-property \
+  "build.flags.defs=-D__IMXRT1062__ -DTEENSYDUINO=160 -DSJ_EEPROM_SLOTS=6"
+```
+
+Check that a define actually arrived: `grep SJ_FASTIO <build-path>/compile_commands.json`.
 
 Build with `-DSJ_BOOT_TRACE` to make `setup()` wait for a serial host and announce each init
 step; that is how a hang in initialization gets pinned down in one flash cycle.
