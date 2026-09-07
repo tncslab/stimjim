@@ -559,6 +559,46 @@ void poll() {
   }
 }
 
+void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out) {
+  // Same buffer choice as printSummary, but nothing is consumed: the engine may
+  // already have been re-armed onto the other buffer, and the finished train's
+  // one stays frozen until printSummary releases it.
+  const uint8_t idx = summaryPending[eng] ? summaryIdx[eng] : live[eng];
+  const Plan& p = plan_[eng][idx];
+  out.valid   = false;
+  out.eng     = eng;
+  out.slot    = slot;
+  out.trainNo = trainNo;
+  out.nPoints = 0;
+  out.nMax    = 0;
+  if (!p.on || p.slot != slot) return;
+  out.type    = p.type;
+  out.nPoints = p.nPoints;
+  for (uint8_t i = 0; i < p.nPoints; i++) {
+    out.label[i] = p.label[i];
+    for (uint8_t ch = 0; ch < 2; ch++) {
+      ResultChan& r = out.ch[i][ch];
+      memset(&r, 0, sizeof r);
+      for (uint8_t ln = 0; ln < 2; ln++) {
+        const Accum& a = p.acc[i][ch][ln];
+        double meanRaw, sdRaw;
+        if (!accumStats(a, meanRaw, sdRaw)) continue;
+        // The calibrated path `MSUM` uses, then x1000 into the panel's unit:
+        // millivolts become microvolts, microamps become nanoamps. The standard
+        // error is sd/sqrt(n); the offset cancels in the spread, so only the
+        // scale applies to it.
+        const double mean = toPhysD(meanRaw, ch, ln) * 1000.0;
+        const double se   = (a.n >= 2)
+                          ? sdPhys(sdRaw, ln) * 1000.0 / sqrt((double)a.n) : 0.0;
+        if (ln == 0) { r.nV = a.n; r.uV = (int32_t)llround(mean); r.seUV = (uint32_t)llround(se); }
+        else         { r.nI = a.n; r.nA = (int32_t)llround(mean); r.seNA = (uint32_t)llround(se); }
+        if (a.n > out.nMax) out.nMax = a.n;
+      }
+    }
+  }
+  out.valid = (p.nPoints != 0);
+}
+
 bool printSummary(uint8_t eng, uint8_t slot) {
   // The finished train's buffer, not the live one: the engine may already have
   // been re-armed onto the other buffer, and with two of them that no longer

@@ -22,7 +22,10 @@
 //    from is runtime state (`CAL`), so calibrating one bench costs a serial line
 //    rather than a rebuild.
 //
-//    Not implemented: the button menu editor.
+//    Three front-panel buttons: one walks the display pages (status, the last
+//    train's per-point results with the load resistance, system and clock), the
+//    other two fire the two trigger inputs' routes. There is no button slot
+//    editor and none is planned -- a slot is defined over the serial port.
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -37,6 +40,7 @@
 
 #include "Config.h"
 #include "Cal.h"
+#include "Clock.h"
 #include "FastIO.h"
 #include "Engine.h"
 #include "Protocol.h"
@@ -81,6 +85,11 @@ void setup() {
   // Must come after Stimjim.begin() — the SPI library clobbers the CTARs.
   SJ_TRACE("-> FastIO::begin");
   FastIO::begin();
+
+  // Needs CYCCNT running (Clock::anchor pairs the RTC with the timebase), so it
+  // comes after FastIO and before anything that writes a log anchor.
+  SJ_TRACE("-> Clock::begin");
+  Clock::begin();
 
   SJ_TRACE("-> Engine::begin");
   Engine::begin();           // reserve 2 PIT channels + K_RELOAD self-calibration
@@ -127,6 +136,7 @@ void loop() {
   Triggers::poll();          // deferred trigger-reject WARNs (ISRs never print)
   Measure::poll();           // MDATA ring drain: streaming and SD rows
   Engine::prepareArms();     // prepare the next arm's player and plan, off the latency path
-  SdLog::poll();             // periodic log flush
+  SdLog::poll();             // periodic log flush + wall-clock anchor lines
+  UiInput::poll();           // re-arm buttons whose contact has settled
   UiMenu::tick();            // event drain + throttled render
 }

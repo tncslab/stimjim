@@ -24,24 +24,39 @@ Event pop() {
   return e;
 }
 
-// 25 ms last-edge debounce per input, done entirely in the ISR (~1 us body).
-static volatile uint32_t lastMs[3];
+static const uint8_t PIN[3] = {SJ_BTN_PAGE, SJ_BTN_TRIG0, SJ_BTN_TRIG1};
 
+// Set here, cleared in the ISR: a disarmed button generates nothing at all,
+// which is what makes the whole of a bouncing make *and* break one event.
+static volatile bool armed[3] = {true, true, true};
+// When poll() last saw the pin high. Only poll() writes it, so no barrier.
+static uint32_t lastHighMs[3] = {0, 0, 0};
+
+// Whole ISR body: a load, a store and a ring push.
 template <uint8_t IDX, Event EV>
 static void btnIsr() {
-  uint32_t now = millis();
-  if (now - lastMs[IDX] < SJ_BTN_DEBOUNCE_MS) return;
-  lastMs[IDX] = now;
+  if (!armed[IDX]) return;
+  armed[IDX] = false;
   push(EV);
 }
 
 void begin() {
-  pinMode(SJ_BTN_OK,   INPUT);   // board has external pulldowns; buttons pull high
-  pinMode(SJ_BTN_PREV, INPUT);
-  pinMode(SJ_BTN_NEXT, INPUT);
-  attachInterrupt(SJ_BTN_OK,   btnIsr<0, EV_OK>,   RISING);
-  attachInterrupt(SJ_BTN_PREV, btnIsr<1, EV_PREV>, RISING);
-  attachInterrupt(SJ_BTN_NEXT, btnIsr<2, EV_NEXT>, RISING);
+  for (uint8_t i = 0; i < 3; i++) pinMode(PIN[i], INPUT);   // board has external pulldowns
+  attachInterrupt(SJ_BTN_PAGE,  btnIsr<0, EV_PAGE>,  RISING);
+  attachInterrupt(SJ_BTN_TRIG0, btnIsr<1, EV_TRIG0>, RISING);
+  attachInterrupt(SJ_BTN_TRIG1, btnIsr<2, EV_TRIG1>, RISING);
+}
+
+void poll() {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < 3; i++) {
+    if (armed[i]) continue;
+    // digitalReadFast falls back to digitalRead for a non-constant pin, which
+    // is what a loop over the table gets; three of those per pass is nothing
+    // next to the render this shares loop() with.
+    if (digitalReadFast(PIN[i])) { lastHighMs[i] = now; continue; }
+    if ((uint32_t)(now - lastHighMs[i]) >= SJ_BTN_DEBOUNCE_MS) armed[i] = true;
+  }
 }
 
 } // namespace UiInput

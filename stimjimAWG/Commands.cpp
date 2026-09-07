@@ -15,6 +15,7 @@
 #include "Measure.h"
 #include "SdLog.h"
 #include "Cal.h"
+#include "Clock.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -381,6 +382,78 @@ static void handleCalDef() {
   ok();
 }
 
+// --------------------------------------------------------------------- CLK
+//
+// The wall clock is a label and never an authority (Clock.h). The reply pairs
+// it with the microsecond count every log row is stamped with, because that
+// pair -- not the RTC -- is what anchors a log file to a computer's log: a host
+// subtracts its own clock from it and bounds the error by timing the round
+// trip. A host that never sets the clock still gets a usable anchor this way.
+
+static void clkStatus() {
+  uint32_t s;
+  uint16_t ms;
+  uint64_t us;
+  const bool ok_ = Clock::anchor(s, ms, us);
+  char usStr[24];
+  Protocol::u64str(us, usStr);
+  const Clock::Source src = Clock::source();
+  Serial.printf("CLK,%lu,%u,%s,%s\n", (unsigned long)(ok_ ? s : 0),
+                (unsigned)(ok_ ? ms : 0), usStr, Clock::sourceName(src));
+  if (!ok_) { Serial.println("# clock: this board has no running RTC"); return; }
+  // What the source means matters more than the reading: a `build` time is the
+  // build host's *local* time at compile, so it is off by however long the
+  // binary has been in service and by the zone offset on top of that.
+  static const char* what[3] = {
+    "the binary's compile time in the BUILD HOST's local zone — a label, not a time",
+    "running from VBAT since an earlier upload — the epoch is unverified",
+    "UTC, set by a host this session — good to about a millisecond",
+  };
+  char iso[SJ_ISO_MAX];
+  Clock::isoString(iso, sizeof iso, s, ms);
+  Serial.printf("# clock: %s src=%s (%s)\n", iso, Clock::sourceName(src), what[src]);
+}
+
+static void handleClk(const char* args) {
+  const char* p = args;
+  while (*p == ',' || *p == ' ') p++;
+  if (!*p || *p == '?') { clkStatus(); return; }
+
+  // strtoul, not the shared parseFields: a Unix second count passes 2^31 in
+  // 2038 and the strict parser's strtol would saturate there.
+  char* end;
+  const unsigned long secs = strtoul(p, &end, 10);
+  if (end == p) { err("CLK", "need CLK,<unix_seconds>[,<ms>] or CLK?"); return; }
+  p = end;
+  unsigned long ms = 0;
+  if (*p == ',') {
+    p++;
+    ms = strtoul(p, &end, 10);
+    if (end == p) { err("CLK", "malformed millisecond field"); return; }
+    p = end;
+  }
+  while (*p == ' ') p++;
+  if (*p)      { err("CLK", "trailing characters after CLK,<unix>[,<ms>]"); return; }
+  if (ms > 999) { err("CLK", "ms must be 0-999"); return; }
+  Clock::set((uint32_t)secs, (uint16_t)ms);
+  clkStatus();
+}
+
+// -------------------------------------------------------------------- PAGE
+
+static void handlePage(const char* args) {
+  const char* p = args;
+  while (*p == ',' || *p == ' ') p++;
+  if (!*p)        { UiMenu::pageNext();   return; }   // same action as the page button
+  if (*p == '?')  { UiMenu::pageStatus(); return; }
+  long v;
+  if (parseFields(p, &v, 1) != 1 || v < 0 || v > 255) {
+    err("PAGE", "need PAGE (advance), PAGE,<n> (select) or PAGE? (query)");
+    return;
+  }
+  UiMenu::pageSelect((uint8_t)v);
+}
+
 // ------------------------------------------------------------- ENV / MEAS
 
 static void handleEnv(const char* args) {
@@ -525,6 +598,7 @@ static void handleStart(char letter, const char* args) {
       Engine::Completion f;
       Engine::timingFaults(eng, f);
       printTimingFaults(f);
+      UiMenu::noteResult(trainCount, eng, (uint8_t)stopped);
       Measure::printSummary(eng, (uint8_t)stopped);
       SdLog::flushNow();
     }
@@ -571,6 +645,9 @@ void poll() {
     Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
     Serial.println(" pulses.");
     printTimingFaults(c);
+    // Before printSummary, which is what releases the finished train's plan
+    // buffer back to loop()'s housekeeping.
+    UiMenu::noteResult(trainCount, c.eng, c.slot);
     if (!Measure::printSummary(c.eng, c.slot))
       Serial.println("Note: no measurement carried out.");
     SdLog::flushNow();
@@ -1244,6 +1321,7 @@ static void help() {
   Serial.println("#     fit: 0 refuse a point that does not fit its gap, 1 rotate its reads (default)");
   Serial.println("#   CAL? / CAL,<name>,<us> / CALDEF timing budget: PRELOAD DACPROG1 DACPROG2 ADCREAD");
   Serial.println("#                                   ADCSWITCH GUARD SETTLE STARTLAT TRIGCOMP (us)");
+  Serial.println("#   CLK? / CLK,<unix>[,<ms>]        wall clock: read (with the us timebase) / set");
   Serial.println("#   READ<ch>[,n]                    manual averaged V+I read (mean and std dev)");
   Serial.println("#   M<ch>,<mode>  V<ch>,<mV>  A<ch>,<dac>  E<ch>,<line>   immediate (legacy replies)");
   Serial.println("#   B / C                           recalibrate ADC / current+voltage offsets");
@@ -1251,13 +1329,14 @@ static void help() {
   Serial.println("#   P                               save slots 0-9 + triggers to EEPROM");
   Serial.println("#   DUMP / STAT / IDN               session export / engine status / identity");
   Serial.println("#   SCREEN                          dump the OLED framebuffer as ASCII art");
+  Serial.println("#   PAGE / PAGE,<n> / PAGE?         display page: advance / select / query");
   Serial.println("#   TRIG<t>,<mode>,<s0>,<s1>,<edge> route input 0/1: 0 off, 1 joint, 2 independent,");
   Serial.println("#                                   3 stimulus marker out; edge 0 rising, 1 falling");
   Serial.println("#   R<t>,<slot>[,<out>]             legacy alias of TRIG; TRIG<t>? / R<t>? query");
   Serial.println("#   LOG? / LOG1[,<name>] / LOG0     SD measurement log: status / open / close");
   Serial.println("#   SD?                             SD file access over serial (SDLIST, SDGET, ...)");
   Serial.println("#   BENCH?                          hardware benchmarks (BENCHDAC, BENCHPIT, ...)");
-  Serial.println("# Not implemented: the button menu editor");
+  Serial.println("# Buttons: Btn0 next page, Btn1 fires IN0's route, Btn2 fires IN1's");
   ok();
 }
 
@@ -1318,8 +1397,12 @@ void handleLine(const char* line) {
     handleCal(args);
   } else if (!strcmp(word, "CALDEF")) {
     handleCalDef();
+  } else if (!strcmp(word, "CLK")) {
+    handleClk(args);
   } else if (!strcmp(word, "SCREEN")) {
     UiMenu::dumpScreen();
+  } else if (!strcmp(word, "PAGE")) {
+    handlePage(args);
   } else if (!strcmp(word, "ENV")) {
     handleEnv(args);
   } else if (!strcmp(word, "MEAS")) {

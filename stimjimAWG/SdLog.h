@@ -27,6 +27,11 @@ void poll();   // flush timer; the MDATA ring is drained by Measure::poll()
 void writeRow(const char* row);
 void flushNow();          // called at train end
 bool isOpen();
+bool cardPresent();       // a card is mounted (false on a build with no socket)
+// The open log's name ("" when none) and how many bytes have been written to
+// it — what the OLED status page reports, and what `LOG?` prints.
+const char* name();
+uint32_t    bytes();
 
 // One `#` block naming the waveform a just-armed train plays, so a log stays
 // self-describing when trains are started by trigger edges long after the file

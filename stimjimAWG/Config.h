@@ -24,7 +24,7 @@
 
 // ------------------------------------------------------------------ identity
 #define SJ_FW_NAME       "stimjimAWG"
-#define SJ_FW_VERSION    "0.7.0"
+#define SJ_FW_VERSION    "0.8.0"
 #define SJ_PROTO_VERSION 1
 
 // ---------------------------------------------------------- hardware variant
@@ -317,9 +317,19 @@
 #define SJ_OLED_COLS     (SJ_OLED_WIDTH / 6)    // 6x8 default GFX font
 #define SJ_OLED_ROWS     (SJ_OLED_HEIGHT / 8)
 #define SJ_UI_MIN_MS     100   // minimum interval between physical display writes
-#define SJ_BTN_OK        17    // Btn0
-#define SJ_BTN_PREV      39    // Btn1
-#define SJ_BTN_NEXT      16    // Btn2
+// Result pages the panel offers of a train's up to SJ_MAX_STAGES measurement
+// points. One button cycles every page, so the list has to stay walkable;
+// `MSUM` carries the full detail either way.
+#define SJ_UI_RESULT_PAGES 4
+// The three front-panel buttons, restored to what stimjimPulser wired them to:
+// Btn0 was a hello message and is now the page key, Btn1 and Btn2 fired the two
+// trigger inputs' routes and do so again (stimjimPulser.ino:888-896).
+#define SJ_BTN_PAGE      17    // Btn0 — switch display page
+#define SJ_BTN_TRIG0     39    // Btn1 — fire input 0's route
+#define SJ_BTN_TRIG1     16    // Btn2 — fire input 1's route
+// How long a button has to read low before it is armed again. This is a
+// re-arm window, not a lockout from the last accepted edge: one press yields
+// exactly one event whatever the contact does on make *or* break (UiInput.cpp).
 #define SJ_BTN_DEBOUNCE_MS 25
 
 #endif // STIMJIMAWG_CONFIG_H

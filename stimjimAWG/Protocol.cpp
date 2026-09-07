@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "Engine.h"
 #include "Cal.h"
+#include "Clock.h"
 
 namespace Protocol {
 
@@ -55,6 +56,13 @@ void begin() {
                 "with a per-slot start delay; HELP lists commands\n",
                 SJ_FW_NAME, SJ_FW_VERSION);
   printIdentity(Serial);
+  // The wall clock is not part of the identity block -- the log header carries
+  // its own anchor lines, and this one would be stale by the time a file was
+  // opened -- but a session that attached at boot should see whether the box
+  // knows what time it is at all. `CLK?` says what the source means.
+  char anchor[96];
+  Clock::anchorLine(anchor, sizeof anchor);
+  Serial.printf("# clock: %s\n", anchor);
 }
 
 void poll() {

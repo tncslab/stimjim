@@ -38,24 +38,32 @@ static inline void fire(uint8_t eng, int8_t slot, uint64_t at) {
     rejects++;
 }
 
-static void edge(uint8_t input) {
-  // First thing in the ISR: the edge's own timebase reading. Everything after
-  // it — dispatch, the arm's precomputation, a second engine's arm — is then
-  // subtracted from the start latency instead of added to it, so two engines
-  // started by one edge also share one t0 grid.
-  const uint64_t at = FastIO::cycles64();
+bool fireRoute(uint8_t input, uint64_t at) {
   const TriggerRoute& r = routes[input];
   if (r.mode == 1) {
     // joint: one slot, one engine — the slot's own modes decide which physical
     // channels it drives, so "both channels synchronized" is a property of the
     // waveform definition, not of the routing.
     fire(0, r.slot0, at);
-  } else if (r.mode == 2) {
+    return true;
+  }
+  if (r.mode == 2) {
     // independent: slot0 on engine 0, slot1 on engine 1. Each refusal counts
     // separately, so a half-served trigger is visible in the reject count.
     fire(0, r.slot0, at);
     fire(1, r.slot1, at);
+    return true;
   }
+  return false;                        // mode 0 (off) or 3 (marker output)
+}
+
+static void edge(uint8_t input) {
+  // First thing in the ISR: the edge's own timebase reading. Everything after
+  // it — dispatch, the arm's precomputation, a second engine's arm — is then
+  // subtracted from the start latency instead of added to it, so two engines
+  // started by one edge also share one t0 grid.
+  const uint64_t at = FastIO::cycles64();
+  fireRoute(input, at);
 }
 
 static void trig0Isr() { edge(0); }

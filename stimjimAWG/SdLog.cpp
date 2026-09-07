@@ -6,6 +6,7 @@
 #include "FastIO.h"
 #include "Protocol.h"
 #include "TrainStore.h"
+#include "Clock.h"
 #include <string.h>
 
 #if SJ_USE_SD
@@ -26,6 +27,9 @@ void poll()                             { }
 void writeRow(const char*)              { }
 void flushNow()                         { }
 bool isOpen()                           { return false; }
+bool cardPresent()                      { return false; }
+const char* name()                      { return ""; }
+uint32_t bytes()                        { return 0; }
 void noteTrain(uint8_t)                 { }
 void status()                           { noCard("LOG"); }
 void openLog(const char*)               { noCard("LOG"); }
@@ -40,6 +44,7 @@ void del(const char*)                   { noCard("SDDEL"); }
 #define SJ_LOGNAME_MAX 64
 #define SJ_FLUSH_ROWS  64      // rows between forced flushes
 #define SJ_FLUSH_MS    1000    // ... or milliseconds, whichever comes first
+#define SJ_ANCHOR_MS   60000   // longest gap between two wall-clock anchor lines
 
 static bool     mounted = false;
 static File     logFile;
@@ -47,14 +52,54 @@ static char     logName[SJ_LOGNAME_MAX] = "";
 static uint32_t logBytes = 0;
 static uint32_t rowsSinceFlush = 0;
 static uint32_t lastFlushMs = 0;
+static uint32_t lastAnchorMs = 0;
+
+// One wall-clock anchor line. The CSV columns deliberately do not carry a wall
+// clock: host tools depend on their shape, and rendering one per row would add
+// cost to the path phase 15 set out to make cheaper. Instead every row's `us`
+// maps to a wall clock through the nearest anchor, and the drift between two
+// anchors is visible in the file rather than hidden inside it.
+static void writeAnchor() {
+  if (!logFile) return;
+  char anchor[96];
+  Clock::anchorLine(anchor, sizeof anchor);
+  logBytes += (uint32_t)logFile.printf("# clock: %s\n", anchor);
+  lastAnchorMs = millis();
+}
+
+// FAT directory timestamps for files this firmware creates. SdFat asks for a
+// packed date and time plus hundredths since the last even second. A SRC_BUILD
+// epoch is refused outright: a wrong file date is worse than none, because a
+// host sorting by date would silently believe it.
+static void fatDateTime(uint16_t* date, uint16_t* time, uint8_t* ms10) {
+  uint32_t s;
+  uint16_t ms;
+  if (Clock::source() == Clock::SRC_BUILD || !Clock::read(s, ms)) {
+    *date = 0;
+    *time = 0;
+    *ms10 = 0;
+    return;
+  }
+  Clock::Civil c;
+  Clock::civilFromUnix(s, ms, c);
+  *date = FS_DATE(c.year, c.mon, c.day);
+  *time = FS_TIME(c.hour, c.min, c.sec);
+  // FS_TIME has 2-second granularity, so the odd second and the fraction go
+  // here: hundredths since the last even second, valid range 0-199.
+  *ms10 = (uint8_t)((c.sec & 1u) * 100u + c.ms / 10u);
+}
 
 static bool mount() {
   if (mounted) return true;
   mounted = SD.begin(BUILTIN_SDCARD);      // native SDIO — not the DAC/ADC bus
+  if (mounted) FsDateTime::setCallback(fatDateTime);
   return mounted;
 }
 
-bool isOpen() { return (bool)logFile; }
+bool isOpen()          { return (bool)logFile; }
+bool cardPresent()     { return mounted; }
+const char* name()     { return logName; }
+uint32_t bytes()       { return logBytes; }
 
 void begin() {
   if (mount()) {
@@ -69,6 +114,9 @@ void begin() {
 void poll() {
   if (!logFile || rowsSinceFlush == 0) return;
   uint32_t now = millis();
+  // Only while rows are actually being written: a file left open on an idle
+  // board collects no anchors, because there is nothing between them to anchor.
+  if ((uint32_t)(now - lastAnchorMs) >= SJ_ANCHOR_MS) writeAnchor();
   if (rowsSinceFlush >= SJ_FLUSH_ROWS || (uint32_t)(now - lastFlushMs) >= SJ_FLUSH_MS) {
     logFile.flush();
     rowsSinceFlush = 0;
@@ -94,6 +142,7 @@ void flushNow() {
 // that changes between trains.
 void noteTrain(uint8_t slot) {
   if (!logFile) return;
+  writeAnchor();                 // every train's rows start from a fresh anchor
   const TrainDef& t = TrainStore::slotConst(slot);
   char line[SJ_SERIALIZE_MAX];
   TrainStore::serializeTrain(slot, t, line, sizeof line);
@@ -122,6 +171,7 @@ static void writeHeader() {
   Protocol::printIdentity(logFile);
   Commands::writeDump(logFile);
   logFile.println("# columns: timestamp_us,slot,pulse,point,V0_mV,I0_uA,V1_mV,I1_uA");
+  writeAnchor();
 }
 
 void openLog(const char* name) {
@@ -133,8 +183,12 @@ void openLog(const char* name) {
     if (strlen(name) >= sizeof nm) { Serial.println("ERR LOG: file name too long"); return; }
     strcpy(nm, name);
   } else {
-    // lowest free LOGnnnn.CSV — the index is the only thing that identifies a
-    // run on a board without a clock, so it must not be reused
+    // lowest free LOGnnnn.CSV. The index, not the clock, is what identifies a
+    // run: the RTC epoch is a label whose source may be a compile time
+    // (Clock.h), so a date-based name would promise more than it can keep. The
+    // date reaches the file two other ways — the FAT timestamp fatDateTime
+    // supplies and the in-file anchor lines — and the index must not be reused
+    // either way.
     uint32_t i = 0;
     for (; i < 10000; i++) {
       snprintf(nm, sizeof nm, "LOG%04lu.CSV", (unsigned long)i);

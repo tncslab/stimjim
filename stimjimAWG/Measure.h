@@ -117,6 +117,25 @@ struct Plan {
   uint32_t envSkipped;           // repetitions dropped by the envelope gate
 };
 
+// What the OLED result pages show, taken from the same accumulators `MSUM`
+// prints. Everything is integer so the display path stays float-free: the
+// conversion runs once per completion, in loop() context, and the panel then
+// only formats. Full scale is +-15 V and +-3.33 mA, so int32 has ample room in
+// microvolts and nanoamps.
+struct ResultChan {
+  uint32_t nV, nI;       // repetitions behind each line; 0 = that line was not read
+  int32_t  uV, nA;       // means
+  uint32_t seUV, seNA;   // standard error of each mean, same units
+};
+struct ResultSet {
+  bool     valid;        // false: the train measured nothing
+  uint8_t  eng, slot, type, nPoints;
+  uint32_t trainNo;      // the completion counter the `Train #n complete` line prints
+  uint32_t nMax;         // largest n in the set
+  uint16_t label[SJ_MEAS_POINTS];      // stage index (S/L) or peak degrees (W)
+  ResultChan ch[SJ_MEAS_POINTS][2];
+};
+
 // ------------------------------------------------------------ pure plan math
 
 // Compile `def`'s MeasDef against the geometry, and zero the result state of
@@ -190,6 +209,13 @@ void pulseDone(uint8_t eng);
 bool printSummary(uint8_t eng, uint8_t slot);
 // Whether the train the engine is playing *now* has measurement points.
 bool hasPlan(uint8_t eng);
+
+// The same buffer printSummary reads, converted to the integer units the panel
+// works in and *not* consumed: it leaves summaryPending alone. Call it
+// immediately before printSummary for the same completion, because that is what
+// clears the flag naming the finished train's buffer. Sets out.valid = false
+// for a train that measured nothing.
+void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out);
 
 #endif // ARDUINO
 
