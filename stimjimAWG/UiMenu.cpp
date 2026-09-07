@@ -246,10 +246,12 @@ static void composeResult(uint8_t k) {
          (unsigned)(k + 1), (unsigned)resultPages());
 
   char a[SJ_UI_FIELD_MAX], b[SJ_UI_FIELD_MAX];
-  const char fv0 = c0.nV ? UiFmt::voltFlag(c0.uV) : ' ';
-  const char fv1 = c1.nV ? UiFmt::voltFlag(c1.uV) : ' ';
-  const char fi0 = c0.nI ? UiFmt::currFlag(c0.nA) : ' ';
-  const char fi1 = c1.nI ? UiFmt::currFlag(c1.nA) : ' ';
+  // Flagged from the extremes, not the mean: a single repetition that reached
+  // the driver's ceiling is exactly what a mean hides.
+  const char fv0 = c0.nV ? UiFmt::voltFlag(c0.uVmin, c0.uVmax) : ' ';
+  const char fv1 = c1.nV ? UiFmt::voltFlag(c1.uVmin, c1.uVmax) : ' ';
+  const char fi0 = c0.nI ? UiFmt::currFlag(c0.nAmin, c0.nAmax) : ' ';
+  const char fi1 = c1.nI ? UiFmt::currFlag(c1.nAmin, c1.nAmax) : ' ';
 
   UiFmt::fmtVolt(a, sizeof a, c0.nV != 0, c0.uV);
   UiFmt::fmtVolt(b, sizeof b, c1.nV != 0, c1.uV);

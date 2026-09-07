@@ -53,9 +53,19 @@ namespace Measure {
 // Raw-code accumulator for one (point, channel, line). sum/sumsq are int64:
 // a 13-bit code squared is ~1.7e7, so even millions of repetitions cannot
 // overflow, and the single-pass estimator stays exact in integers.
+//
+// mn/mx are the extremes of the individual readings. A mean and a spread
+// describe the bulk of a train and hide a single excursion completely: one
+// repetition that reached the output driver's ceiling moves a 500-sample mean
+// by a fiftieth of the distance it travelled itself. The extremes are what
+// answer "did *any* repetition hit the rail", which is a different question
+// from "did the average", and they cost two comparisons per reading in the
+// player ISR and eight bytes here. They are seeded by planResetResults, not by
+// the zeroing memset, because 0 is a perfectly ordinary reading.
 struct Accum {
   uint32_t n;
   int64_t  sum, sumsq;
+  int16_t  mn, mx;
 };
 
 // What the player knows about its own arm-time geometry, handed to planBuild so
@@ -130,6 +140,8 @@ struct ResultChan {
   uint32_t nV, nI;       // repetitions behind each line; 0 = that line was not read
   int32_t  uV, nA;       // means
   uint32_t seUV, seNA;   // standard error of each mean, same units
+  int32_t  uVmin, uVmax; // extremes of the individual readings, same units
+  int32_t  nAmin, nAmax;
 };
 struct ResultSet {
   bool     valid;        // false: the train measured nothing
@@ -169,7 +181,17 @@ char* putCenti(char* p, int32_t centi, bool neg);
 
 // Mean and sample standard deviation of an accumulator, in raw ADC codes.
 // Returns false when n == 0 (nothing measured); sd is 0 when n == 1.
+//
+// The single-pass form is exact here in a way it is not in general: the sums
+// are accumulated as int64 in the ISR, so the only rounding is the final
+// subtraction. Measured against a two-pass long-double reference over
+// n = 5..1e6, means 0..8000 codes and spreads 0.29..50 codes, the worst
+// relative error is 1.6e-8 -- four orders below what a two-decimal field can
+// show.
 bool accumStats(const Accum& a, double& mean, double& sd);
+
+// Extremes of the individual readings, in raw ADC codes. False when n == 0.
+bool accumRange(const Accum& a, int16_t& lo, int16_t& hi);
 
 // ------------------------------------------------------------- device side
 #ifdef ARDUINO

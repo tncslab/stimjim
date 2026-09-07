@@ -134,7 +134,9 @@ MSUM,0,500,0,99.8,0.4,,,,,,
 ```
 
 `MSUM` carries the mean and standard deviation per point, per channel, per line, accumulated over
-every repetition. `MEAS<idx>,…,<report>` with `report` +1 also streams a per-repetition `MDATA`
+every repetition, and `MRANGE` follows it with the extremes of the individual readings in the same
+field positions — because a mean hides a single excursion almost completely, and "did any
+repetition reach the driver's ceiling" is a different question from "did the average". `MEAS<idx>,…,<report>` with `report` +1 also streams a per-repetition `MDATA`
 line, +2 writes to the SD card (`LOG` opens and closes the file; the `SD` group reads the card
 back over the serial port, so the socket under the cover never has to be opened).
 
@@ -187,7 +189,9 @@ short or noisy train loses digits by itself. `open` replaces the number when the
 distinguishable from zero, and `--` when a line was not measured or when neither V nor I differs
 from zero. A `*` after a value means it may be the hardware talking rather than the load — 9 V
 or more on the voltage row (the output driver's ceiling) or 3 mA or more on the current row (the
-current pump's design limit, above which the DAC conversion is known bad).
+current pump's design limit, above which the DAC conversion is known bad). The marker keys off the
+*extremes* of the train, not its mean, so a train that touched a limit once is marked even when its
+average sits well below.
 
 **The clock is a label, never an authority.** `CLK?` reports the wall clock, the microsecond count
 since boot, and where the epoch came from:

@@ -90,7 +90,8 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
 
 - Amplitudes above **3000 µA are converted incorrectly** on the DAC. The firmware warns at parse
   time when a stage asks for more, and the OLED result pages mark a *measured* current of 3 mA or
-  more with `*` for the same reason.
+  more with `*` for the same reason — from the extremes of the train, so one repetition that got
+  there is enough.
 - The output driver saturates below the ±15 V the DAC span implies, so a measured output voltage
   of 9 V or more is more likely the driver's ceiling than the amplitude that was requested. The
   result pages mark those with `*` too. **9 V is a working threshold, not a measured limit:** it

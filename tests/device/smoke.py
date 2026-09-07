@@ -356,6 +356,24 @@ def main():
             check(float(msum[1].split(",")[4]) < -1000.0,
                   "stage 1 V0 is the negative phase")
 
+        # MRANGE follows each MSUM line with the extremes of the individual
+        # readings, in the same field positions. It must bracket the mean, and
+        # its field count must match MSUM's so a host can index them alike.
+        mrange = [l for l in r if l.startswith("MRANGE,")]
+        eq(len(mrange), len(msum), "one MRANGE line per MSUM line")
+        if len(mrange) == 2 and len(msum) == 2:
+            g0 = mrange[0].split(",")
+            eq(len(g0), 12, "MRANGE field count matches MSUM")
+            eq(g0[1], msum[0].split(",")[1], "MRANGE names the same slot")
+            eq(g0[3], msum[0].split(",")[3], "MRANGE names the same point")
+            f0 = msum[0].split(",")
+            for pos, name in ((4, "V0"), (6, "I0")):
+                lo, hi = float(g0[pos]), float(g0[pos + 1])
+                mean = float(f0[pos])
+                check(lo <= mean <= hi,
+                      f"{name}: min {lo} <= mean {mean} <= max {hi}")
+                check(lo < hi, f"{name}: the readings actually varied ({lo}..{hi})")
+
             # The panel reads the same accumulators, so the RESULT pages appear
             # as soon as a measured train completes and the firmware jumps to
             # the first of them.

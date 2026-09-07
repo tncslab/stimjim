@@ -9,8 +9,19 @@ static inline uint32_t absU(int32_t v) {
   return (uint32_t)((v < 0) ? -(int64_t)v : (int64_t)v);
 }
 
-char voltFlag(int32_t uV) { return (absU(uV) >= (uint32_t)SJ_UI_VLIMIT_UV) ? '*' : ' '; }
-char currFlag(int32_t nA) { return (absU(nA) >= (uint32_t)SJ_UI_ILIMIT_NA) ? '*' : ' '; }
+// The larger magnitude of the two extremes: a limit is a magnitude, so a train
+// that swings to -12 V trips it exactly as one that swings to +12 V does.
+static inline uint32_t peak(int32_t lo, int32_t hi) {
+  const uint32_t a = absU(lo), b = absU(hi);
+  return (a > b) ? a : b;
+}
+
+char voltFlag(int32_t lo, int32_t hi) {
+  return (peak(lo, hi) >= (uint32_t)SJ_UI_VLIMIT_UV) ? '*' : ' ';
+}
+char currFlag(int32_t lo, int32_t hi) {
+  return (peak(lo, hi) >= (uint32_t)SJ_UI_ILIMIT_NA) ? '*' : ' ';
+}
 
 uint32_t isqrt64(uint64_t v) {
   if (v == 0) return 0;

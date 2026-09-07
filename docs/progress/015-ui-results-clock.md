@@ -198,13 +198,46 @@ number may be the hardware talking rather than the load:
   already uses that number (`WARN_LIMIT_UA`), so the display and the parser agree.
 
 The marker carries through to the resistance row: a resistance derived from a suspect reading is
-suspect for the same reason. It is the same kind of feedback `open` gives, in the column the
+suspect for the same reason. It keys off the extremes of the train rather than the mean (§1.3.3). It is the same kind of feedback `open` gives, in the column the
 layout reserved for it.
 
 The Pulser's *compliance* markers — inverted video on a voltage- or current-limited field — are
 still not built. They compared the reading against the requested amplitude, which the AWG's `MSUM`
 path does not carry, and the flag deserves its own decision about what "limited" means for a ramp
 or a sine.
+
+### 1.3.3 The extremes, and what the marker keys off
+
+A mean and a spread describe the bulk of a train and hide a single excursion almost completely:
+one repetition in five hundred that reached the output driver's ceiling moves the mean by a
+five-hundredth of the distance it travelled itself. So `Accum` gained `int16_t mn, mx`, updated by
+two comparisons per reading in the player ISR @EM@ against a ~3 µs ADC read, free @EM@ and eight
+bytes per accumulator, 1.6 KB across the four plans.
+
+They cannot start at 0 the way the sums do, because 0 is an ordinary reading and a channel whose
+codes are all positive would keep a minimum of 0 for ever. `planResetResults` seeds them inverted
+(`INT16_MAX` / `INT16_MIN`), which is what lets the ISR be two unconditional comparisons with no
+first-sample branch; `accumRange` gates on `n`, so the sentinels are never read as data. That
+seeding runs in loop() context, and in the arm only on the fallback path that compiles in place.
+
+They surface two ways:
+
+- **`MRANGE`**, one record per `MSUM` line and immediately after it, carrying the extremes in the
+  same units and the same field positions the means occupy. A separate record rather than four
+  more `MSUM` fields, so a host parsing `MSUM` by field count is unaffected.
+- **the panel's limit markers**, which now key off the extremes rather than the mean. A train
+  whose average sits below 9 V but which touched it once is marked, which is the case the marker
+  exists for and the one a mean is worst at reporting.
+
+On silicon, a five-repetition biphasic train:
+
+```
+MSUM,4,5,0,4489.53,2.04,1102.93,0.38,8053.22,10.15,989.14,0.76
+MRANGE,4,5,0,4486.60,4491.48,1102.25,1103.10,8042.48,8069.32,988.64,990.34
+```
+
+@EM@ and the second channel is the point: mean 8053 mV, but one of the five repetitions reached
+8069.
 
 ### 1.4 The clock
 
@@ -268,7 +301,7 @@ everything finer comes from the microsecond column. A host that never sets the c
 usable anchor from `CLK?` alone.
 
 **In the log.** The CSV columns did **not** change — host tools depend on them, and rendering a
-wall clock per row would add cost to the very path §1.5 is about making cheaper. The file carries
+wall clock per row would add cost to the very path §1.6 is about making cheaper. The file carries
 anchor lines instead:
 
 ```
@@ -286,7 +319,36 @@ than none: a host sorting by date would believe it. `LOG1` keeps `LOGnnnn.CSV` n
 comment in `openLog()` that said the index "is the only thing that identifies a run on a board
 without a clock" was rewritten to say why the index still is what identifies a run.
 
-### 1.5 The row formatting is now fixed point
+### 1.5 Why the accumulators stayed accumulators
+
+Storing every reading and computing the spread by definition was considered and rejected, on two
+grounds that were measured rather than assumed.
+
+**Accuracy is not a reason to change.** The usual objection to `sumsq - sum*sum/n` assumes the sums
+were accumulated in floating point; here they are exact `int64` and the only rounding is the final
+subtraction. Compared against a two-pass long-double reference over n = 5..1e6, means 0..8000 codes
+and spreads 0.29..50 codes, the **worst relative error is 1.6e-8** @EM@ four orders below what a
+two-decimal field can show.
+
+**Memory rules it out anyway.** The accumulators cost 4 896 B for all four plans *regardless of
+train length*. Storing raw readings would cost n x 40 lines x 2 B per plan:
+
+| n | per plan | all four | |
+|---|---|---|---|
+| 50 | 4 kB | 16 kB | fits |
+| 500 | 40 kB | 160 kB | only just, against 55 kB already used |
+| 5 000 | 400 kB | 1.6 MB | does not fit 256 kB |
+
+500 repetitions is five seconds at a 10 ms period, so this would put an arbitrary cap on train
+length to buy an accuracy improvement of 1e-8.
+
+**And the option already exists in the right place.** `MEAS ...,<report>` with +1 streams every
+individual reading as `MDATA` and +2 writes every one to the card, so a host that wants medians,
+distributions or per-definition statistics already has the raw data @EM@ on a machine that has the
+memory for it. What the accumulators owed was the one thing a summary genuinely could not give,
+which is the extremes, and that is what §1.3.3 adds.
+
+### 1.6 The row formatting is now fixed point
 
 Per row the old path ran four `snprintf("%.2f")` conversions plus the row `snprintf`. The Teensy
 3.5 links full newlib (`teensy35.build.flags.libs` carries no `nano.specs`), so `%f` goes through
@@ -371,7 +433,8 @@ New: `stimjimAWG/Clock.h`, `stimjimAWG/Clock.cpp`, `stimjimAWG/UiFmt.h`, `stimji
 
 Changed: `Config.h` (version 0.8.0, button names and roles, `SJ_UI_RESULT_PAGES`), `Commands.cpp`
 (`CLK`, `PAGE`, `BENCHFMT`, `noteResult` in both completion paths, `noteOffsets` after `B`/`C`,
-help), `Measure.h`/`Measure.cpp` (`ResultSet`, `resultSnapshot`, fixed-point fields,
+help), `Measure.h`/`Measure.cpp` (`ResultSet`, `resultSnapshot`, the `mn`/`mx` extremes with
+`accumRange` and the `MRANGE` record, fixed-point fields, the decimal appenders,
 `benchFormatRow`, `noteOffsets`), `Protocol.cpp` (the boot `# clock:` line), `SdLog.h`/`SdLog.cpp`
 (anchor lines, the FAT date callback, `cardPresent`/`name`/`bytes`), `Triggers.h`/`Triggers.cpp`
 (`fireRoute`), `UiInput.h`/`UiInput.cpp` (roles and the arm/re-arm debounce), `UiMenu.h`/
@@ -416,7 +479,7 @@ No EEPROM change: nothing new needs persisting, so the image version stays at v6
   before each `# train:` block. The arithmetic ties out: the anchor `us=78020018` at
   `10:52:34.236Z` and the first data row at `78022020` us, 2.0 ms later.
 - **`BENCHFMT`**: 160.9 / 171.1 / 180.2 us per row, against 285.8 / 336.7 / 350.1 us for the
-  `%.2f` path measured beside it. See §1.5 and `docs/timing.md` §6.
+  `%.2f` path measured beside it. See §1.6 and `docs/timing.md` §6.
 - **The clock source heuristic behaves as designed on a battery-backed board.** After an upload it
   reports `batt`, not `build` — correct, and it is what the documentation predicts: the core only
   re-sets the RTC from `__rtc_localtime` when its VBAT "known-stale" flag is still set, and a
@@ -448,8 +511,15 @@ No EEPROM change: nothing new needs persisting, so the image version stays at v6
   `int64` headroom at +-15 V and +-3.33 mA, the limit markers, the field widths, and the
   ISO 8601 / civil-date conversion including leap days and the `uint32` ceiling.
 - **The fixed-point conversion was compared against `%.2f`** over 13.1 million conversions on the
-  host — the whole code range crossed with 801 offsets — which is where the numbers in §1.5 come
+  host — the whole code range crossed with 801 offsets — which is where the numbers in §1.6 come
   from.
+**A third silicon round, after the extremes.** `MRANGE` brackets `MSUM` on a real train
+(`MRANGE,4,5,0,4486.60,4491.48,...` against `MSUM,4,5,0,4489.53,2.04,...`), `smoke.py` checks that
+relation for every point it measures, and the panel marks a 9385 mV train and leaves a 2558 mV one
+clean. `BENCHFMT` is unchanged at 11.8 us, so the two ISR comparisons cost the row path nothing.
+Host tests cover `accumRange`'s gate on `n`, the seeding `planBuild` must leave behind, and the
+flag deciding from a range whose mean would not have tripped it.
+
 **A second silicon round, after `BENCHSD` and the appenders.**
 
 - `SDINFO,1` **never worked**, and the audit that found the `SCREEN,1` argument bug found it too.
@@ -495,6 +565,6 @@ replaced without touching logic: `SJ_UI_REL_FLOOR_PPM` (1 %, standing in for the
 accuracy) and `SJ_UI_VLIMIT_UV` (9 V, standing in for the output driver's saturation point). Either
 one measured on the bench is a one-line change.
 
-**If the log row rate ever matters**, §1.5 says what to do and what not to: replace the five
+**If the log row rate ever matters**, §1.6 says what to do and what not to: replace the five
 `snprintf` calls with hand-rolled integer-to-decimal appends, keeping the bytes identical, rather
 than adopting a binary format.

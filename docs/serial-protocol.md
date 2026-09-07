@@ -406,6 +406,22 @@ and the peak phase in degrees (`90` / `270`) for `W`. `<n>` = repetitions accumu
 empty when `n < 2`; fields are empty where not measured. A train stopped by hand (`T-1`) also
 prints its summary, so a long averaging run can be ended when it has enough repetitions.
 
+**MRANGE record** (one per `MSUM` line, immediately after it):
+`MRANGE,<slot>,<n>,<point>,<V0_min>,<V0_max>,<I0_min>,<I0_max>,<V1_min>,<V1_max>,<I1_min>,<I1_max>`
+— the extremes of the *individual* readings, in the same units and the same field positions the
+means occupy in `MSUM`, empty where not measured.
+
+A mean and a spread describe the bulk of a train and hide a single excursion almost completely:
+one repetition in five hundred that reached the output driver's ceiling moves the mean by a
+five-hundredth of the distance it travelled itself, and lifts the sd barely more. `MRANGE` answers
+the different question — *did any repetition get there* — which is what matters for deciding
+whether a reading is the load talking or the hardware. It is a separate record rather than four
+more `MSUM` fields so that a host parsing `MSUM` by field count is unaffected; a host that does not
+want it ignores the word.
+
+The panel's limit markers key off these extremes rather than the mean, so a train whose average sits
+below the threshold but which touched it once is still marked (§ the display, below).
+
 **Timing self-check.** Every latch compares itself against its own deadline, so no oscilloscope
 is needed to tell whether a train's budgets held. Three lines can follow a completion, all
 normally absent:

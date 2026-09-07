@@ -587,31 +587,33 @@ static void testRotateSine() {
 // ------------------------------------------------------------------ estimator
 
 static void testAccumStats() {
-  Accum a = {0, 0, 0};
+  // The extremes play no part in the mean/spread estimator, so they are left
+  // at 0 here; testAccumRange covers them.
+  Accum a = {0, 0, 0, 0, 0};
   double mean = -1, sd = -1;
   CHECK(!accumStats(a, mean, sd));
 
   // One sample: mean is the sample, spread undefined and reported as 0.
-  a = {1, 100, 100 * 100};
+  a = {1, 100, 100 * 100, 0, 0};
   CHECK(accumStats(a, mean, sd));
   CHECK_NEAR(mean, 100.0, 1e-12);
   CHECK_NEAR(sd, 0.0, 1e-12);
 
   // 10, 12, 14: mean 12, sample sd 2.
-  a = {3, 36, 100 + 144 + 196};
+  a = {3, 36, 100 + 144 + 196, 0, 0};
   CHECK(accumStats(a, mean, sd));
   CHECK_NEAR(mean, 12.0, 1e-12);
   CHECK_NEAR(sd, 2.0, 1e-12);
 
   // Identical samples: the subtraction must not produce a negative variance
   // and then a NaN square root.
-  a = {5, 5 * 4096, 5LL * 4096 * 4096};
+  a = {5, 5 * 4096, 5LL * 4096 * 4096, 0, 0};
   CHECK(accumStats(a, mean, sd));
   CHECK_NEAR(mean, 4096.0, 1e-12);
   CHECK_NEAR(sd, 0.0, 1e-12);
 
   // Negative codes accumulate the same way.
-  a = {2, -30, 500};                        // -10 and -20
+  a = {2, -30, 500, 0, 0};                        // -10 and -20
   CHECK(accumStats(a, mean, sd));
   CHECK_NEAR(mean, -15.0, 1e-12);
   CHECK_NEAR(sd, sqrt(50.0), 1e-12);
@@ -674,6 +676,44 @@ static void testDecimalAppenders() {
   }
 }
 
+// The extremes: seeded by the reset so they can never be mistaken for data,
+// gated on n so an untouched accumulator reports nothing, and reported exactly
+// as they were stored.
+static void testAccumRange() {
+  Accum a;
+  memset(&a, 0, sizeof a);
+  int16_t lo = 123, hi = 456;
+  CHECK(!accumRange(a, lo, hi));              // n == 0: nothing to report
+  CHECK_EQ(lo, 123);                          // ... and the outputs are untouched
+  CHECK_EQ(hi, 456);
+
+  a.n = 3; a.mn = -4096; a.mx = 8191;
+  CHECK(accumRange(a, lo, hi));
+  CHECK_EQ(lo, -4096);
+  CHECK_EQ(hi, 8191);
+
+  // planBuild must leave the sentinels in place, not the memset's zeros: 0 is an
+  // ordinary reading, so a zeroed minimum would stick at 0 for a channel whose
+  // codes are all positive.
+  Plan pl;
+  Geometry g;
+  fillGeometry(g, PIECEWISE_HOLD, 0b11);
+  uint64_t cum[3] = {0, 5000 * CYC, 10000 * CYC};
+  g.nStages = 2;
+  g.cum = cum;
+  TrainDef def;
+  defaultDef(def, 0, 1);
+  planBuild(pl, 0, def, g);
+  CHECK_EQ(pl.nPoints, 2);
+  for (uint8_t i = 0; i < pl.nPoints; i++)
+    for (uint8_t ch = 0; ch < 2; ch++)
+      for (uint8_t ln = 0; ln < 2; ln++) {
+        CHECK_EQ(pl.acc[i][ch][ln].mn, 32767);
+        CHECK_EQ(pl.acc[i][ch][ln].mx, -32768);
+        CHECK(!accumRange(pl.acc[i][ch][ln], lo, hi));
+      }
+}
+
 int main() {
   testPeakSolver();
   testHoldPlan();
@@ -692,6 +732,7 @@ int main() {
   testRotationShortTrain();
   testRotateSine();
   testAccumStats();
+  testAccumRange();
   testDecimalAppenders();
   printf(failures ? "%d check(s) failed\n" : "all checks passed\n", failures);
   return failures;

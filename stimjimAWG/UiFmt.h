@@ -58,9 +58,13 @@ namespace UiFmt {
 // Widest string any formatter below produces, terminator included.
 #define SJ_UI_FIELD_MAX 12
 
-// '*' at or above the limit, ' ' otherwise.
-char voltFlag(int32_t uV);
-char currFlag(int32_t nA);
+// '*' at or above the limit, ' ' otherwise. `lo`/`hi` are the extremes of the
+// individual readings, so the marker answers "did any repetition reach the
+// limit" rather than "did the average" -- one excursion in five hundred moves a
+// mean by a five-hundredth of the distance it travelled itself, which is
+// exactly the case a mean is worst at reporting.
+char voltFlag(int32_t lo, int32_t hi);
+char currFlag(int32_t lo, int32_t hi);
 
 // Microvolts as millivolts, nanoamps as microamps: one decimal below 1000 of
 // the printed unit, none above. `have` false renders "--".

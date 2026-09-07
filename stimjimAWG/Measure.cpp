@@ -74,6 +74,13 @@ char* putCenti(char* p, int32_t centi, bool neg) {
   return p;
 }
 
+bool accumRange(const Accum& a, int16_t& lo, int16_t& hi) {
+  if (a.n == 0) return false;
+  lo = a.mn;
+  hi = a.mx;
+  return true;
+}
+
 // ADC window `nr` reads need: the conversions themselves plus the margin
 // before the next latch starts programming the DAC.
 static inline uint32_t windowCyc(uint8_t nr, const Geometry& g) {
@@ -250,6 +257,18 @@ static void planCompile(Plan& pl, uint8_t slot, const TrainDef& def, const Geome
 // two-point plan costs a fraction of what zeroing all ten did.
 static inline void planResetResults(Plan& pl) {
   memset(pl.acc, 0, (size_t)pl.nPoints * sizeof pl.acc[0]);
+  // The extremes cannot start at 0 the way the sums do -- 0 is an ordinary
+  // reading, and a channel whose codes are all positive would keep a minimum of
+  // 0 for ever. Seeding them inverted makes the ISR's two comparisons enough,
+  // with no first-sample branch; accumRange gates on n, so the sentinels are
+  // never read as data. This runs in loop() context (housekeep/warmPlan), and
+  // in the arm only on the fallback path that compiles in place.
+  for (uint8_t i = 0; i < pl.nPoints; i++)
+    for (uint8_t ch = 0; ch < 2; ch++)
+      for (uint8_t ln = 0; ln < 2; ln++) {
+        pl.acc[i][ch][ln].mn = INT16_MAX;
+        pl.acc[i][ch][ln].mx = INT16_MIN;
+      }
   pl.next       = 0;
   pl.envSkipped = 0;
 }
@@ -483,6 +502,8 @@ void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15) {
       a.n++;
       a.sum   += v;
       a.sumsq += (int32_t)v * v;           // int16 squared fits int32
+      if (v < a.mn) a.mn = v;              // two compares: what catches a single
+      if (v > a.mx) a.mx = v;              // excursion the mean averages away
       raw[ch][ln] = v;
       valid |= (uint8_t)(1u << (ch * 2 + ln));
     }
@@ -562,6 +583,12 @@ static inline char* fieldRaw(char* p, bool have, int16_t raw, uint8_t ch, uint8_
   if (!have) return p;
   const int64_t v = (((int64_t)raw << 16) - adcOffsetQ16[ch]) * centiScale(line);
   return putCenti(p, q16RoundDiv(v), v < 0);
+}
+
+// One extreme of an MSUM/MRANGE line: a single raw code through the same
+// calibrated fixed-point path as everything else, NUL-terminated for a printf.
+static inline void fieldCode(char* b, bool have, int16_t raw, uint8_t ch, uint8_t line) {
+  *fieldRaw(b, have, raw, ch, line) = '\0';
 }
 
 // The mean field of an MSUM line, straight from the integer sums: the Q16
@@ -728,8 +755,17 @@ void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out)
         const double mean = toPhysD(meanRaw, ch, ln) * 1000.0;
         const double se   = (a.n >= 2)
                           ? sdPhys(sdRaw, ln) * 1000.0 / sqrt((double)a.n) : 0.0;
-        if (ln == 0) { r.nV = a.n; r.uV = (int32_t)llround(mean); r.seUV = (uint32_t)llround(se); }
-        else         { r.nI = a.n; r.nA = (int32_t)llround(mean); r.seNA = (uint32_t)llround(se); }
+        // The extremes go through the same conversion as the mean, so the panel
+        // can flag a reading that reached a hardware limit even once.
+        const int32_t lo = (int32_t)llround(toPhysD((double)a.mn, ch, ln) * 1000.0);
+        const int32_t hi = (int32_t)llround(toPhysD((double)a.mx, ch, ln) * 1000.0);
+        if (ln == 0) {
+          r.nV = a.n; r.uV = (int32_t)llround(mean); r.seUV = (uint32_t)llround(se);
+          r.uVmin = lo; r.uVmax = hi;
+        } else {
+          r.nI = a.n; r.nA = (int32_t)llround(mean); r.seNA = (uint32_t)llround(se);
+          r.nAmin = lo; r.nAmax = hi;
+        }
         if (a.n > out.nMax) out.nMax = a.n;
       }
     }
@@ -772,6 +808,21 @@ bool printSummary(uint8_t eng, uint8_t slot) {
     Serial.printf("MSUM,%u,%lu,%u,%s,%s,%s,%s,%s,%s,%s,%s\n",
                   p.slot, (unsigned long)n, p.label[i],
                   f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+    // The extremes, in the same field order and units, as a record of their
+    // own rather than four more MSUM fields: a host that parses MSUM by field
+    // count keeps working, and one that wants the range asks for MRANGE.
+    char g[8][16];
+    for (uint8_t ch = 0; ch < 2; ch++)
+      for (uint8_t ln = 0; ln < 2; ln++) {
+        const Accum& a = p.acc[i][ch][ln];
+        int16_t lo, hi;
+        const bool have = accumRange(a, lo, hi);
+        fieldCode(g[ch * 4 + ln * 2],     have, lo, ch, ln);
+        fieldCode(g[ch * 4 + ln * 2 + 1], have, hi, ch, ln);
+      }
+    Serial.printf("MRANGE,%u,%lu,%u,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                  p.slot, (unsigned long)n, p.label[i],
+                  g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
     if (p.skipMask & (1u << i))
       Serial.printf("# MSUM point %u: needs %lu us, only %lu us free — not measured\n",
                     p.label[i],

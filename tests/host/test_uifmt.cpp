@@ -139,14 +139,23 @@ static void testVoltCurrFields() {
 
 static void testLimitFlags() {
   // A reading at the driver IC's ceiling or at the current pump's design limit
-  // is marked, whichever sign it has, and nothing below it is.
-  CHECK_EQ(UiFmt::voltFlag(8999999), ' ');
-  CHECK_EQ(UiFmt::voltFlag(9000000), '*');
-  CHECK_EQ(UiFmt::voltFlag(-9000000), '*');
-  CHECK_EQ(UiFmt::voltFlag(14988000), '*');
-  CHECK_EQ(UiFmt::currFlag(2999999), ' ');
-  CHECK_EQ(UiFmt::currFlag(3000000), '*');
-  CHECK_EQ(UiFmt::currFlag(-3333000), '*');
+  // is marked, whichever sign it has, and nothing below it is. The arguments
+  // are the extremes of the train, so a range entirely below the limit is
+  // clean and one that touches it at either end is marked.
+  CHECK_EQ(UiFmt::voltFlag(-8999999, 8999999), ' ');
+  CHECK_EQ(UiFmt::voltFlag(0, 9000000), '*');
+  CHECK_EQ(UiFmt::voltFlag(-9000000, 0), '*');
+  CHECK_EQ(UiFmt::voltFlag(100, 14988000), '*');
+  CHECK_EQ(UiFmt::currFlag(-2999999, 2999999), ' ');
+  CHECK_EQ(UiFmt::currFlag(0, 3000000), '*');
+  CHECK_EQ(UiFmt::currFlag(-3333000, 0), '*');
+  // The point of using extremes rather than the mean: one excursion in five
+  // hundred barely moves a mean, so a mean-based flag would miss it. Here the
+  // mean of such a train would be about 4 V and the peak 12 V.
+  CHECK_EQ(UiFmt::voltFlag(3980000, 12000000), '*');
+  // A single reading (min == max) still works.
+  CHECK_EQ(UiFmt::voltFlag(9500000, 9500000), '*');
+  CHECK_EQ(UiFmt::voltFlag(1000, 1000), ' ');
 }
 
 static void testIso() {
