@@ -26,8 +26,11 @@
 //                        single read fits the gap.
 //
 //    The ISR accumulates raw ADC codes only (n, sum, sum of squares — integer
-//    adds). The channel offset and the unit scale are floats, so both are
-//    applied in loop context when the summary is formatted.
+//    adds). The offset correction and the unit scale are applied in loop
+//    context, when a row or the summary is formatted, and in fixed point: both
+//    scales are exact hundredths of their unit and the calibration offset is
+//    cached in Q16, so no row conversion goes through newlib's `_dtoa_r`
+//    (`BENCHFMT` times what is left).
 //
 //    planBuild/peakSampleIndex/accumStats carry no Arduino dependency and are
 //    host-tested by tests/host/test_measure.cpp.
@@ -36,6 +39,7 @@
 #define STIMJIMAWG_MEASURE_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "WaveformDef.h"
 
 namespace Measure {
@@ -157,6 +161,18 @@ bool accumStats(const Accum& a, double& mean, double& sd);
 
 void begin();
 void poll();   // deferred start notes, then the single drain of the MDATA ring
+
+// Re-read Stimjim.adcOffset10[] into the fixed-point offset the row formatting
+// works from. begin() calls it; so must anything that recalibrates the offsets
+// (`B`, `C`), because the cached copy is what every MDATA row, log row and
+// MSUM mean is corrected by.
+void noteOffsets();
+
+// `BENCHFMT`: format one synthetic record exactly as poll() does — four field
+// conversions plus the row — into `row`, and return its length. Nothing is
+// printed and nothing reaches the card, so timing this in a loop measures the
+// conversion path and nothing else. `i` varies the record.
+uint16_t benchFormatRow(char* row, size_t n, uint32_t i);
 
 // Each engine holds two plans, and the arm swaps between them rather than
 // rewriting one in place: the player ISR only ever reads the live buffer, so

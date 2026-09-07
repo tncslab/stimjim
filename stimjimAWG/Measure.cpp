@@ -281,6 +281,7 @@ static volatile uint32_t rDropped = 0;
 
 void begin() {
   memset(plan_, 0, sizeof plan_);
+  noteOffsets();
 }
 
 bool hasPlan(uint8_t eng) { return plan_[eng][live[eng]].on; }
@@ -467,9 +468,6 @@ void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15) {
 static inline double toPhysD(double raw, uint8_t ch, uint8_t line) {
   return (raw - Stimjim.adcOffset10[ch]) * (line ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
 }
-static inline double toPhys(int16_t raw, uint8_t ch, uint8_t line) {
-  return toPhysD((double)raw, ch, line);
-}
 // The offset cancels in a difference, so a spread converts with the scale alone.
 static inline double sdPhys(double sdRaw, uint8_t line) {
   return sdRaw * (line ? MICROAMPS_PER_ADC : MILLIVOLTS_PER_ADC);
@@ -479,10 +477,79 @@ static inline uint32_t cycToUsUp(uint32_t cyc) {
   return (uint32_t)((cyc + SJ_CYC_PER_US - 1) / SJ_CYC_PER_US);
 }
 
-// One numeric field of an MSUM/MDATA record, empty where nothing was measured.
-static inline void field(char* b, size_t n, bool have, double v) {
-  if (have) snprintf(b, n, "%.2f", v);
-  else      b[0] = '\0';
+// ------------------------------------------------- fixed-point row formatting
+//
+// Every row and every summary field used to be a `snprintf("%.2f")`. The Teensy
+// 3.5 links full newlib (no nano.specs), so that goes through `_dtoa_r`: double
+// software arithmetic plus a `_Bigint` allocation, per field. Nothing a
+// waveform can see -- all of it runs in loop() context and the players preempt
+// it unconditionally -- but it is what bounds the sustainable row rate, and
+// through that the headroom of the 128-entry MDATA ring (docs/timing.md §6).
+//
+// The conversion is exact in integers, so nothing is lost by doing it there.
+// Both scales are exact hundredths of their unit -- 2.44 mV and 0.85 uA per
+// code -- and the only non-integer input is the channel's calibration offset,
+// which is folded into Q16 once per calibration. `field` then prints the
+// hundredths as `%ld.%02lu`, and the output bytes are the same. The one place
+// the two can differ is a value landing exactly on a .005 boundary: printf
+// rounds half to even on the binary double, this rounds half away from zero, so
+// such a value can differ by one in the last digit.
+#define SJ_CENTI_MV_PER_ADC 244   // MILLIVOLTS_PER_ADC * 100, exact
+#define SJ_CENTI_UA_PER_ADC 85    // MICROAMPS_PER_ADC  * 100, exact
+
+static int32_t adcOffsetQ16[2] = {0, 0};
+
+void noteOffsets() {
+  for (uint8_t ch = 0; ch < 2; ch++)
+    adcOffsetQ16[ch] = (int32_t)llround((double)Stimjim.adcOffset10[ch] * 65536.0);
+}
+
+static inline int32_t centiScale(uint8_t line) {
+  return line ? SJ_CENTI_UA_PER_ADC : SJ_CENTI_MV_PER_ADC;
+}
+
+// Round half away from zero at the Q16 boundary. An arithmetic shift would floor
+// instead, which is the wrong direction for every negative reading.
+static inline int32_t q16RoundDiv(int64_t v) {
+  return (int32_t)((v >= 0) ? ((v + 32768) / 65536) : -((-v + 32768) / 65536));
+}
+
+// Hundredths as text. `neg` carries the sign of the *unrounded* value, so a
+// small negative reading still prints as -0.00 the way the `%.2f` it replaces
+// did.
+static inline void putCenti(char* b, size_t n, int32_t centi, bool neg) {
+  const uint32_t a = (centi < 0) ? (uint32_t)(-(int64_t)centi) : (uint32_t)centi;
+  snprintf(b, n, "%s%lu.%02lu", (neg || centi < 0) ? "-" : "",
+           (unsigned long)(a / 100u), (unsigned long)(a % 100u));
+}
+
+// One numeric field of an MDATA record: a single raw code, offset-corrected and
+// scaled. Empty where the line was not read.
+static inline void fieldRaw(char* b, size_t n, bool have, int16_t raw,
+                            uint8_t ch, uint8_t line) {
+  if (!have) { b[0] = '\0'; return; }
+  const int64_t v = (((int64_t)raw << 16) - adcOffsetQ16[ch]) * centiScale(line);
+  putCenti(b, n, q16RoundDiv(v), v < 0);
+}
+
+// The mean field of an MSUM line, straight from the integer sums: the Q16
+// division by n happens first, so the multiply that follows stays four orders
+// below the int64 ceiling even at millions of repetitions, and the result is
+// exact where the double quotient was not.
+static inline void fieldMean(char* b, size_t n, bool have, const Accum& a,
+                             uint8_t ch, uint8_t line) {
+  if (!have) { b[0] = '\0'; return; }
+  const int64_t q = ((int64_t)a.sum << 16) / (int64_t)a.n;
+  const int64_t v = (q - adcOffsetQ16[ch]) * centiScale(line);
+  putCenti(b, n, q16RoundDiv(v), v < 0);
+}
+
+// The spread field. A standard deviation comes out of a sqrt, so this is the one
+// field that still multiplies in floating point — but it no longer prints
+// through `_dtoa_r`, and a spread is never negative.
+static inline void fieldSpread(char* b, size_t n, bool have, double sdRaw, uint8_t line) {
+  if (!have) { b[0] = '\0'; return; }
+  putCenti(b, n, (int32_t)llround(sdRaw * (double)centiScale(line)), false);
 }
 
 // Runs once per armed plan, before the ring is drained in the same poll() call
@@ -523,6 +590,22 @@ static void printNote(uint8_t eng) {
                   "channel has a different frequency or phase\n", p.slot, p.peakChannel);
 }
 
+// The four physical fields of one record, in the order the row prints them.
+static void recFields(const Rec& r, char f[4][16]) {
+  for (uint8_t ch = 0; ch < 2; ch++)
+    for (uint8_t ln = 0; ln < 2; ln++)
+      fieldRaw(f[ch * 2 + ln], 16, (r.valid >> (ch * 2 + ln)) & 1, r.raw[ch][ln], ch, ln);
+}
+
+// The CSV row itself. Microseconds since boot outgrow 32 bits after 71 minutes,
+// so the timestamp is rendered by hand rather than trusting printf's %llu.
+static void recRow(char* row, size_t n, const Rec& r, char f[4][16]) {
+  char ts[24];
+  Protocol::u64str(SJ_CYC_TO_US(r.tCyc), ts);
+  snprintf(row, n, "%s,%u,%lu,%u,%s,%s,%s,%s",
+           ts, r.slot, (unsigned long)r.pulse, r.label, f[0], f[1], f[2], f[3]);
+}
+
 void poll() {
   for (uint8_t e = 0; e < 2; e++)
     if (notePending[e]) { notePending[e] = false; printNote(e); }
@@ -530,21 +613,13 @@ void poll() {
   while (rTail != rHead) {
     const Rec& r = ring[rTail];
     char f[4][16];
-    for (uint8_t ch = 0; ch < 2; ch++)
-      for (uint8_t ln = 0; ln < 2; ln++) {
-        const bool have = (r.valid >> (ch * 2 + ln)) & 1;
-        field(f[ch * 2 + ln], sizeof f[0], have, have ? toPhys(r.raw[ch][ln], ch, ln) : 0.0);
-      }
+    recFields(r, f);
     if (r.report & 1)
       Serial.printf("MDATA,%u,%lu,%u,%s,%s,%s,%s\n", r.slot, (unsigned long)r.pulse,
                     r.label, f[0], f[1], f[2], f[3]);
     if (r.report & 2) {
-      // Microseconds since boot outgrow 32 bits after 71 minutes, so the
-      // timestamp is rendered by hand rather than trusting printf's %llu.
-      char ts[24], row[144];
-      Protocol::u64str(SJ_CYC_TO_US(r.tCyc), ts);
-      snprintf(row, sizeof row, "%s,%u,%lu,%u,%s,%s,%s,%s",
-               ts, r.slot, (unsigned long)r.pulse, r.label, f[0], f[1], f[2], f[3]);
+      char row[144];
+      recRow(row, sizeof row, r, f);
       SdLog::writeRow(row);
     }
     rTail = (uint16_t)((rTail + 1) & (SJ_MDATA_RING - 1));
@@ -557,6 +632,25 @@ void poll() {
                   "(the host is not reading fast enough)\n", (unsigned long)rDropped);
     rDropped = 0;
   }
+}
+
+uint16_t benchFormatRow(char* row, size_t n, uint32_t i) {
+  Rec r;
+  r.tCyc   = (uint64_t)i * 1000u * SJ_CYC_PER_US;   // a millisecond apart, so the
+  r.pulse  = i;                                     // timestamp grows past 32 bits
+  r.label  = (uint16_t)(i % 10u);
+  r.slot   = 0;
+  r.report = 3;
+  r.valid  = 0x0F;                                  // all four lines read
+  // Codes swept across the converter range rather than repeated, so no reading
+  // is formatted twice and nothing can be hoisted out of the bench loop.
+  for (uint8_t ch = 0; ch < 2; ch++)
+    for (uint8_t ln = 0; ln < 2; ln++)
+      r.raw[ch][ln] = (int16_t)((int32_t)((i * 37u + ch * 11u + ln * 5u) % 8191u) - 4096);
+  char f[4][16];
+  recFields(r, f);
+  recRow(row, n, r, f);
+  return (uint16_t)strlen(row);
 }
 
 void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out) {
@@ -622,11 +716,13 @@ bool printSummary(uint8_t eng, uint8_t slot) {
       for (uint8_t ln = 0; ln < 2; ln++) {
         const Accum& a = p.acc[i][ch][ln];
         double meanRaw, sdRaw;
+        // accumStats still supplies the spread, which comes out of a sqrt; the
+        // mean is formatted straight from the integer sums instead.
         const bool have = accumStats(a, meanRaw, sdRaw);
-        // mean carries the channel offset; the spread does not (it cancels)
-        field(f[ch * 4 + ln * 2],     sizeof f[0], have,
-              have ? toPhysD(meanRaw, ch, ln) : 0.0);
-        field(f[ch * 4 + ln * 2 + 1], sizeof f[0], have && a.n >= 2, sdPhys(sdRaw, ln));
+        (void)meanRaw;
+        // The mean carries the channel offset; the spread does not (it cancels).
+        fieldMean(f[ch * 4 + ln * 2],     sizeof f[0], have, a, ch, ln);
+        fieldSpread(f[ch * 4 + ln * 2 + 1], sizeof f[0], have && a.n >= 2, sdRaw, ln);
         if (have && a.n > n) n = a.n;
       }
     Serial.printf("MSUM,%u,%lu,%u,%s,%s,%s,%s,%s,%s,%s,%s\n",

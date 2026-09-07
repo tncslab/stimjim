@@ -6,11 +6,13 @@ queried, and timed end-to-end against STAT), the runtime timing budget (CAL:
 query, set, the invariant refusals, CALDEF), the per-slot ramp sample interval
 (DT), in-train measurement (MSUM/MDATA, the refusal of a point whose ADC window
 does not fit, and the rotation that measures it anyway), SD logging with
-length-framed retrieval over the serial port, and the OLED framebuffer in each
-of its three views. Waveform shape and microsecond-accurate delay timing need
-the scope -- see capture.py.
+length-framed retrieval over the serial port, the wall clock (CLK), the display
+pages (PAGE) and the OLED framebuffer on each of them. Waveform shape and
+microsecond-accurate delay timing need the scope -- see capture.py.
 
-The SD section is skipped, with a note, when no card is in the socket.
+The SD section is skipped, with a note, when no card is in the socket. Nothing
+here needs a panel: SCREEN renders into the framebuffer whether or not one is
+connected, so a headless board passes the whole suite.
 
     python smoke.py [COM4] [--screens DIR]
 
@@ -50,7 +52,8 @@ def screen(sj, name, outdir):
     art = [l for l in lines if l.startswith("|")]
     # The firmware also reports the composed row text, so a capture is readable
     # without decoding the bitmap font.
-    text = [l for l in lines if l.startswith("# row") or l.startswith("# bar")]
+    text = [l for l in lines if l.startswith("# row") or l.startswith("# bar")
+            or l.startswith("# page")]
     if not check(len(art) == 32 and lines[-1] == "OK", f"SCREEN {name}: 32 rows + OK"):
         print("   ", lines[:4])
         return None
@@ -60,7 +63,8 @@ def screen(sj, name, outdir):
         p = pathlib.Path(outdir) / f"screen-{name}.txt"
         p.write_text("\n".join(text + art) + "\n", encoding="ascii")
         print(f"       -> {p}")
-    return art
+    # The composed text, not the pixels: that is what a layout check reads.
+    return text
 
 
 def run_train(sj, cmd, wait):
@@ -114,6 +118,29 @@ def stat(sj):
     v = [int(x) for x in f[1:]]
     return {"slot0": v[0], "n0": v[1], "el0": v[2], "dur0": v[3],
             "slot1": v[4], "n1": v[5], "el1": v[6], "dur1": v[7]}
+
+
+def page(sj, quiet=0.3):
+    """Current page as (index, count, name), from the PAGE status line."""
+    f = sj.cmd1("PAGE?", quiet=quiet).split(",")
+    assert f[0] == "PAGE", f
+    return int(f[1]), int(f[2]), f[3]
+
+
+def page_next(sj):
+    """Advance one page -- what the page button does -- and report the new state."""
+    f = sj.cmd1("PAGE", quiet=0.3).split(",")
+    assert f[0] == "PAGE", f
+    return int(f[1]), int(f[2]), f[3]
+
+
+def clk(sj):
+    """CLK? as (unix, ms, us_since_boot, src)."""
+    lines = sj.cmd("CLK?", quiet=0.3, limit=4)
+    rec = [l for l in lines if l.startswith("CLK,")]
+    assert rec, lines
+    f = rec[0].split(",")
+    return int(f[1]), int(f[2]), int(f[3]), f[4]
 
 
 def main():
@@ -222,8 +249,25 @@ def main():
         eq(sj.cmd1("S8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500"),
            "S8,0,1,10000,200000;1000,0,0;2000,0,0;3000,0,500", "S keeps 0-duration steps")
 
-        print("\n[screens: browse view]")
-        screen(sj, "1-browse", a.screens)
+        print("\n[screens: status page, and the page walk]")
+        idx, count, name = page(sj)
+        eq(idx, 0, "boot page is 0")
+        eq(name, "STATUS", "page 0 is STATUS")
+        eq(count, 2, "with no train finished there are two pages: STATUS and SYSTEM")
+        first = screen(sj, "1-status", a.screens) or []
+        # SCREEN works with or without a panel -- the framebuffer is composed
+        # either way -- so the suite runs headless. Which of the two this is
+        # goes in the notes rather than in a check.
+        pline = [l for l in first if l.startswith("# page")]
+        check(bool(pline), f"SCREEN names the page and the panel state: {pline}")
+        if pline and "panel absent" in pline[0]:
+            notes.append("no OLED panel connected: SCREEN rendered the framebuffer only")
+        # Advancing wraps, and every page has to render.
+        eq(page_next(sj)[2], "SYSTEM", "PAGE advances to SYSTEM")
+        screen(sj, "2-system", a.screens)
+        eq(page_next(sj)[0], 0, "PAGE wraps back to the first page")
+        check(sj.cmd1(f"PAGE,{count}").startswith("ERR"), "PAGE past the end is refused")
+        eq(page(sj)[0], 0, "a refused PAGE leaves the page alone")
 
         print("\n[timed delay, end to end]")
         # 1.5 s delay then a 0.5 s train of 2 ms pulses every 10 ms on channel 0
@@ -292,6 +336,28 @@ def main():
             check(1000.0 < float(f0[4]) < 6000.0, f"stage 0 V0 plausible: {f0[4]}")
             check(float(msum[1].split(",")[4]) < -1000.0,
                   "stage 1 V0 is the negative phase")
+
+            # The panel reads the same accumulators, so the RESULT pages appear
+            # as soon as a measured train completes and the firmware jumps to
+            # the first of them.
+            idx, count, name = page(sj)
+            eq(name, "RESULT", "a measured completion jumps the panel to a RESULT page")
+            eq(idx, 1, "... to the first one")
+            eq(count, 4, "two measurement points give STATUS + 2 RESULT + SYSTEM")
+            rowtext = [l for l in (screen(sj, "4-result", a.screens) or [])
+                       if l.startswith("# row")]
+            check(len(rowtext) == 4, f"RESULT page composes four rows: {len(rowtext)}")
+            check(any(l.startswith('# row1: "V') for l in rowtext), "row 1 is the V row")
+            check(any(l.startswith('# row2: "I') for l in rowtext), "row 2 is the I row")
+            check(any(l.startswith('# row3: "R') for l in rowtext), "row 3 is the R row")
+            # The panel prints millivolts to one decimal below 1000 and none
+            # above, so a value matching MSUM to a few counts is what to expect.
+            m = re.search(r'row1: "V'+r"\s*(-?[0-9.]+)", "".join(rowtext))
+            if check(m is not None, "the V row carries a number for channel 0"):
+                check(abs(float(m.group(1)) - float(f0[4])) < 1.0,
+                      f"RESULT V0 {m.group(1)} agrees with MSUM {f0[4]}")
+            eq(page_next(sj)[0], 2, "the second measurement point is the next page")
+            screen(sj, "5-result2", a.screens)
 
         # report bit 0 streams one MDATA line per point per pulse.
         sj.cmd1("MEAS4,3,3,0,-1,1")
@@ -429,6 +495,23 @@ def main():
         time.sleep(0.3)
         screen(sj, "3-running", a.screens)
         sj.cmd("T-1", quiet=0.3)
+
+        print("\n[clock]")
+        sec0, ms0, us0, src0 = clk(sj)
+        check(src0 in ("build", "batt", "host"), f"CLK reports a source: {src0}")
+        check(us0 > 0, "CLK carries the microsecond timebase, not only the RTC")
+        iso = [l for l in sj.cmd("CLK?", quiet=0.3, limit=4) if l.startswith("# clock:")]
+        check(bool(iso), f"CLK? explains its source: {iso}")
+        # Setting it moves the source to host and the reading to what was sent;
+        # the microsecond column is monotonic across the change, because it is a
+        # different clock and nothing here touches it.
+        host_unix = int(time.time())
+        sj.cmd("CLK,%d,250" % host_unix, quiet=0.3)
+        sec1, ms1, us1, src1 = clk(sj)
+        eq(src1, "host", "CLK,<unix> moves the source to host")
+        check(abs(sec1 - host_unix) <= 2, f"the RTC now reads what was sent: {sec1} vs {host_unix}")
+        check(us1 > us0, "the microsecond timebase kept running across the set")
+        check(sj.cmd1("CLK,%d,1000" % host_unix).startswith("ERR"), "ms > 999 refused")
 
         print("\n[cleanup]")
         sj.cmd("T-1")

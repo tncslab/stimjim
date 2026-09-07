@@ -5,8 +5,8 @@ Stimjim is a two-channel current and voltage stimulator for neural tissue. Each 
 isolated supply, switches between voltage and current output, and measures what it actually
 delivered. This repository holds the hardware design and two firmwares: the original
 `stimjimPulser`, and **`stimjimAWG`**, an arbitrary-waveform firmware that adds ramps, sine
-bursts, envelopes, per-slot trigger delays, in-train measurement with SD logging, and a runtime
-timing calibration. This page is a quick start for `stimjimAWG`; the full command reference is
+bursts, envelopes, per-slot trigger delays, in-train measurement with SD logging, a result
+display with three front-panel buttons, a wall clock, and a runtime timing calibration. This page is a quick start for `stimjimAWG`; the full command reference is
 [docs/serial-protocol.md](docs/serial-protocol.md).
 
 ![Stimjim picture](images/photo.png)
@@ -53,7 +53,7 @@ and send `IDN`:
 
 ```
 IDN
-IDN,stimjimAWG,Teensy3.5,fw=0.7.0,proto=1
+IDN,stimjimAWG,Teensy3.5,fw=0.8.0,proto=1
 # build: Teensy3.5, F_CPU=120 MHz, fastio=registers, timer=raw-PIT, sd=yes
 # engine: PIT channels 0/1, K_RELOAD=112 cycles, cal=default
 ```
@@ -145,6 +145,61 @@ the gap is the sample interval, so in-train measurement needs `DT` raised above 
 default.
 [figs/stimjim-timing-measurement.png](figs/stimjim-timing-measurement.png) shows the arithmetic.
 
+## The panel, the buttons and the clock
+
+**The box runs headless.** With no OLED and no SD card it boots, plays, triggers and measures the
+same; it says so at boot and nothing later waits on either. The panel is probed once, at boot, and
+never again on its own — send `SCREEN` after plugging one in.
+
+**Three buttons.** Btn0 (pin 17) walks the display pages. Btn1 (pin 39) and Btn2 (pin 16) fire the
+routes of trigger inputs 0 and 1, so a train configured with `TRIG` can be started by hand. A
+button with nothing routed says so instead of doing nothing quietly. One press is one train,
+whatever the contact does: the firmware arms a button once and re-arms it only after the pin has
+read low for 25 ms.
+
+**Pages**, cycled by the button or by `PAGE` (and `PAGE,<n>` / `PAGE?` over serial):
+
+- `STATUS` — a running train's slot, progress bar and pulse count; when both engines are idle,
+  what each trigger button would fire and what the log is doing.
+- `RESULT` — one page per measurement point of the last completed train, up to four. A
+  completion that measured something jumps here by itself.
+- `SYSTEM` — board, firmware, card and panel presence, uptime, and the clock with its source.
+
+A `RESULT` page is three rows, channel 0 left and channel 1 right:
+
+```
+#7 T n=500 s0 1/2
+V    100.2   -99.8 mV
+I     99.5  -100.0 uA
+R    1.01k   1.00k
+```
+
+The resistance is `V/I` printed to the precision the measurement supports and no further: the
+standard errors of the two means, floored at 1 % for the ADC path's uncharacterised gain accuracy,
+combined in quadrature, then rounded to that window and capped at three significant figures. A
+short or noisy train loses digits by itself. `open` replaces the number when the current is not
+distinguishable from zero, and `--` when a line was not measured or when neither V nor I differs
+from zero. A `*` after a value means it may be the hardware talking rather than the load — 9 V
+or more on the voltage row (the output driver's ceiling) or 3 mA or more on the current row (the
+current pump's design limit, above which the DAC conversion is known bad).
+
+**The clock is a label, never an authority.** `CLK?` reports the wall clock, the microsecond count
+since boot, and where the epoch came from:
+
+```
+CLK?
+CLK,1757255525,123,41234567,build
+# clock: 2025-09-07T14:32:05.123Z src=build (the binary's compile time in the BUILD HOST's local zone ...)
+```
+
+`build` means nobody has set it: a Teensy 3.5 with no VBAT battery starts every power-up at the
+binary's compile time, in the *build host's local zone*. `CLK,<unix>[,<ms>]` sets it and the source
+becomes `host`. What actually anchors a log to a computer's log is not the RTC but the *pair* the
+reply carries: a host subtracts its own clock from it and keeps the offset against the log's
+microsecond column, which is exact. The log file writes the same pair as `# clock:` lines when it
+opens, before every train, and once a minute while rows are being written; the CSV columns are
+unchanged.
+
 ## Calibrate the timing to your board
 
 Every hardware timing budget the scheduler works from is runtime state, not a compiled constant:
@@ -172,8 +227,8 @@ and names the value that would have covered it. No oscilloscope is needed for th
 
 [tests/host/](tests/host/) holds host-side C++ tests of the parser, the measurement planner, the
 sample generator and the calibration validator — no board required. [tests/device/](tests/device/)
-talks to a real Stimjim over USB (`smoke.py`, and `bench_arm.py` for the arm cost that sizes the
-trigger latency) and, for the microsecond measurements, to a PicoScope (`capture.py`); its README
+talks to a real Stimjim over USB (`smoke.py`, which also captures every display page, and
+`bench_arm.py` for the arm cost that sizes the trigger latency) and, for the microsecond measurements, to a PicoScope (`capture.py`); its README
 documents the bench wiring.
 
 ## Where things are

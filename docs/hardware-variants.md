@@ -100,6 +100,44 @@ literal tuned for 120 MHz becomes five times shorter at 600 MHz:
   ~100 ns on any clock — comfortably above the AD5752's ~20 ns minimum;
 - the cycles→ns conversion in the `BENCH` printouts.
 
+## 3a. The real-time clock, and how the two families differ
+
+The RTC is the coarse clock only: nothing about a waveform, a deadline or a log timestamp depends
+on it (those all come from the DWT cycle counter). What differs between the families is its
+*epoch*, and the difference matters because it decides what a log's `# clock:` anchor and the
+`CLK?` `src` field are worth.
+
+*Teensy 3.5/3.6 (Kinetis K64/K66).* Seconds live in `RTC_TSR` with a 32768 Hz prescaler in
+`RTC_TPR` (about 30.5 us of readable resolution), backed by the **VBAT pin**. The core does two
+things at reset (`cores/teensy3/mk20dx128.c:1128-1155`):
+
+- if `RTC_SR_TIF` is set — an invalid time, which is what a power-up with no battery gives —
+  it sets the RTC from `__rtc_localtime` and writes a "known stale" flag `0x5A94C3A5` into the
+  VBAT register file at `0x4003E01C`;
+- if the reset came from the reset pin (which the Teensy Loader asserts right after an upload)
+  and that flag is set, it sets the RTC from `__rtc_localtime` again and clears the flag.
+
+`__rtc_localtime` is a linker `--defsym` the IDE or `arduino-cli` fills from `{extra.time.local}`
+(`boards.txt:1010`): **the build host's local time at compile, not UTC**. So with no battery every
+power-up starts the clock at the binary's compile time in that zone; with a battery fitted it is
+set once, at the first upload after the battery goes in, and then runs. The 32.768 kHz crystal is
+uncompensated — tens of ppm, so seconds per day. `rtc_compensate()` exists; calibrating it is
+not done here.
+
+`Clock::begin()` reads the stale flag to classify the source, and where the flag is clear it
+compares the reading against `__rtc_localtime` to tell a fresh upload from a battery-backed clock.
+That second half is a heuristic and is documented as one.
+
+*Teensy 4.x (i.MX RT1062).* The core does **not** use the compile time: if the SRTC is not running
+it starts it at 1546300800 = 2019-01-01T00:00:00Z (`cores/teensy4/startup.c:178-182`). Resolution
+is the same 32768 Hz, in `SNVS_HPRTCMR`/`SNVS_HPRTCLR` with 15 fractional bits. There is no stale
+flag, so a reading inside that first day is classified `build` and anything later `batt`.
+
+**The battery.** A CR2032 (or any 3 V cell) on VBAT is what makes the clock survive a power cycle.
+It is optional: without it the box still runs, `CLK?` reports `build`, and a host that sends `CLK`
+once per session gets `host` accuracy anyway. Fitting one is worth it for a box that logs to its
+own card with no host attached, because the FAT modification timestamps then become real.
+
 ## 4. What must be recalibrated, and how
 
 Everything in this list is a `CAL` parameter (protocol §4) whose default lives in `Config.h`

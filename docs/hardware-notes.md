@@ -61,7 +61,7 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
 | MISO | 12 | 8 | SPI0_SIN muxed per read (`SPI.setMISO`) |
 | Trigger input `INx` | 22 | 23 | BNC |
 | LED | 21 | 20 | |
-| Buttons | Btn0=17, Btn1=39, Btn2=16 | | RISING, no external debounce |
+| Buttons | Btn0=17, Btn1=39, Btn2=16 | | RISING, no external debounce (firmware arms once per press). Btn0 = next display page, Btn1 = fire input 0's trigger route, Btn2 = fire input 1's |
 | Display | SSD1306 128×32, I²C addr 0x3C on `Wire` | | future: taller display + rotary |
 
 **Known header bug** (`Stimjim.h:52-62`): `GPIO_1`…`GPIO_11` are *all* defined as pin 36
@@ -88,7 +88,14 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
 
 ## Known analog limitations (stimjimPulser.ino:26-31)
 
-- Amplitudes above **3000 µA are converted incorrectly** on the DAC.
+- Amplitudes above **3000 µA are converted incorrectly** on the DAC. The firmware warns at parse
+  time when a stage asks for more, and the OLED result pages mark a *measured* current of 3 mA or
+  more with `*` for the same reason.
+- The output driver saturates below the ±15 V the DAC span implies, so a measured output voltage
+  of 9 V or more is more likely the driver's ceiling than the amplitude that was requested. The
+  result pages mark those with `*` too. **9 V is a working threshold, not a measured limit:** it
+  has not been characterised on this board, and it lives in `UiFmt.h` as `SJ_UI_VLIMIT_UV` so a
+  measured figure can replace it.
 - Into a 10 kΩ load the output converges more slowly and measurements interfere with the load:
   use stages ≥ 100 µs and expect ~10 % error (1 kΩ loads are fine down to ~10 µs).
 

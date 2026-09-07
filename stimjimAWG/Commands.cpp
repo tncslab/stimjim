@@ -793,6 +793,7 @@ static void handleB() {
   if (Engine::anyActive()) { err("B", "calibration needs an idle engine — stop trains first"); return; }
   Stimjim.getAdcOffsets();         // grounds the outputs, ~2000 ADC reads
   FastIO::acquireBus();
+  Measure::noteOffsets();          // the row formatting works from a fixed-point copy
   modeShadow[0] = modeShadow[1] = 3;
   ok();                            // legacy printed nothing — see protocol §6
 }
@@ -803,6 +804,7 @@ static void handleC() {
   Stimjim.getCurrentOffsets();
   Stimjim.getVoltageOffsets();
   FastIO::acquireBus();
+  Measure::noteOffsets();
   modeShadow[0] = modeShadow[1] = 3;
   ok();
 }
@@ -1045,6 +1047,7 @@ static void benchList() {
   Serial.println("# BENCHMISO[,n]                alternating ch0/ch1 reads (MISO mux swap)");
   Serial.println("# BENCHCYC[,n]                 cycles64() overhead");
   Serial.println("# BENCHK[,n]                   K_RELOAD recalibration, residual stats");
+  Serial.println("# BENCHFMT[,n]                 one MDATA/log row's number formatting (row rate)");
   Serial.println("# BENCHARM,slot[,n]            Engine::startTrain cost (what CAL STARTLAT must cover)");
   Serial.println("# BENCHSETTLE,ch,code,dmax_us[,n]   ADC reading vs delay after a latch (CAL SETTLE)");
   Serial.println("# BENCHPIT,period_us,n[,preload_us]  PIT wake/latch jitter vs deadline");
@@ -1288,6 +1291,17 @@ static void benchDispatch(const char* sub, const char* args) {
     Serial.printf("BENCH,K,n=%lu,residual_cycles(min/med/max)=%ld/%ld/%ld,K_RELOAD=%lu\n",
                   (unsigned long)n, (long)mn, (long)med, (long)mx,
                   (unsigned long)Engine::kReloadCycles());
+    ok();
+  } else if (!strcmp(sub, "FMT")) {
+    // What one MDATA/log row costs to render: four field conversions plus the
+    // row itself, and nothing else -- no serial write, no card. It runs in
+    // loop() context like the real thing, so no waveform can see it; what it
+    // bounds is the sustainable row rate and through that the headroom of the
+    // 128-entry MDATA ring (docs/timing.md section 6).
+    uint32_t n = parseLongs(args, v, 1) ? (uint32_t)v[0] : 2000;
+    char row[144];
+    benchRun("FMT", n, [&row](uint32_t i) { (void)Measure::benchFormatRow(row, sizeof row, i); });
+    Serial.printf("# BENCHFMT: last row was %u bytes: %s\n", (unsigned)strlen(row), row);
     ok();
   } else if (!strcmp(sub, "ARM")) {
     benchArm(args);

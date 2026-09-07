@@ -4,9 +4,11 @@ Status: protocol version 1. Implemented: waveform definition and queries (`S`/`L
 `DELAY`, `DT`, `ENV`/`MEAS`), `T`/`U` playback of all three slot types with the `ENV` envelope,
 `TRIG`/`R` trigger routing, the immediate commands (`M`/`V`/`A`/`E`/`READ`, `B`/`C`/`D`),
 persistence (`P`), in-train measurement (`MEAS` execution with its `MSUM` summaries and
-`MDATA` stream), SD logging (`LOG`) with serial access to the card (the `SD` group), and
+`MDATA` stream), SD logging (`LOG`) with serial access to the card (the `SD` group), the wall
+clock (`CLK`), the display pages (`PAGE`), and
 `STAT`/`IDN`/`HELP`/`SCREEN`/`DUMP`/`BENCH`, and the runtime timing budget (`CAL`).
-**Not implemented:** the button menu editor.
+**Not implemented:** a button slot editor, and none is planned — a slot is defined over this
+protocol.
 See [awg-implementation-plan.md](awg-implementation-plan.md) for what remains,
 [timing.md](timing.md) for latency and CPU-occupancy figures gathered in one place, and
 [bench-wiring.md](bench-wiring.md) for the measurements that still need an oscilloscope. The legacy
@@ -557,10 +559,42 @@ no host attached, so the file carries:
 2. the `# columns:` names;
 3. a `# train:` block for every train that arms while the file is open, giving that slot's
    canonical `S`/`L`/`W` line plus its `ENV`/`MEAS` lines. This is what records configuration
-   changes made *after* the file was opened.
+   changes made *after* the file was opened;
+4. `# clock: <ISO 8601> src=<build|batt|host> us=<microseconds since boot>` anchor lines, written
+   when the file is opened, before every `# train:` block, and at most once a minute while rows
+   are being written.
 
-Auto names are `LOG0000.CSV` upwards, the lowest free index — the board has no clock, so the
-index is all that distinguishes runs, and it is never reused.
+**The CSV columns do not change and will not.** Host tools depend on their shape, and rendering a
+wall clock per row would add cost to exactly the path this phase set out to make cheaper. Any
+row's `us` maps to a wall clock through the nearest anchor above it, and the drift between two
+anchors is visible in the file rather than hidden inside it. What an anchor is worth is what its
+`src` field says it is — see `CLK` below.
+
+**The microsecond column cannot overflow, but it does have one requirement.** It is derived from a
+64-bit cycle count, which at 120 MHz wraps after about 4900 years. What can go wrong is the
+software extension: it detects a 32-bit wrap by comparing against the previous reading, so
+**something must read the timebase at least once every 2^32 cycles = 35.8 s**, or a wrap is missed
+and the column jumps back by that much. `loop()` guarantees it through the engine's own
+housekeeping, and the long-running card and serial loops (`SDLIST`, `SDGET`, the `MDATA` drain)
+call it explicitly for this reason. Nothing a host does can break the guarantee; it is recorded
+here because it is the one way the column can go wrong.
+
+**Rounding note (firmware 0.8.0).** The `V*_mV` and `I*_uA` fields are converted in fixed point
+rather than through `printf("%.2f")`, which takes newlib's `_dtoa_r` and its allocation out of the
+row path. Both scales are exact hundredths of their unit (2.44 mV and 0.85 uA per code) and the
+calibration offset is cached in Q16, so the conversion is exact and the output bytes are the same
+— with one systematic exception. Where the exact value lands on a `.005` boundary, the old code
+rounded the nearest *double* of a product involving the inexact 0.85 and the new code rounds the
+exact value half away from zero. The voltage column never differs. The current column does when the
+channel's calibration offset, which the library produces as a multiple of 0.01, has a hundredths
+value congruent to 10 modulo 20 — one offset in twenty. On such a board every reading of that
+line sits on a boundary and 37-70 per cent of rows differ by one in the last digit, always in
+favour of the new value. 0.01 uA is 1.2 per cent of one converter code.
+
+Auto names are `LOG0000.CSV` upwards, the lowest free index, never reused. The index and not the
+clock is what identifies a run: the RTC epoch may be a compile time (`CLK`, below), so a date-based
+name would promise more than it can keep. The date reaches the file two other ways instead — the
+FAT modification timestamp and the in-file anchor lines.
 
 ### The `SD` group — reading the card over the serial port
 
@@ -628,13 +662,49 @@ TRIG<t>?  → canonical line
   engine 1 about **7.5 µs** behind engine 0 (measured). Trains that must be sample-
   synchronous belong in one slot driving both channels (mode 1), not in two.
 
+### `CLK` — the wall clock and the anchor a log is tied by
+
+```
+CLK?              —  CLK,<unix>,<ms>,<us_since_boot>,<src>   plus one `#` ISO 8601 line
+CLK,<unix>[,<ms>] —  same record                             set, then report
+```
+
+**The reading is a label, never an authority.** The RTC counts 32768 Hz, so about 30.5 µs of
+readable resolution, and its crystal is uncompensated — tens of ppm is normal, which is seconds
+per day. Its *epoch* is worse: `<src>` says where it came from and is the field that decides
+whether the rest means anything.
+
+| `src` | What the epoch is |
+|---|---|
+| `build` | the binary's compile time, in the **build host's local zone**. On a Teensy 3.5 with no VBAT battery every power-up starts here (the core's `__rtc_localtime` defsym); on a Teensy 4.x the equivalent default is 2019-01-01T00:00:00Z. Right just after an upload, wrong by however long the binary has been in service. |
+| `batt` | running from VBAT since some earlier upload. The rate is fine, the epoch is whatever was set then — still local time if it came from an upload. |
+| `host` | a host sent `CLK` this session: UTC, good to about a millisecond. |
+
+The ISO 8601 line always renders as UTC, because the firmware knows no zone; a `build` reading is
+therefore local time wearing a `Z`, and the source token is the warning label. Distinguishing
+`build` from `batt` on a Kinetis board is a heuristic — the core's VBAT "known-stale" flag, and
+failing that the distance from the compile time — and is documented as one.
+
+**Why the reply carries two clocks.** `CLK?` reads the RTC and the 64-bit cycle counter back to
+back and reports both. That pair, not the RTC, is what anchors a log to a computer's log: a host
+subtracts its own clock from it, keeps the offset against the `timestamp_us` column, and bounds
+its own uncertainty by timing the round trip (USB CDC round trips on a Teensy are typically
+0.1—1 ms, so wall-clock anchoring is good to about a millisecond and everything finer comes from
+the microsecond column). A host that never sets the clock still gets a usable anchor this way.
+
+Setting the clock writes the sub-second fraction too, which the core's own `rtc_set()` discards.
+On a board whose source is not `build`, SD files also get real FAT modification timestamps; a
+`build` epoch is refused there, because a wrong file date is worse than none.
+
 ### Status and utility
 
 | Cmd | Reply |
 |---|---|
 | `STAT` | one line: `STAT,<slot0>,<n0>,<elapsed0_us>,<dur0_us>,<slot1>,<n1>,<elapsed1_us>,<dur1_us>` (idle engine: slot −1, zeros). Cheap for GUI polling. |
 | `IDN` | `IDN,<name>,<board>,fw=<x.y.z>,proto=1` followed by two `#` lines: `# build: <board>, F_CPU=<n> MHz, fastio=<registers\|Arduino-SPI>, timer=<raw-PIT\|IntervalTimer>, sd=<yes\|no>, hot=<RAM\|ITCM\|flash>` and `# engine: …, K_RELOAD=<n> cycles, cal=<default|custom>`. The same block is printed in the boot banner, so a session that attached after boot can still ask which backends the binary uses — that decides whether the timing constants in `Config.h` apply as written (see [hardware-variants.md](hardware-variants.md)); `cal` says whether they are still the ones the board runs on, or a hand-calibrated set (`CAL?`); `hot` says whether the arm and the player loop execute from RAM or from flash, which changes what `BENCHARM` reports (`SJ_CODE_IN_RAM`, [timing.md](timing.md) §7). |
-| `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
+| `SCREEN` | Renders the OLED now and prints its framebuffer as ASCII art: a `# SCREEN 128x32` header, a `# page <i>/<n> <name>, panel <present\|absent>` line, one `# row<r>: "..."` line per text row, then one `\|`-delimited line per pixel row (`#` = lit), then `OK`. It works with no panel connected — the framebuffer is composed either way — and it re-probes the bus first, so a panel plugged in after boot is picked up by sending `SCREEN` once. The panel cannot be photographed over a serial link, so this is how display changes get reviewed and regression-checked. |
+| `PAGE` | display page: bare `PAGE` advances one (the same action as the page button, wrapping at the end), `PAGE,<n>` selects one, `PAGE?` queries. All three reply `PAGE,<index>,<count>,<name>`, where `name` is `STATUS`, `RESULT` or `SYSTEM`. The page list is `STATUS`, then one `RESULT` page per measurement point of the last completed train (at most 4), then `SYSTEM`, so `count` grows and shrinks with what the last train measured. Paired with `SCREEN` this makes every page reviewable with no panel attached. |
+| `CLK` | the wall clock — see below. |
 | `HELP` | multi-line human command table with units and defaults, ends with `OK`. Bare `?` = alias. |
 | `DUMP` | session export: `#` header, one round-trippable line per non-default slot, non-default `ENV`/`MEAS` (S/L slots only — a `W` line carries its envelope), both `TRIG` lines, one `CAL` line per hand-calibrated timing budget, `OK`. Paste-back restores the configuration, `TRIG` and `CAL` lines included (they are real set-commands). |
 | `LOG` | SD logging: status / open / close — see above. |
@@ -656,6 +726,7 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 | `BENCHMISO[,n]` | alternating ch0/ch1 reads (MISO PORT-mux swap, bench-verify item 3) |
 | `BENCHCYC[,n]` | `cycles64()` overhead |
 | `BENCHK[,n]` | re-run the `K_RELOAD` self-calibration, print residual min/med/max (item 6) |
+| `BENCHFMT[,n]` | the number formatting of one `MDATA`/log row: four field conversions plus the row, with no serial write and no card. What it bounds is the sustainable row rate and through that the `MDATA` ring's headroom — never waveform timing |
 | `BENCHARM,slot[,n]` | `Engine::startTrain` on that slot — the arm cost `CAL STARTLAT` has to cover. The train is stopped again inside the same bus lock, so nothing plays and the outputs stay parked |
 | `BENCHSETTLE,ch,code,dmax_us[,n]` | the same DAC step latched over and over and read back at delays 0…`dmax_us`, so the delay at which the readings stop moving is `CAL SETTLE`. Drives the output — set the channel's mode first (`M<ch>,0`) and print a `WARN` |
 | `BENCHPIT,period_us,n[,preload_us]` | PIT wake (preload 0) or post-spin latch jitter vs absolute deadline, histogram in 0.5 µs bins |
@@ -719,6 +790,9 @@ route is for two stimuli that merely start together.
 | `ENV` | 0,0,0 (no ramp) |
 | `MEAS` | 3,3,auto-when (0 for S/L, 3 for W),-1 (all stages),0 (summary only),1 (rotate reads that do not fit) |
 | `READ` sample count | 16 |
+| Display page after boot | 0 (`STATUS`); a completion that measured something jumps to the first `RESULT` page |
+| Buttons | Btn0 (pin 17) next page, Btn1 (pin 39) fires input 0's route, Btn2 (pin 16) fires input 1's; 25 ms release before a button re-arms |
+| Clock | not set: `build` on both MCU families until a host sends `CLK` |
 | Triggers | both `TRIG<t>,3,-1,-1,0` (output marker) |
 | `R` third argument | 0 (trigger-input mode) |
 | Ramp sample interval | 20 µs (`SJ_TARGET_DT_US`); per slot via the `L` 7th header field or `DT` |

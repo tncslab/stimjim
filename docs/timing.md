@@ -255,8 +255,8 @@ What card latency *can* cost is measurement records. SD write latency is dominat
 own controller: typically well under a millisecond for a buffered block, with occasional stalls of
 tens of milliseconds — hundreds on cheap cards — during internal housekeeping. **Those figures are
 the general behaviour of SD cards, not a measurement on this board: there is no `BENCHSD`, and the
-write path has never been timed here.** The exposure is the ring's headroom — a stall costs records
-once it exceeds `128 / (measurement points per second)`, which is 64 ms at 2000 rows/s. An
+card write itself has never been timed here.** The exposure is the ring's headroom — a stall costs
+records once it exceeds `128 / (measurement points per second)`, which is 64 ms at 2000 rows/s. An
 overflow is never silent; it prints
 
 ```
@@ -267,8 +267,42 @@ Two card operations do block `loop()` for a long time: `SDINFO,1` walks the whol
 chain (seconds, and it is refused while a train runs), and `SDGET` streams a file over the serial
 port. Neither disturbs a waveform, for the reason above.
 
-**Content.** Log files are `LOG0000.CSV` upwards — the lowest free index, never reused, because
-the board has no clock — or a name given to `LOG1,<name>`. A file contains, in order:
+**What the row costs before it reaches the card.** `BENCHFMT,<n>` times exactly the
+per-row work `Measure::poll()` does — four field conversions plus the row itself — with no
+serial write and no card in the loop.
+
+**Neither firmware's figure has been taken yet: no board was attached when `BENCHFMT` was
+written.** Run `BENCHFMT,2000` on a 0.8.0 board and record it here; the 0.7.0 comparison needs a
+0.7.0 binary, so it is optional. What changed in the
+code is not in doubt: the Teensy 3.5 links full newlib (`teensy35.build.flags.libs` carries no
+`nano.specs`), so `%f` went through `_dtoa_r`, which does double software arithmetic and allocates
+`_Bigint` scratch, four times per row. The replacement is an integer multiply and a divide per
+field, because both unit scales are exact hundredths (2.44 mV and 0.85 uA per code) and the
+calibration offset is cached in Q16. The `MSUM` mean takes the same path from the integer sums;
+only the spread still multiplies in floating point, because it comes out of a `sqrt`.
+
+**The clock hierarchy, and the one rule that keeps it working.** Three clocks, three jobs:
+
+- **The cycle counter is the only fine clock.** `FastIO::cycles64()` extends the Cortex-M DWT
+  counter to 64 bits: 8.33 ns per tick at 120 MHz, an exact integer count per microsecond, and the
+  source of every waveform instant, every measurement deadline and the log's `timestamp_us`.
+- **It cannot overflow in service** — 2^64 cycles is about 4900 years — **but the software
+  extension has a deadline.** It detects a 32-bit wrap by comparing against the previous reading,
+  so something must call it at least once every 2^32 cycles = **35.8 s**, or a wrap is missed and
+  the timestamp jumps back by that much. `loop()` guarantees it through `Engine::poll()`, and the
+  long-running card and serial loops (`SdLog::list`, `SdLog::get`, `Measure::poll`) call it
+  explicitly for exactly this reason. This is the one way the microsecond column can go wrong.
+- **The RTC is a coarse label.** 32768 Hz, uncompensated crystal, and an epoch that is a compile
+  time until a host sets it. It never touches a waveform. See `CLK` in
+  [serial-protocol.md](serial-protocol.md) §4 and the RTC differences in
+  [hardware-variants.md](hardware-variants.md).
+- **The anchor ties them together.** `CLK?` reads the RTC and the cycle counter back to back; the
+  log writes the same pair as `# clock:` lines at file open, before each train and at most once a
+  minute while rows are written. A row's wall clock is its `us` mapped through the nearest anchor.
+
+**Content.** Log files are `LOG0000.CSV` upwards — the lowest free index, never reused — or a
+name given to `LOG1,<name>`. The index and not the clock is what identifies a run, because the RTC
+epoch may be a compile time. A file contains, in order:
 
 1. written when the file is opened: a header line (`# stimjimAWG log — fw=…, proto=…`), the `IDN`
    identity block, and the whole session configuration as the paste-back-able lines `DUMP` prints
@@ -279,9 +313,17 @@ the board has no clock — or a name given to `LOG1,<name>`. A file contains, in
    waveform line, its `ENV` line if non-default, and its `MEAS` line. This is what records
    configuration changes made after the file was opened, and what keeps a log self-describing when
    trains were fired by trigger edges with no host attached;
-4. one CSV row per measurement repetition, for slots whose `MEAS` `report` has bit 1 set (`+2`):
+4. `# clock: <ISO 8601> src=<build|batt|host> us=<since boot>` anchor lines, at file open, before
+   every `# train:` block and at most once a minute while rows are being written. The CSV columns
+   carry no wall clock; a row's `us` maps through the nearest anchor above it, and the drift
+   between two anchors is visible in the file rather than hidden inside it;
+5. one CSV row per measurement repetition, for slots whose `MEAS` `report` has bit 1 set (`+2`):
    `<timestamp_us>,<slot>,<pulse>,<point>,<V0_mV>,<I0_uA>,<V1_mV>,<I1_uA>`, timestamp in µs since
    boot. Lines that were not read are empty fields.
+
+Files this firmware creates also carry a real FAT modification timestamp, but only when the clock
+source is not `build`: a wrong file date is worse than none, because a host sorting by date would
+believe it.
 
 Nothing else goes to the card. Output samples are not dumped, and the persistent configuration
 lives in the EEPROM, not on the card. The socket sits under the instrument cover, so the whole

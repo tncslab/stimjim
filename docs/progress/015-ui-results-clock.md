@@ -1,0 +1,393 @@
+# 015 — the result display, the buttons, the clock, and a headless box
+
+This phase gave `stimjimAWG` four things an operator standing at the bench needs and a fifth the
+row path needed. The firmware now boots and runs with no OLED panel and no SD card attached, and
+says which of them it found. The panel carries a flat list of pages walked by one button and by a
+new `PAGE` command: a status page, up to four result pages showing the last completed train's
+per-point voltage, current and load resistance per channel, and a system page. The other two
+buttons fire the two trigger inputs' routes, as `stimjimPulser` wired them, with bounce suppressed
+by arming rather than by a lockout, so one press is one train whatever the contact does. A new
+`Clock` module reads and sets the RTC on both MCU families and reports where its epoch came from,
+because the epoch is a compile time until a host sets it; `CLK?` pairs the wall clock with the
+microsecond timebase, and the log file carries the same pair as `# clock:` anchor lines rather
+than changing its CSV columns. Finally the per-row number formatting moved from
+`snprintf("%.2f")` to fixed point, which takes newlib's `_dtoa_r` out of the path that bounds the
+sustainable row rate, and `BENCHFMT` was added to measure what is left. Firmware version is now
+0.8.0; the EEPROM image stays at v6 because nothing new needs persisting.
+
+Everything below was verified by compiling all four target configurations and running five host
+suites. **Nothing in this phase has run on silicon** — no board was attached to the machine it was
+written on — so every claim about behaviour on hardware is a code claim, and the two placeholder
+figures say so.
+
+
+## 1. What was built, and why each choice
+
+### 1.1 The display is what made a missing panel expensive
+
+`Adafruit_SSD1306::begin()` (2.5.17, `Adafruit_SSD1306.cpp:496-638`) returns `false` only when its
+512-byte framebuffer `malloc` fails. It never probes the bus, and every I2C write it makes is
+unchecked. So the old `displayOk` was true whether or not a panel was connected, and `UiMenu::tick()`
+then pushed a frame at up to 10 Hz for ever.
+
+With the panel unplugged there are no pull-ups on SDA/SCL — the Teensy 3.5 has none on board and
+the core deliberately does not enable the internal ones in I2C mode (`WireKinetis.cpp:70-76`). The
+Kinetis `Wire` driver is bounded rather than hanging: `wait_idle()` gives up after 16 ms and
+`endTransmission()` after a further 4 ms per phase (`WireKinetis.cpp:513-600`). One
+`display.display()` is 1 + 16 chunked transactions, so a frame could cost about 340 ms of blocked
+`loop()` every 100 ms. Waveform timing was never at risk — the player ISRs at priority 64 preempt
+`loop()` unconditionally — but `Measure::poll()` (the 128-entry MDATA ring), `SdLog::poll()` and
+`Engine::prepareArms()` were all starved.
+
+The fix probes the panel and gates only the bus traffic:
+
+- `UiMenu::begin()` calls `Wire.begin()`, then one raw `beginTransmission`/`endTransmission` to
+  `SJ_OLED_ADDR`. A non-zero return means no panel. Worst case one 20 ms timeout, once, at boot.
+- `display.begin()` runs either way, because it is what allocates the framebuffer and there is no
+  other way to get one. With no panel its ~25 unchecked transactions cost up to half a second,
+  once, at boot.
+- `paint()` composes into the framebuffer exactly as before and skips the final
+  `display.display()` when `panelPresent` is false. Everything else in the render path is RAM work.
+- `SCREEN` therefore works headless, which is what remote testing needs. It re-probes the bus
+  first, so a panel plugged in after boot is picked up by sending `SCREEN` once. There is no
+  automatic retry: a periodic probe would cost a 20 ms `loop()` stall for ever on a board meant to
+  run without a panel.
+- Boot prints `# display: SSD1306 at 0x3C` or `# display: no panel — rendering to the framebuffer
+  only (SCREEN still works; it re-probes)`.
+
+The card path needed no mechanism change: `SD.begin(BUILTIN_SDCARD)` is bounded at 1 s by the
+Teensy SDIO driver (`SdioTeensy.cpp:36`), `writeRow()`/`poll()` are no-ops with no open file, and
+`mount()` is retried only from explicit commands. What changed there is a comment that had become
+wrong (see 1.4).
+
+### 1.2 The buttons do what the Pulser's buttons did
+
+`stimjimPulser` wired Btn0 (pin 17) to `sayHello()`, Btn1 (pin 39) to the IN0 edge handler and
+Btn2 (pin 16) to the IN1 one, with `// TODO: protection against rolling buttons` above them
+(`stimjimPulser.ino:888-896`). `stimjimAWG` had made all three menu keys. The new mapping restores
+the intent: Btn0 is the page key, Btn1 and Btn2 fire the routes. `Config.h` names changed with the
+roles (`SJ_BTN_PAGE`, `SJ_BTN_TRIG0`, `SJ_BTN_TRIG1`), as did `UiInput::Event`
+(`EV_PAGE`, `EV_TRIG0`, `EV_TRIG1`). `UiMenu::browseSlot()` had no callers and went with the
+browse cursor.
+
+**Bounce.** The old scheme was a 25 ms lockout from the last accepted edge. It suppressed bounce
+on contact make but not on break: a switch held for 300 ms and released with a bouncy break
+generated a second accepted rising edge, which for a trigger button means a second train. It is
+now an explicit arm/re-arm:
+
+- the ISR fires only while `armed[i]` is set; it pushes one event, clears the flag and returns —
+  a load, a store and a ring push;
+- `UiInput::poll()`, called from `loop()`, samples the three pins. A pin reading high records the
+  time; a button is re-armed once its pin has read low continuously for `SJ_BTN_DEBOUNCE_MS`.
+
+One press yields exactly one event whatever the contact does, and a `loop()` stall only delays
+re-arming, which is the safe direction.
+
+**Dispatch context.** `Triggers::edge()` was factored so the route dispatch is callable from
+`loop()`: `Triggers::fireRoute(uint8_t input, uint64_t at)`, where `at` is the cycle count the
+start was requested at and 0 means "now". The edge ISRs still pass their own entry timestamp; the
+button path calls it from `UiMenu::tick()` under `FastIO::busLock()`, exactly as `handleStart()`
+does for `T`/`U`, with `at = 0`.
+
+This is a deliberate difference from the Pulser, which armed from the button ISR. A press is a
+human action, so a `loop()`-scale dispatch latency — microseconds normally, tens of milliseconds
+while the card flushes — does not matter, and it buys two things: no second ISR-context arming
+path to reason about, and no need to raise `IRQ_PORTA`/`IRQ_PORTB` to `SJ_TRIG_PRIO` so that a
+trigger edge cannot preempt a button's arm. Delivered waveform timing is unchanged either way,
+because `t0` is anchored at the start request. If ISR-context arming is ever wanted it is a
+three-line change plus the two NVIC priorities.
+
+A button whose input has no train routed (`TRIG` mode 0 or 3) prints
+`WARN button: input <t> has no train routed — set TRIG<t>` from `loop()`. A press that hits a busy
+engine is refused by `Engine::startTrain` and counted by `Triggers::poll()`'s existing reject
+WARN, the same as an electrical edge.
+
+### 1.3 The pages
+
+One flat list, advanced by the page button and by `PAGE`, wrapping at the end:
+
+| Page | Content |
+|---|---|
+| 0 `STATUS` | a running train's progress (the old RUN view), or when both engines are idle: what each trigger button would fire, and the log state |
+| 1..N `RESULT` | the last completed train, one page per measurement point, N capped at `SJ_UI_RESULT_PAGES` = 4 |
+| N+1 `SYSTEM` | board and firmware, card and panel presence, uptime, the clock and its source |
+
+The BROWSE view and its cursor are gone. Btn1/Btn2 no longer scroll, and the useful thing to show
+when idle is what the buttons will actually fire — the routed slots — so `STATUS` subsumes what
+BROWSE was for. A completion that measured something jumps the page to 1; one that measured
+nothing leaves the page alone.
+
+`PAGE` (advance), `PAGE,<n>` (select) and `PAGE?` (query) all reply `PAGE,<index>,<count>,<name>`.
+Paired with `SCREEN` this makes every page reviewable from a host with no panel attached.
+
+**The RESULT layout.** Four rows of 21 characters, channel 0 left, channel 1 right:
+
+```
+#7 T n=500 s0 1/2
+V    100.2   -99.8 mV
+I     99.5  -100.0 uA
+R    1.01k   1.00k
+```
+
+The title bar (inverted, as row 0 always is) carries the train counter, the engine, the sample
+count, the point's label — stage index for `S`/`L`, degrees for `W` — and the page's position
+within the result pages. Each data row is a three-character tag, then per channel a
+seven-character value and a one-character marker, then the unit: 3 + 8 + 8 + 2 = 21. The marker
+column comes out of the gap between the channels, not out of the numbers.
+
+The numbers come from the same accumulators `MSUM` prints. `Commands::poll()` already drains the
+completion in `loop()` context; it now calls `UiMenu::noteResult()` immediately *before*
+`Measure::printSummary`, which is what clears `summaryPending` and releases the finished train's
+plan buffer. `Measure::resultSnapshot()` reads that buffer without consuming it and converts once
+into integer microvolts and nanoamps with the standard error of each mean, so the panel itself is
+float-free. The `T-1`/`U-1` stop path fills the snapshot the same way. The set is 10 points x 2
+channels x 24 bytes, about 500 bytes.
+
+### 1.3.1 Resistance: unit and rounding
+
+`R = V/I`, computed in integers: with V in microvolts and I in nanoamps,
+`R[milliohm] = V[uV] * 1e6 / I[nA]`, which needs `int64_t` (it peaks near 2e10 at the smallest
+current the module will divide by).
+
+Unit and decimals are not fixed. They follow the precision the measurement supports:
+
+1. Standard error of each mean, `sd / sqrt(n)`, from the accumulator `MSUM` already carries,
+   floored at the converter's own quantisation deviation (2.44 mV / sqrt(12) = 704 uV,
+   0.85 uA / sqrt(12) = 245 nA) — a run of identical codes gives sd = 0, which is not a claim the
+   hardware supports.
+2. Relative uncertainty, floored: `rV = max(seV/|V|, 1 %)`, `rI = max(seI/|I|, 1 %)`. The 1 %
+   floor stands in for the ADC path's gain accuracy, which this project has not characterised;
+   without it a 500-repetition train would claim five significant digits it does not have. It is
+   `SJ_UI_REL_FLOOR_PPM` in `UiFmt.h` so a measured figure can replace it.
+3. `rR = sqrt(rV^2 + rI^2)`, so at the floor `rR = 1.4 %`.
+4. The unit puts the mantissa in [1, 1000): ohms below 999.5, kilohms below 999.5 k, megohms above.
+5. Decimals: round `rR * |R|` to one significant figure, give `R` the same decimal place, then cap
+   the whole thing at three significant figures.
+
+At the 1.4 % floor that yields `471`, `1.01k`, `47.1k`, `1.02M` — three significant figures, the
+honest ceiling for a 2.44 mV / 0.85 uA converter. A short or noisy train loses digits by itself:
+10 % on the current gives `1.0k` where the floor gave `1.01k`. All four worked examples and the
+coarsening are host-tested.
+
+Two cases print a word instead of a number:
+
+- `open` when the current is not distinguishable from zero (`|I| < 3*seI`, `seI` floored as above);
+- `--` when the line was not measured, or when neither V nor I differs from zero (an undriven or
+  grounded channel).
+
+A voltage that does not differ from zero while a real current flows is a *short*, not a missing
+reading, and renders as the small number it is.
+
+The old firmware's rule — kilohms above 100 k, ohms below, integers throughout
+(`stimjimPulser.ino:494-501`) — is superseded: it printed six-digit ohm values in a six-character
+field and claimed integer-ohm precision on a +-2.44 mV reading.
+
+### 1.3.2 Limit markers
+
+Requested after the plan was approved, and the one addition to it. A `*` after a value means the
+number may be the hardware talking rather than the load:
+
+- **9 V or more** on the voltage row. The output stage runs off a +-15 V rail but its driver
+  saturates below that, so a reading this large is more likely the driver IC's ceiling than the
+  requested amplitude. **This threshold is a working figure, not a measured one** — the saturation
+  point has not been characterised on this board. It is `SJ_UI_VLIMIT_UV` in `UiFmt.h`.
+- **3 mA or more** on the current row. The current pump is designed to 3.33 mA and amplitudes
+  above 3000 uA are known to convert incorrectly on the DAC; `TrainStore`'s parse-time warning
+  already uses that number (`WARN_LIMIT_UA`), so the display and the parser agree.
+
+The marker carries through to the resistance row: a resistance derived from a suspect reading is
+suspect for the same reason. It is the same kind of feedback `open` gives, in the column the
+layout reserved for it.
+
+The Pulser's *compliance* markers — inverted video on a voltage- or current-limited field — are
+still not built. They compared the reading against the requested amplitude, which the AWG's `MSUM`
+path does not carry, and the flag deserves its own decision about what "limited" means for a ramp
+or a sine.
+
+### 1.4 The clock
+
+**Three clocks, three jobs.** The cycle counter stays the only fine clock: `FastIO::cycles64()`
+extends the DWT counter to 64 bits (8.33 ns per tick at 120 MHz, an exact integer count per
+microsecond) and is the source of every waveform instant, every measurement deadline and the log's
+`timestamp_us`. Nothing in this phase touched it.
+
+**On overflow the log column is safe, but it has a keep-alive requirement.** 2^64 cycles is about
+4900 years. What can go wrong is the software extension: it detects a 32-bit wrap by comparing
+against the previous reading, so **something must call `cycles64()` at least once per 2^32 cycles
+= 35.8 s** or a wrap is missed and the timestamp jumps back by that much. `loop()` guarantees it
+through `Engine::poll()`, and the long-running card and serial loops (`SdLog::list`, `SdLog::get`,
+`Measure::poll`) call it explicitly for exactly this reason. That guarantee used to be a code
+comment only; it is now in `docs/timing.md` §6 and in the protocol reference next to the column
+list, because it is the one way the column can go wrong.
+
+**The RTC is a coarse label, never an authority.** What the firmware had to be careful about is
+the *epoch*, and the two MCU families differ:
+
+*Teensy 3.5/3.6 (Kinetis K64/K66).* Seconds in `RTC_TSR`, a 32768 Hz prescaler in `RTC_TPR` (about
+30.5 us of readable resolution), backed by VBAT. The core (`mk20dx128.c:1128-1155`) sets the RTC
+from `__rtc_localtime` when `RTC_SR_TIF` says the time is invalid — a power-up with no battery —
+and writes a "known stale" flag `0x5A94C3A5` into the VBAT register file at `0x4003E01C`; on the
+reset that follows an upload it sets it again from a *fresh* compile time and clears the flag.
+`__rtc_localtime` is a linker `--defsym` the IDE fills from `{extra.time.local}`
+(`boards.txt:1010`), that is, **the build host's local time at compile, not UTC**. So with no
+battery every power-up starts at the binary's compile time in that zone; with a battery the clock
+is set once, at the first upload after the battery goes in. The crystal is uncompensated, so tens
+of ppm — seconds per day.
+
+*Teensy 4.x (i.MX RT1062).* The core does **not** use the compile time: if the SRTC is not running
+it starts it at 1546300800 = 2019-01-01T00:00:00Z (`startup.c:178-182`). Same 32768 Hz, in
+`SNVS_HPRTCMR`/`SNVS_HPRTCLR` with 15 fractional bits.
+
+The new `Clock` module therefore:
+
+- **reads consistently.** `rtc_get()` returns seconds only, and reading the two registers
+  separately can straddle a second. The Kinetis path reads `TPR`, `TSR`, `TPR` and retries when
+  the prescaler rolled; the i.MX path is the core's own paired loop, extended to keep the 15
+  fractional bits it discards.
+- **sets with sub-second alignment.** `rtc_set()` zeroes `TPR`, throwing the fraction away.
+  `Clock::set()` writes both, through the same enable/disable sequence.
+- **classifies the source.** `SRC_BUILD` when the Kinetis stale flag is set, or when the reading
+  is within a minute of `__rtc_localtime` (a fresh upload); `SRC_BATT` otherwise. On the i.MX a
+  reading inside the first day after 2019-01-01Z is `SRC_BUILD`, anything later `SRC_BATT`.
+  `set()` always moves to `SRC_HOST`. The second half of the Kinetis test is a heuristic and is
+  documented as one.
+- **states the source everywhere.** A `SRC_BUILD` reading is the build host's *local* time; a host
+  that sends `CLK` naturally sends UTC. The firmware holds UTC once a host has set it, does not
+  pretend to convert a build-sourced value, and never presents any of it as accurate on its own.
+  Nothing in the firmware needs a zone.
+
+**`CLK`.** `CLK?` replies `CLK,<unix>,<ms>,<us_since_boot>,<src>` plus a `#` line with the ISO 8601
+rendering and a sentence saying what that source means. `CLK,<unix>[,<ms>]` sets and replies the
+same. The reply reads the RTC and `cycles64()` back to back, so a host computes the offset between
+its own clock and the board's monotonic timebase and can bound its uncertainty by timing the round
+trip. That pair — not the RTC — is what anchors a log to a computer log. USB CDC round trips on a
+Teensy are typically 0.1–1 ms, so wall-clock anchoring is good to about a millisecond and
+everything finer comes from the microsecond column. A host that never sets the clock still gets a
+usable anchor from `CLK?` alone.
+
+**In the log.** The CSV columns did **not** change — host tools depend on them, and rendering a
+wall clock per row would add cost to the very path §1.5 is about making cheaper. The file carries
+anchor lines instead:
+
+```
+# clock: 2026-09-07T14:32:05.123Z src=host us=41234567
+```
+
+written at file open (in `writeHeader()`), before each train's `# train:` block (in
+`noteTrain()`), and from `SdLog::poll()` at most once per 60 s while rows are actually being
+written. Any row's `us` maps to a wall clock through the nearest anchor, and the drift between two
+anchors is visible in the file rather than hidden inside it.
+
+`FsDateTime::setCallback()` is now fed from `Clock::read()`, so log files carry real modification
+dates on the card — but only when the source is not `SRC_BUILD`, because a wrong date is worse
+than none: a host sorting by date would believe it. `LOG1` keeps `LOGnnnn.CSV` numbering; the
+comment in `openLog()` that said the index "is the only thing that identifies a run on a board
+without a clock" was rewritten to say why the index still is what identifies a run.
+
+### 1.5 The row formatting is now fixed point
+
+Per row the old path ran four `snprintf("%.2f")` conversions plus the row `snprintf`. The Teensy
+3.5 links full newlib (`teensy35.build.flags.libs` carries no `nano.specs`), so `%f` goes through
+`_dtoa_r`, which does double software arithmetic and allocates `_Bigint` scratch.
+
+None of that can affect a waveform: it all runs in `Measure::poll()`, in `loop()` context, the
+player ISRs preempt it unconditionally, the card is on native SDIO and no write path takes the bus
+lock. What it bounds is the row rate, and through that the headroom of the 128-entry MDATA ring.
+
+Both unit scales are exact hundredths of their unit — 2.44 mV and 0.85 uA per code — so the whole
+conversion is exact in integers. `Stimjim.adcOffset10[]` is folded into a Q16 integer offset once
+per calibration (`Measure::noteOffsets()`, called from `begin()` and from `B` and `C`), and the
+fields print as `%ld.%02lu`. The `MSUM` mean takes the same path straight from the integer sums,
+which is exact where the double quotient was not. Only the spread still multiplies in floating
+point, because it comes out of a `sqrt` — but it no longer prints through `_dtoa_r` either.
+
+**How byte-identical the output is, measured on the host.** Over the whole converter range and
+every calibration offset the library can produce (a multiple of 0.01, from a 100-reading average):
+
+- the **voltage column never differs**;
+- the **current column** differs when the offset's hundredths value is congruent to 10 modulo 20 —
+  one offset in twenty. On such a board *every* reading of that line sits exactly on a `.005`
+  boundary, and 37–70 % of rows differ by one in the last digit. Where they differ the new digit
+  is the correctly rounded one: `%.2f` rounds the nearest *double* of a product involving the
+  inexact 0.85, the integer path rounds the exact value half away from zero. 0.01 uA is 1.2 % of
+  one converter code.
+
+That is documented in the protocol reference under `LOG`, because it is a change a host comparing
+old and new log files could otherwise be puzzled by.
+
+`BENCHFMT[,n]` was added to time exactly this: `Measure::benchFormatRow()` builds a synthetic
+record whose codes sweep the range (so nothing is hoisted out of the loop), converts its four
+fields and formats the row, with no serial write and no card. **It has not been run on silicon**,
+so `docs/timing.md` §6 carries a placeholder that says so rather than a number.
+
+
+## 2. Files
+
+New: `stimjimAWG/Clock.h`, `stimjimAWG/Clock.cpp`, `stimjimAWG/UiFmt.h`, `stimjimAWG/UiFmt.cpp`,
+`tests/host/test_uifmt.cpp`, this file.
+
+Changed: `Config.h` (version 0.8.0, button names and roles, `SJ_UI_RESULT_PAGES`), `Commands.cpp`
+(`CLK`, `PAGE`, `BENCHFMT`, `noteResult` in both completion paths, `noteOffsets` after `B`/`C`,
+help), `Measure.h`/`Measure.cpp` (`ResultSet`, `resultSnapshot`, fixed-point fields,
+`benchFormatRow`, `noteOffsets`), `Protocol.cpp` (the boot `# clock:` line), `SdLog.h`/`SdLog.cpp`
+(anchor lines, the FAT date callback, `cardPresent`/`name`/`bytes`), `Triggers.h`/`Triggers.cpp`
+(`fireRoute`), `UiInput.h`/`UiInput.cpp` (roles and the arm/re-arm debounce), `UiMenu.h`/
+`UiMenu.cpp` (rewritten around the page list), `stimjimAWG.ino` (`Clock::begin`, `UiInput::poll`,
+header comment), `README.md`, `docs/serial-protocol.md`, `docs/timing.md`,
+`docs/hardware-variants.md`, `docs/hardware-notes.md`, `tests/device/smoke.py`,
+`tests/device/README.md`.
+
+No EEPROM change: nothing new needs persisting, so the image version stays at v6.
+
+
+## 3. Verification
+
+- **Host suites, all five clean at `-Wall -Wextra` and passing:** `test_cal`, `test_samplegen`,
+  `test_trainstore`, `test_measure`, and the new `test_uifmt` — the ohm/kilohm/megohm selection
+  and the decimal rule across the range, the 1 % floor from both sides, `open`, `--`, the short
+  case, `int64` headroom at +-15 V and +-3.33 mA, the limit markers, the field widths, and the
+  ISO 8601 / civil-date conversion including leap days and the `uint32` ceiling.
+- **All four target configurations compile clean at `-Wall -Wextra`:** Teensy 3.5 register,
+  Teensy 3.5 portable (`-DSJ_FASTIO_REGISTER=0 -DSJ_TIMER_REGISTER=0`), Teensy 4.1, Teensy 4.0
+  with `-DSJ_EEPROM_SLOTS=6`.
+- **A caveat about how those builds were checked.** `arduino-cli` is not installed on the machine
+  this phase was written on, so the four builds were run as per-translation-unit
+  `arm-none-eabi-g++ -fsyntax-only` with the same compiler, flags, defines and include set the
+  IDE uses (taken from the `compile_commands.json` of the previous phase's build directories).
+  That catches everything except the link step, so **flash and RAM figures are not reported this
+  phase and link errors would not have been caught.** Re-run the real four builds before flashing.
+- **The fixed-point conversion was compared against `%.2f`** over 13.1 million conversions on the
+  host — the whole code range crossed with 801 offsets — which is where the numbers in §1.5 come
+  from.
+- **Not run on silicon.** No board was attached. `BENCHFMT` has never executed, the panel probe
+  has never met a real missing panel, no button has been pressed, and the RTC classification has
+  never seen a real VBAT flag.
+
+
+## 4. Next entry point
+
+In order, on a board:
+
+1. `python tests/device/smoke.py COM4 --screens tmp/screens` with everything attached, then again
+   **with the panel unplugged and the card removed** — that second run is the headless regression,
+   and the suite is written to pass it (the SD section skips itself with a note, `SCREEN` composes
+   the framebuffer either way).
+2. Press each button. Btn0 should walk the pages and wrap; Btn1 and Btn2 should start whatever
+   `TRIG0`/`TRIG1` route, once per press, and warn when nothing is routed. Hold one for a second
+   and release it: exactly one train.
+3. `BENCHFMT,2000` and put the figure into `docs/timing.md` §6, replacing the placeholder. If a
+   0.7.0 binary is still around, the comparison is worth one line.
+4. `CLK?` before and after `CLK,<host unix>` on a board with and without a VBAT battery, to see
+   whether the `build`/`batt` heuristic actually separates them. This is the part of the phase
+   most likely to be wrong on hardware.
+5. Read a log file back with `SDGET` and check that the `# clock:` anchors are where they should
+   be — at open, before each train, and about once a minute during a long measured train.
+
+Still outstanding from earlier phases and untouched here: **measure the prepared arm and lower
+`CAL STARTLAT`** (phase 14's next-entry-point; `SJ_START_LATENCY_US` is still 35 and
+`bench_arm.py` has not been re-run on silicon).
+
+Two thresholds in this phase are working figures rather than measurements and are named so they
+can be replaced without touching logic: `SJ_UI_REL_FLOOR_PPM` (1 %, standing in for the ADC path's
+gain accuracy) and `SJ_UI_VLIMIT_UV` (9 V, standing in for the output driver's saturation point).
+Either one measured on the bench is a one-line change.
