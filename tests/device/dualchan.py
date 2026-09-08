@@ -900,6 +900,15 @@ def usecase_figures(res):
         t = [i * dt * 1e3 for i in range(len(ch[ps.CHANNEL_A]))]
         ax.plot(t, ch[ps.CHANNEL_A], lw=0.6, label=NAME[ps.CHANNEL_A])
         ax.plot(t, ch[ps.CHANNEL_B], lw=0.9, label=NAME[ps.CHANNEL_B])
+        # The burst is 200 us of activity in 650 ms and the record samples
+        # every 164 us, so most of it falls between samples. Mark where it is
+        # rather than leave the trace looking as if nothing happened there.
+        ax.axvline(GATE_DELAY_US / 1000, color="C3", lw=1.0, ls="--")
+        ax.annotate(f"gate burst\n(4 x {GATE_WIDTH_US} us, too narrow to\n"
+                    f"resolve at {dt*1e6:.0f} us per sample)",
+                    (GATE_DELAY_US / 1000, ax.get_ylim()[1]), fontsize=7,
+                    ha="right", va="top", color="C3",
+                    xytext=(-5, -2), textcoords="offset points")
         ax.set_ylabel("output (V)")
         ax.set_title(f"gate in {m} mode", fontsize=9)
         ax.grid(alpha=0.3)
@@ -978,19 +987,23 @@ def usecase_figures(res):
     fig.savefig(FIGS / "stimjim-usecase-collision.png")
     plt.close(fig)
 
-    # The raw coincidence captures, so the figure above can be redrawn without
-    # occupying the bench again.
+    # Every raw capture, so the figures above can be redrawn without occupying
+    # the bench again. The coincidence record is referenced to the gate edge a
+    # quarter of the way into it; the rest start at the trigger.
     for m in modes:
-        dt, ch = res[m]["collide"]
-        n = len(ch[ps.CHANNEL_A])
-        with open(TMP / f"stimjim-usecase-collision-{m}.csv", "w",
-                  newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["t_us_from_gate_edge", "ch0_V", "ch1_V"])
-            for i in range(n):
-                w.writerow([f"{(i - n/4) * dt * 1e6:.4f}",
-                            f"{ch[ps.CHANNEL_A][i]:.4g}",
-                            f"{ch[ps.CHANNEL_B][i]:.4g}"])
+        for key, zero in (("overview", 0.0), ("stim", 0.1),
+                          ("gate", 0.1), ("gate_staggered", 0.1),
+                          ("collide", 0.25)):
+            dt, ch = res[m][key]
+            n = len(ch[ps.CHANNEL_A])
+            with open(TMP / f"stimjim-usecase-{key}-{m}.csv", "w",
+                      newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["t_us_from_trigger_point", "ch0_V", "ch1_V"])
+                for i in range(n):
+                    w.writerow([f"{(i - n * zero) * dt * 1e6:.4f}",
+                                f"{ch[ps.CHANNEL_A][i]:.4g}",
+                                f"{ch[ps.CHANNEL_B][i]:.4g}"])
 
     with open(TMP / "stimjim-usecase.csv", "w", newline="") as fh:
         w = csv.writer(fh)
