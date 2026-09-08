@@ -12,6 +12,10 @@ cost of arming a train, and `BENCHSETTLE` measures how long after a latch a read
 anything. What is left needs a scope because it involves an instant the firmware cannot observe —
 the physical edge on a trigger pin — or a comparison between two outputs.
 
+**Status.** Configuration A is measured and configuration B is measured (2026-09-08; the numbers
+are in its section below, and `tests/device/trigcomp.py` repeats them). Configuration C has not
+been run.
+
 Three wiring configurations cover everything below. Configuration A is the bench as it stands and
 is the one `tests/device/capture.py` already drives; B and C are changes to it.
 
@@ -29,9 +33,13 @@ is the one `tests/device/capture.py` already drives; B and C are changes to it.
   least 1 V clear of the baseline, or the threshold sits inside the trigger hysteresis and never
   fires.
 - Close the PicoScope application before running any script. It holds the USB device exclusively.
-- With both scope channels enabled the capture buffer is 3968 samples and the fastest usable
-  sample interval is 640 ns. That floor matters: it is why sub-microsecond settling cannot be
-  measured this way, and why `BENCHSETTLE` exists instead.
+- With both scope channels enabled the capture buffer is 3968 samples and the fastest sample
+  interval is **20 ns** (timebase 1; 40 ns and slower are also available, and every index the
+  driver accepts delivers what it reports — `tests/device/scope_timebase.py` checks that against
+  the unit's own AWG). Until 2026-09-08 `pico2000.py` mis-scaled the driver's interval and could
+  never select anything faster than 640 ns, which is the floor earlier revisions of this document
+  quoted. The buffer is the real constraint: 3968 samples at 20 ns is a 79 µs window, so fine
+  resolution and a long window are alternatives.
 
 ---
 
@@ -83,8 +91,14 @@ is absent at every other delay.
 
 ## Configuration B — trigger edge and output on the scope at the same time
 
-**Measures: `CAL TRIGCOMP`, the delay from the physical edge at the input pin to the trigger
-ISR's first instruction. It is the last quantity in the firmware with no measured value.**
+**Measures: the absolute delay from the physical edge at the input pin to the output actually
+moving — the quantity `CAL TRIGCOMP` exists to cancel. Measured on a Teensy 3.5: 37.27 µs against
+a `CAL STARTLAT` of 35, so `TRIGCOMP` is 2.27 µs, with a shot-to-shot spread of 49 ns.**
+
+`tests/device/trigcomp.py` drives the whole of this section: `check` verifies the wiring
+connection by connection, `threshold` measures the input pin's own switching level, and `measure`
+takes the latency. Read that script's docstring for what each step proves; the rest of this
+section is what the numbers turned out to be.
 
 Change from A: tee the AWG output so the scope sees the edge it generates.
 
@@ -106,33 +120,88 @@ configuration A informative only adds uncertainty here.
 
 ### Procedure
 
-1. `M0,0` (channel 0 to voltage mode).
-2. Define a one-pulse train with no delay and a large step, on channel 0 only:
-   `S20,0,3,100000,1000;8000,0,2000`
-3. Route the trigger to it, rising edge, joint mode: `TRIG0,1,20,-1,0`
-4. `CAL,TRIGCOMP,0` and `CAL,STARTLAT,35` — you are measuring against a known budget.
-5. Scope: channel B on the trigger edge, channel A on CH0(+), both DC, ±10 V range. Trigger on
-   channel B rising at half the AWG amplitude, 10 % pre-trigger, 640 ns/sample.
-6. AWG: a 1 Hz square wave, 0 to 2 V (`scope.square(1.0, 2.0)` in `pico2000.py`).
-7. Measure `t(CH0 crosses half its step) − t(trigger edge crosses its threshold)`. Average over at
-   least 20 shots; the spread is the trigger-latency repeatability, which is worth recording on
-   its own.
+```
+python trigcomp.py check                       # is the bench wired as above?
+python trigcomp.py threshold                   # what level does IN0 switch at?
+python trigcomp.py measure --threshold 1.757   # the latency itself
+python ../../docs/figures/make_bench_figures.py
+```
 
-### What the number means
+`check` proves six things separately, so a failure names the wire rather than corrupting a
+number: the AWG reaches scope B, the AWG reaches IN0, scope A is on CH0(+), scope ground is at
+CH0(−) rather than partway down a chain, CH1 and the LED branch are gone, and the load is a plain
+resistor. The last of those is measured through **both** output modes, because one mode on its own
+cannot tell a bad contact from a miscalibrated readback — see the load fault below.
 
-The delivered latency is `TRIGCOMP + STARTLAT`. With `TRIGCOMP` at 0 the measurement should read
-about 35 µs plus the hardware part. Set `CAL,TRIGCOMP,<measured − 35>` and re-run: the delivered
-latency then reads 35 µs exactly, and `P` persists it. If the measured value is *less* than 35 µs
-something is wrong with the setup, not with the firmware — `STARTLAT` is a floor the engine
-schedules against, not an average.
+`measure` sets `CAL,TRIGCOMP,0` and `CAL,STARTLAT,35`, defines `S20,90,3,100000,1000;8000,0,2000`,
+routes `TRIG0,1,20,-1,0`, and captures 30 shots at 5 Hz per amplitude. Mode 90 rather than 0 turns
+in-train measurement off, which keeps the USB serial quiet during the captures without touching
+the path being timed.
 
-Expect a few hundred nanoseconds. `attachInterrupt` on a Kinetis port ISR plus the dispatch to the
-handler is the whole of it, and the value is a property of the MCU and the core, not of the board.
+### Two things the original procedure got wrong
 
-This is also the only configuration that measures the instrument's **absolute** trigger-to-output
-latency. Everything else on this bench is differential (the same edge starts a reference pulse on
-the other engine), so until this runs, the 35 µs of [timing.md](timing.md) §1 is a budget the
-engine schedules against rather than a captured figure.
+**Reference the edge to the pin's threshold, not to half the AWG's amplitude.** The 2204A's square
+wave takes 2.08 µs to slew its middle 1.58 V — 0.75 V/µs. Starting the clock at 1.00 V instead of
+the level the pin actually switches at moves the answer by 1.35 µs, which is *half the quantity
+being measured*. `trigcomp.py threshold` measures the pin instead of assuming it: it walks the
+AWG's peak down until trains stop firing. On this board the transition is sharp — 1.780 V fires
+every edge, 1.735 V fires none — so the threshold is **1.757 ± 0.022 V**, and the residual doubt
+is worth only ±29 ns.
+
+**Time the foot of the output step, not its 50 % point.** The 50 % crossing arrives after half the
+output's settling, and that settling depends on the step size: it puts the answer 0.37 µs late on
+an 8 V step and 1.13 µs late on a 2 V one. The first departure from baseline does not: 37.267 µs
+at 8000 mV and 37.261 µs at 2000 mV, six nanoseconds apart across a 4× change of slew rate. That
+agreement is the check that the load and the settling are not inside the number.
+
+### What the number turned out to be
+
+| | |
+|---|---|
+| edge (at 1.757 V) → output leaves baseline | **37.27 µs**, sd 49 ns over 30 shots |
+| `CAL STARTLAT` in force | 35 µs |
+| unaccounted, i.e. `CAL TRIGCOMP` | **2.27 µs** |
+| output settling, foot to 90 % | 1.91 µs at 8 V, 2.93 µs at 2 V |
+
+![what the 37.3 µs is made of](../figs/stimjim-trigcomp-budget.png)
+![why the reference instant decides the answer](../figs/stimjim-trigcomp-reference.png)
+
+**It is not a few hundred nanoseconds, and it is not only the pin-to-ISR delay.** Three delays sit
+between the edge and the output, and this wiring sees only their sum:
+
+- the pin edge reaching the trigger ISR's first instruction — the part `TRIGCOMP` is named for,
+  and the only part that is a property of the MCU rather than the board;
+- the PIT wake and its 96-cycle (0.8 µs) scheduling quantum;
+- the `NLDAC` pulse and the AD5752's output beginning to move.
+
+Separating them needs a probe on `NLDAC`, which is not brought out to a connector. So `TRIGCOMP`
+is best read as *everything between the edge and the output that `STARTLAT` does not already
+cover*, and setting it to 2 makes the delivered edge-to-output latency the budgeted 35 µs.
+
+**Setting it is a decision, not a formality.** `TRIGCOMP` is subtracted only on the trigger path
+(`t0 = edge − TRIGCOMP + STARTLAT + delay`), while two of its three terms — the PIT wake and the
+DAC's latch-to-output delay — apply to a `T`/`U` start as well. Setting `TRIGCOMP` to the full
+2.27 µs therefore makes a triggered train's output lead a `T`-started one by about 2 µs. Set it if
+what matters is the edge-to-output latency of a triggered train; leave it at 0 if what matters is
+that both start paths behave alike. It is left at 0 until that is decided.
+
+This is the only configuration that measures the instrument's **absolute** trigger-to-output
+latency. Everything else on this bench is differential — the same edge starts a reference pulse on
+the other engine — so the delays above cancel there and are invisible.
+
+### The load fault this configuration found
+
+The 1 kΩ across CH0 read as **3988 Ω** through the board's own voltage-mode measurement, stably,
+linearly and symmetrically, at every amplitude. It is not the load and not the contacts: driving
+the same resistor in **current** mode, where the pump forces a known current and the scope reads
+the voltage, gives **993 Ω ± 3 %**. The board's voltage readback agrees with the scope throughout,
+so what is wrong is the **channel-0 current readback in voltage mode, low by a factor of 4.02**.
+
+![the same resistor through both modes](../figs/stimjim-load-two-modes.png)
+
+This matters well beyond the bench: every voltage-mode `MSUM`, `MDATA` and `READ` current figure
+is a quarter of the truth, and the load resistances the OLED result pages compute from them are
+four times it. See [hardware-notes.md](hardware-notes.md).
 
 ---
 

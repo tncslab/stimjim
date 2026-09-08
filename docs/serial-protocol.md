@@ -522,13 +522,20 @@ naming the value that would have covered it. Raising `STARTLAT` raises the deliv
 trigger-to-output latency by the same amount; it stays deterministic either way, which is the
 property the trigger path exists to provide.
 
-`TRIGCOMP` is the one parameter with no measured value: it is the delay from the physical edge at
-the input pin to the trigger ISR's first instruction, which software cannot see. The ISR
-timestamps the edge at its own entry, so interrupt dispatch and the arm's own cost no longer
-*add* to the delivered latency whatever the train's complexity — they are spent inside
-`STARTLAT` instead of after it, which is why `STARTLAT` has to be wide enough to hold them.
-What remains outside that accounting is the hardware part; set `TRIGCOMP` to it once a scope has
-measured edge-to-output, and the delivered latency becomes `STARTLAT` exactly.
+`TRIGCOMP` covers what software cannot see: the delay from the physical edge at the input pin to
+the output actually moving. The ISR timestamps the edge at its own entry, so interrupt dispatch
+and the arm's own cost no longer *add* to the delivered latency whatever the train's complexity —
+they are spent inside `STARTLAT` instead of after it, which is why `STARTLAT` has to be wide
+enough to hold them. What remains outside that accounting is hardware, and on a Teensy 3.5 it is
+**2.27 µs**: the pin-to-ISR delay, the PIT wake and its 0.8 µs quantum, and the AD5752's
+latch-to-output delay, which a scope on the trigger input and one output can only see summed
+([bench-wiring.md](bench-wiring.md) configuration B).
+
+It ships at 0 by choice. Setting it makes the delivered edge-to-output latency of a *triggered*
+train exactly `STARTLAT`, which is what the knob is for; but it is subtracted on the trigger path
+only, while two of its three terms apply to a `T`/`U` start as well, so a non-zero `TRIGCOMP`
+makes triggered trains lead software-started ones by the same amount. Set it when the absolute
+trigger-to-output latency is what matters, leave it when the two start paths must agree.
 
 ### `READ` — manual averaged measurement (immediate)
 

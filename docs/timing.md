@@ -83,10 +83,14 @@ a preload), and the per-slot delay is exact to the scope's own sample interval (
 
 Two qualifications on the 35 µs:
 
-- **`CAL TRIGCOMP` is 0 and unmeasured.** It is the delay from the physical edge at the input pin
-  to the ISR's first instruction, which software cannot see; expect a few hundred nanoseconds.
-  The bench measures trigger delay differentially (the same edge starts a reference pulse on the
-  other engine), so the *absolute* edge-to-output figure has never been captured — see
+- **`CAL TRIGCOMP` is measured at 2.27 µs, and is left at 0.** The absolute figure is now
+  captured: on a Teensy 3.5 the output leaves its baseline 37.27 µs (sd 49 ns) after the input pin
+  crosses its own 1.757 V switching threshold, against a `STARTLAT` of 35. The 2.27 µs difference
+  is the pin-to-ISR delay *plus* the PIT wake and its 0.8 µs quantum *plus* the AD5752's
+  latch-to-output delay; a scope on the trigger input and one output sees only their sum, and
+  `NLDAC` is not brought out to separate them. It stays at 0 because `TRIGCOMP` is subtracted on
+  the trigger path only, while two of its three terms apply to a `T`/`U` start too, so setting it
+  makes triggered trains lead software-started ones by ~2 µs. See
   [bench-wiring.md](bench-wiring.md) configuration B.
 - **The analog path adds its own 8–9 µs.** After a latch the output needs that long to reach its
   final value (`BENCHSETTLE`), so the load sees the onset at `STARTLAT` and full amplitude 8–9 µs
@@ -627,5 +631,7 @@ Ordered by what the measurements say each is worth, largest first.
 - **Pre-arm the whole train and fire on a bare `NLDAC` pulse** (§3). This makes the arm's cost
   irrelevant rather than smaller, and is the only path to a single-digit *total* trigger latency —
   and, given the 9.0 µs floor, the only path to an arm inside one latch interval.
-- **`CAL TRIGCOMP`** is still 0 and unmeasured — the one term of the delivered latency that
-  software cannot see. [bench-wiring.md](bench-wiring.md) configuration B measures it.
+- **`CAL TRIGCOMP`** is measured (2.27 µs) but deliberately still 0: applying it would make a
+  triggered train's output lead a `T`-started one, because two of the three delays it lumps
+  together are common to both start paths. [bench-wiring.md](bench-wiring.md) configuration B has
+  the measurement and the argument.

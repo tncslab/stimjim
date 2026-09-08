@@ -30,7 +30,10 @@ RANGE = {  # volts full scale (+/-) -> driver code
 RISING, FALLING = 0, 1
 MAX_VALUE = 32767            # legacy driver scales every model to +/-32767
 
-# time_units returned by get_timebase
+# The `time_units` code get_timebase returns. It is the unit of the timestamp
+# array of get_times_and_values, NOT of the sample interval beside it -- the
+# interval is always nanoseconds. Nothing here calls get_times_and_values, so
+# the table is kept only to name the codes the driver reports.
 TIME_UNITS = {0: 1e-15, 1: 1e-12, 2: 1e-9, 3: 1e-6, 4: 1e-3, 5: 1.0}
 
 WAVE_SINE, WAVE_SQUARE, WAVE_TRIANGLE = 0, 1, 2
@@ -129,11 +132,19 @@ class Scope:
             ctypes.byref(max_samples))
         if rc == 0:
             return None
-        return interval.value * TIME_UNITS[units.value], max_samples.value
+        # The interval is in nanoseconds whatever `units` says (see TIME_UNITS).
+        return interval.value * 1e-9, max_samples.value
 
     def pick_timebase(self, want_dt, n):
         """Fastest timebase whose interval is still >= want_dt, so a requested
-        window is covered without oversampling past the driver's limit."""
+        window is covered without oversampling past the driver's limit.
+
+        Timebases the current channel configuration cannot reach are refused by
+        the driver -- timebase 0 with two channels enabled, for one -- and
+        `timebase` returns None for those, so the search skips them. Every
+        index the driver does accept delivers the interval it reports, checked
+        against the unit's own AWG by tests/device/scope_timebase.py.
+        """
         best = None
         for tb in range(0, 24):
             r = self.timebase(tb, n)

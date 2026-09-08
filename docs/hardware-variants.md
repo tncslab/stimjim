@@ -157,7 +157,7 @@ in this order:
 | `BENCHK` | spread of the boot `K_RELOAD` calibration | the constant itself is self-calibrated; this only checks it is stable |
 | `BENCHSQ` vs `BENCHSQL` | scope A/B of the FastIO path against `Stimjim.writeToDac` | the shape check for a new FastIO backend |
 | `BENCHARM,<slot>` | `STARTLAT` — see below | run it on the most complex slot the board will actually be triggered with |
-| a scope on the trigger input and one output | `TRIGCOMP` — pin edge to ISR entry | the delivered latency is `STARTLAT` once this is set; everything from the ISR's first instruction onwards is already accounted for inside `STARTLAT` |
+| `tests/device/trigcomp.py`, a scope on the trigger input and one output | `TRIGCOMP` — pin edge to the output moving | 2.27 µs on the Teensy 3.5 in hand; it lumps the pin-to-ISR delay with the PIT wake and the DAC's latch-to-output delay, which this wiring cannot separate. Setting it makes a *triggered* train's delivered latency `STARTLAT` exactly, at the price of leading a `T`/`U` start by the same amount — so it is a per-board decision, not a constant to copy |
 
 `STARTLAT` has two floors. The one `Cal::validate` enforces is `PRELOAD + DACPROG2 + 3 µs` beyond
 `TRIGCOMP`. The one that actually sizes it is **the cost of `Engine::startTrain`**, because `t0`

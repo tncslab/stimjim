@@ -15,12 +15,16 @@ there is nothing else to install.
 | `pico2000.py` | ctypes binding for the legacy `ps2000` driver, which is what the PicoScope 2204A needs. Run it directly to probe the scope |
 | `pico2000a.py` | the same for the newer `ps2000a` driver. Unused on this bench; kept for 2000a-series models |
 | `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
+| `trigcomp.py` | Configuration B (docs/bench-wiring.md): `check` verifies the wiring one connection at a time, `threshold` measures the level IN0 actually switches at, `measure` times the physical edge to the output leaving baseline. The absolute trigger latency and hence `CAL TRIGCOMP`. `check` also measures the load through both output modes, which is what caught the 4× current-readback fault |
+| `scope_timebase.py` | Scope-only: does each PicoScope timebase deliver the sample interval it reports? Captures the unit's own AWG at a known frequency and measures the period back. Needs no StimJim, only the AWG on a scope channel |
 
 ```
 python smoke.py COM4 --screens ../../tmp/screens
 python bench_arm.py COM4
 python stage_timing.py COM4 --out ../../tmp/stage.txt
 python capture.py all
+python trigcomp.py check && python trigcomp.py measure --threshold 1.757
+python scope_timebase.py
 ```
 
 `bench_arm.py` is what sizes `CAL STARTLAT`, and the figure in `SJ_START_LATENCY_US` predates the

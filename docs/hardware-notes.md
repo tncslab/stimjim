@@ -86,6 +86,34 @@ a load attached (it is commented out of `begin()` for that reason, `Stimjim.cpp:
 - Calibration routines allow 30–50 µs settling after DAC steps before averaging ADC reads; first
   ADC reads after reconfiguration can show a transient (first 50 of 150 reads discarded).
 
+## Measured on the board in hand (Teensy 3.5, fw 0.8.0, 1 kΩ load)
+
+Three figures from the configuration B session (`tests/device/trigcomp.py`,
+[bench-wiring.md](bench-wiring.md)). All three are properties of this board, not of the firmware,
+and none of them has been checked on a second one.
+
+- **The channel-0 current readback is 4.02× low in voltage mode.** Driving a 1 kΩ resistor in
+  voltage mode, the board reports 441.9 µA where 1.77 mA flows; driving the same resistor in
+  current mode it reports 990.4 µA for 1000 µA set, which is right. The voltage readback agrees
+  with a scope in both modes, so the fault is on the current path in voltage mode alone. The error
+  is a clean constant factor across ±1 V to ±4 V and both polarities, which points at the AD7321's
+  input range or the sense chain's gain rather than at anything analog and load-dependent.
+  **Consequence:** every voltage-mode `MSUM`/`MDATA`/`READ` current is a quarter of the truth, and
+  the load resistance the OLED result pages derive from `V/I` is four times it — a 1 kΩ preparation
+  reads as 4 kΩ. Current-mode measurement is unaffected. Not yet diagnosed in the firmware.
+- **The voltage-mode output is 10–15 % below the commanded amplitude, and the shortfall grows with
+  load current.** Into 1 kΩ: 500 mV commanded gives 448 mV (−10.4 %), 4000 gives 3510 (−12.2 %),
+  8000 gives 6820 (−14.8 %), the last confirmed on a scope at 6.90 V. The incremental gain falls
+  from 0.885 to 0.80 over that span, so it is a gain error of about 0.89 plus compression above
+  ~4 mA rather than a pure scale factor. Current mode does not show it: 1000 µA set puts 1.017 V
+  across the same 1 kΩ.
+- **The analog output settles far faster than a reading of it does.** On a scope the output reaches
+  90 % of an 8 V step 1.91 µs after it starts moving (2.93 µs for a 1.8 V step). `BENCHSETTLE`
+  reports 8–9 µs for the same board, so most of `CAL SETTLE` is the ADC path — conversion, the
+  input-line switch, the isolator — and not the output stage. `CAL SETTLE` is still the right
+  budget for *when a reading means anything*, which is what it is used for; it is not the time the
+  output takes to arrive.
+
 ## Known analog limitations (stimjimPulser.ino:26-31)
 
 - Amplitudes above **3000 µA are converted incorrectly** on the DAC. The firmware warns at parse
