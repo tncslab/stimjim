@@ -369,12 +369,19 @@ CAL,STARTLAT,35                                # an independent route arms two e
 The gate delay of 500 000 µs is an exact multiple of the stimulus period, so the gate's rising
 edges at +0, +500 and +1000 µs land on stimulus events — the two phase starts and the park — while
 its falling edges at +50, +550 and +1050 µs land on nothing. The rises are pushed back by the
-contention and the falls are not, so **the first three gate pulses come out about 10 µs short**:
+contention and the falls are not, so **the first three gate pulses come out about 9 µs short**:
 
-| gate mode | pulse widths on the stimulus grid | 250 µs off the grid |
-|---|---|---|
-| voltage | 39.9, 40.8, 39.1, **49.0** µs | 49.1, 49.0, 49.0, 49.1 µs |
-| current | 40.1, 41.4, 39.5, **49.7** µs | 49.6, 49.4, 49.8, 49.7 µs |
+| gate mode | pulse widths on the stimulus grid | 250 µs off the grid | gate edge behind the stimulus edge |
+|---|---|---|---|
+| voltage | 40.1, 40.8, 39.3, **49.0** µs | 49.0, 48.8, 48.8, 49.0 µs | 8.74 µs |
+| current | 40.5, 41.8, 40.1, **49.5** µs | 49.4, 49.3, 49.6, 49.6 µs | 8.26 µs |
+
+The last column is the coincidence measured directly, at 20 ns per sample, and it accounts for the
+width deficit on its own: 49.0 − 40.1 = 8.9 µs against a measured 8.74, and 49.5 − 40.5 = 9.0
+against 8.26. It is larger than C1'"'"'s 7.39 µs because contention costs however long the *other*
+engine'"'"'s ISR takes, and the latch it collides with here is a heavier one — a current-mode stage
+with in-train measurement rather than C1'"'"'s unmeasured single-stage voltage train. Run to run the
+figure moves by a few tenths of a microsecond.
 
 ![the gate burst, and what the coinciding stimulus pulse does to the first of them](../figs/stimjim-usecase-gate.png)
 

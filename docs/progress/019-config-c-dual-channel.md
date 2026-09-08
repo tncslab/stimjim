@@ -12,7 +12,7 @@ now **100 kHz**, measured rather than estimated. A worked example — a biphasic
 channel 0 and a gating burst on channel 1, delayed half a second, started by one trigger edge —
 shows what the 7.39 µs costs in practice: when the gate's delay is an exact multiple of the
 stimulus period its rising edges collide with stimulus events and its falling edges do not, so the
-first three gate pulses come out 10 µs short of the 50 µs asked for. Moving the gate 250 µs off
+first three gate pulses come out about 9 µs short of the 50 µs asked for. Moving the gate 250 µs off
 the stimulus grid restores all four to full width and silences the firmware's own timing counters.
 
 ## The bench
@@ -176,10 +176,16 @@ events (the two phase starts and the park) and its falling edges at +50, +550 an
 nothing. The rises are pushed back by the contention, the falls are not, and the pulses come out
 short.
 
-| gate mode | pulse widths on the stimulus grid | with the gate 250 µs off the grid |
-|---|---|---|
-| voltage | 39.9, 40.8, 39.1, **49.0** µs | 49.1, 49.0, 49.0, 49.1 µs |
-| current | 40.1, 41.4, 39.5, **49.7** µs | 49.6, 49.4, 49.8, 49.7 µs |
+| gate mode | pulse widths on the stimulus grid | with the gate 250 µs off the grid | gate edge behind the stimulus edge |
+|---|---|---|---|
+| voltage | 40.1, 40.8, 39.3, **49.0** µs | 49.0, 48.8, 48.8, 49.0 µs | 8.74 µs |
+| current | 40.5, 41.8, 40.1, **49.5** µs | 49.4, 49.3, 49.6, 49.6 µs | 8.26 µs |
+
+The last column is the coincidence measured directly at 20 ns per sample, and it accounts for the
+width deficit by itself. It is larger than C1'"'"'s 7.39 µs because contention costs however long
+the *other* engine'"'"'s ISR takes, and the latch it collides with here is heavier — a current-mode
+stage carrying in-train measurement, against C1'"'"'s unmeasured single-stage voltage train. Run to
+run these move by a few tenths of a microsecond.
 
 The fourth pulse is full width in both cases, because its rise at +1500 µs has no stimulus event on
 it. The firmware reports the same thing with no scope involved: `# engine: 3 event(s) were already

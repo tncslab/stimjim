@@ -947,13 +947,26 @@ def usecase_figures(res):
     for ax, m in zip(axes[0], modes):
         dt, ch = res[m]["collide"]
         n = len(ch[ps.CHANNEL_A])
+        sk = res[m].get("collide_skew")
+        # Time relative to the gate edge, which is where the scope triggered:
+        # 25 % pre-trigger puts it a quarter of the way into the record.
         t = [(i - n / 4) * dt * 1e6 for i in range(n)]
         ax.plot(t, ch[ps.CHANNEL_A], lw=1.0, label=NAME[ps.CHANNEL_A])
         ax.plot(t, ch[ps.CHANNEL_B], lw=1.0, label=NAME[ps.CHANNEL_B])
-        ax.set_xlim(-6, 14)
+        # The window has to reach back past the stimulus edge. A fixed -6 us
+        # cropped it out whenever the skew was larger than that, which left
+        # CH0 looking flat in the very figure that measures its edge.
+        lead = sk * 1e6 if sk is not None else 0.0
+        ax.set_xlim(min(-lead, 0.0) - 4, 14)
+        if sk is not None:
+            ax.axvline(-lead, color="C0", ls="--", lw=0.9)
+            ax.axvline(0.0, color="C1", ls="--", lw=0.9)
+            ax.annotate("", (0.0, 0.35), (-lead, 0.35),
+                        arrowprops=dict(arrowstyle="<->", lw=0.9, color="0.3"))
+            ax.annotate(f"{lead:.2f} us", (-lead / 2, 0.40), fontsize=8,
+                        ha="center", va="bottom", color="0.3")
         ax.set_xlabel("time relative to the gate edge (us)")
         ax.set_ylabel("output (V)")
-        sk = res[m].get("collide_skew")
         ax.set_title(f"{m} gate" +
                      (f": gate edge {sk*1e6:+.2f} us from the stimulus edge"
                       if sk is not None else ""), fontsize=9)
@@ -964,6 +977,20 @@ def usecase_figures(res):
     fig.tight_layout()
     fig.savefig(FIGS / "stimjim-usecase-collision.png")
     plt.close(fig)
+
+    # The raw coincidence captures, so the figure above can be redrawn without
+    # occupying the bench again.
+    for m in modes:
+        dt, ch = res[m]["collide"]
+        n = len(ch[ps.CHANNEL_A])
+        with open(TMP / f"stimjim-usecase-collision-{m}.csv", "w",
+                  newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["t_us_from_gate_edge", "ch0_V", "ch1_V"])
+            for i in range(n):
+                w.writerow([f"{(i - n/4) * dt * 1e6:.4f}",
+                            f"{ch[ps.CHANNEL_A][i]:.4g}",
+                            f"{ch[ps.CHANNEL_B][i]:.4g}"])
 
     with open(TMP / "stimjim-usecase.csv", "w", newline="") as fh:
         w = csv.writer(fh)
