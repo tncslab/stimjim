@@ -474,8 +474,8 @@ emits a line for each one that differs from the build default. The `IDN` `# engi
 | `ADCSWITCH` | 4 | extra cost of a control-register line switch |
 | `GUARD` | 1 | margin between the last read and the next preload window |
 | `SETTLE` | 9 | after a latch, before a reading means anything (`BENCHSETTLE`) |
-| `STARTLAT` | 35 | fixed start-request → first-latch latency |
-| `TRIGCOMP` | 0 | hardware pin edge → trigger-ISR entry, subtracted for trigger starts |
+| `STARTLAT` | 35 | fixed start-request → first-latch latency (the board in hand runs **20**, measured and persisted; see §4 and timing.md §1) |
+| `TRIGCOMP` | 0 | hardware pin edge → the output moving, subtracted for trigger starts (the board in hand runs **2**, measured) |
 
 All values are whole microseconds, 0…1000. They are **budgets, so they carry the measured worst
 case, not the average** (§4 `BENCH`): a single outlying read that overruns its window pushes the
@@ -495,22 +495,24 @@ than being added to it. `BENCHARM,<slot>` measures that cost for one slot, and
 `tests/device/bench_arm.py` sweeps one slot per shape and prints what `STARTLAT` each needs.
 Measured on a Teensy 3.5 with the register backends: 9.0 µs for a slot that drives nothing,
 11.1 µs for a one-stage two-channel `S` train — measured or not, in-train measurement costs the
-arm nothing — 11.0 µs for a sine, 13.3 µs for a ten-stage `S` train with a point on every stage,
-and 15.0 µs for a ten-stage `L` train, which is the worst case because a ramp stage costs the arm
-more than a rectangular one does. Stage count barely matters: only the first stage is converted in
-the arm, and the player converts stage i+1 while stage i plays. `STARTLAT` must be at least the
-worst of those plus `PRELOAD + DACPROG2`, which is 24 µs; the 35 µs default adds the margin.
+arm nothing. Those are the *cold* figures, and since phase 14 they are the exception: `loop()`
+prepares each engine's next arm into its spare player, and on that prepared path the arm is
+**5.92–6.00 µs whatever the train** — flat in stage count, in waveform type, and in whether the
+train is measured. `STARTLAT` must be at least that plus `PRELOAD + DACPROG2 + 3 µs + TRIGCOMP`,
+which on a Teensy 3.5 is 20 µs by arithmetic and 17 by the firmware's own verdict under real
+trigger edges.
 
-Those figures assume `loop()` is running, because that is what prepares each engine's next
-measurement plan and clears the accumulators of the last train. An engine re-triggered so fast
-that `loop()` never ran in between falls back to doing both inside the arm, which costs about
-0.6 µs per measurement point and, if the slot also changed, another 3.1 µs per point — 20 µs of
-arm on the heaviest slot, which the 35 µs default still covers.
+The cold path is taken when the prepared player describes another slot — `loop()` starved, or the
+slot edited since it last ran. It costs about 0.6 µs per measurement point and, if the slot also
+changed, another 3.1 µs per point: 20 µs of arm on the heaviest slot, which the 35 µs compiled
+default still covers. A train has to *finish* before its engine can be re-armed, so this takes
+`loop()` starved for a whole train, not merely a fast trigger.
 
 A `TRIG` route in independent mode (`mode 2`) arms **two** engines from one edge, inside one ISR,
-so it pays the arm twice before the second engine's first latch is due: two ten-stage `L` trains
-need about 39 µs, and everything else fits in 35. When an arm does not fit, the train still runs
-— its first latch is simply late — and the completion carries
+so it pays the arm twice before the second engine's first latch is due. It is the case that sizes
+`STARTLAT`: measured on silicon it does not fit 20 µs — the firmware asks for 35, and 30 passes.
+When an arm does not fit, the train still runs — its first latch is simply late — and the
+completion carries
 
 ```
 WARN engine: arming this train took longer than CAL STARTLAT (35 us), so its first latch could

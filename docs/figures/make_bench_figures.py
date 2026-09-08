@@ -42,8 +42,11 @@ C_BAD = "#c0392b"         # a wrong value, or a region a value must not be in
 C_OK = "#2e7d32"
 C_BUDGET = "#6c757d"      # a firmware budget, not a measurement
 
-CAL_STARTLAT = 35         # us, the budget in force during the session
-IN0_THRESHOLD = 1.757     # V, measured; the reference instant of the latency
+# The reference instant of every latency here: the level IN0 was measured to
+# switch at (`trigcomp.py threshold`). `CAL STARTLAT` and `CAL TRIGCOMP` are
+# NOT constants here -- they are read from the per-shot CSV, so a figure always
+# describes the run that produced its data.
+IN0_THRESHOLD = 1.757
 
 
 def rows(name):
@@ -143,6 +146,8 @@ def fig_trigcomp_reference():
         [num(x[f"foot_at_{lv:.2f}V_us"]) for x in per_shot
          if x["amp_mV"] == "8000"]) for lv in levels}
 
+    startlat = num(per_shot[0]["startlat_us"])
+    trigcomp = num(per_shot[0]["trigcomp_us"])
     thr = rows("stimjim-in0-threshold.csv")
     v_pass = min(num(x["peak_V"]) for x in thr if int(x["trains"]) >= 5)
     v_fail = max(num(x["peak_V"]) for x in thr if int(x["trains"]) == 0)
@@ -172,13 +177,14 @@ def fig_trigcomp_reference():
     ys = [lat[k] for k in xs]
     ax1.plot(xs, ys, "o-", color=C_MEAS, ms=5)
     ax1.axvspan(v_fail, v_pass, color=C_BAD, alpha=0.18)
-    ax1.axhline(CAL_STARTLAT, color=C_BUDGET, lw=1.2, ls="--")
-    ax1.annotate(f"CAL STARTLAT = {CAL_STARTLAT} us",
-                 (0.03, CAL_STARTLAT), xycoords=("axes fraction", "data"),
+    ax1.axhline(startlat - trigcomp, color=C_BUDGET, lw=1.2, ls="--")
+    ax1.annotate(f"t0: STARTLAT {startlat:.0f} - TRIGCOMP {trigcomp:.0f} "
+                 f"= {startlat - trigcomp:.0f} us",
+                 (0.03, startlat - trigcomp), xycoords=("axes fraction", "data"),
                  fontsize=8, va="bottom", color=C_BUDGET)
     pick = lat[min(levels, key=lambda x: abs(x - IN0_THRESHOLD))]
     ax1.annotate(f"at the measured threshold:\n{pick:.2f} us,\n"
-                 f"{pick - CAL_STARTLAT:.2f} us over budget",
+                 f"{pick - (startlat - trigcomp):.2f} us after t0",
                  (IN0_THRESHOLD, pick), xytext=(-124, 34),
                  textcoords="offset points", fontsize=8, color=C_BAD, ha="left",
                  arrowprops=dict(arrowstyle="->", color=C_BAD, lw=0.9))
@@ -210,23 +216,28 @@ def fig_trigcomp_budget():
                                if x["amp_mV"] == "8000"])
     settle = statistics.fmean([num(x["settle_us"]) for x in per_shot
                                if x["amp_mV"] == "8000"])
-    excess = lat - CAL_STARTLAT
+    # The budget travels with the data, so this figure describes whatever run
+    # produced the CSV rather than a constant edited by hand.
+    startlat = num(per_shot[0]["startlat_us"])
+    trigcomp = num(per_shot[0]["trigcomp_us"])
+    # t0 = edge - TRIGCOMP + STARTLAT, and the output moves `hw` after t0.
+    # `hw` is the invariant: it does not depend on either budget.
+    t0 = startlat - trigcomp
+    hw = lat - t0
 
     fig, ax = plt.subplots(figsize=(10.5, 4.6), dpi=130)
 
-    # One timeline. The bar is what the firmware budgets, the block after it is
-    # what the bench found on top, and the brace names the three things inside
-    # that block which this wiring cannot tell apart.
-    ax.barh(1, CAL_STARTLAT, left=0, height=0.42, color=C_BUDGET, alpha=0.85)
-    ax.barh(1, excess, left=CAL_STARTLAT, height=0.42, color=C_BAD, alpha=0.9)
+    ax.barh(1, t0, left=0, height=0.42, color=C_BUDGET, alpha=0.85)
+    ax.barh(1, hw, left=t0, height=0.42, color=C_BAD, alpha=0.9)
     ax.barh(1, settle, left=lat, height=0.42, color=C_MEAS, alpha=0.5)
 
-    ax.annotate(f"CAL STARTLAT = {CAL_STARTLAT} us\n"
-                "the firmware schedules t0 here",
-                (CAL_STARTLAT / 2, 1), ha="center", va="center", fontsize=8.5,
+    ax.annotate(f"t0 scheduled at STARTLAT {startlat:.0f} "
+                f"- TRIGCOMP {trigcomp:.0f} = {t0:.0f} us\n"
+                "the firmware puts the first latch here",
+                (t0 / 2, 1), ha="center", va="center", fontsize=8.5,
                 color="white", weight="bold")
-    ax.annotate(f"{excess:.2f} us\nunaccounted",
-                (CAL_STARTLAT + excess / 2, 1), ha="center", va="center",
+    ax.annotate(f"{hw:.2f} us\nhardware",
+                (t0 + hw / 2, 1), ha="center", va="center",
                 fontsize=8, color="white", weight="bold")
     ax.annotate(f"output settling,\n{settle:.2f} us to 90 %",
                 (lat + settle / 2, 1.22), xytext=(26, 0),
@@ -241,14 +252,16 @@ def fig_trigcomp_budget():
                 f"(sd {jitter*1000:.0f} ns over 30 shots)",
                 (lat / 2, 1.36), ha="center", fontsize=8.5, color="0.2")
 
-    # What is inside the unaccounted block, and why it stays one block.
+    # What is inside the hardware block, and why it stays one block.
     ax.annotate(
-        "inside these " + f"{excess:.2f} us, in the order they happen:\n"
+        f"inside these {hw:.2f} us, in the order they happen:\n"
         "   pin edge -> trigger ISR entry   (what CAL TRIGCOMP is named for)\n"
         "   PIT wake and its 96-cycle scheduling quantum (0.8 us)\n"
         "   NLDAC pulse -> the AD5752 output starting to move\n"
         "This wiring sees only their sum: separating them needs a probe on\n"
-        "NLDAC, which is not brought out to a connector.",
+        "NLDAC, which is not brought out to a connector.\n"
+        f"CAL TRIGCOMP is set to {trigcomp:.0f}, which leaves {hw - trigcomp:.2f} us "
+        "uncompensated:\nCAL takes whole microseconds, and this sum is not one.",
         (1.0, 0.60), ha="left", va="top", fontsize=8, color="0.2",
         bbox=dict(boxstyle="round,pad=0.45", fc="#fdf1ef", ec=C_BAD, lw=0.8))
 
@@ -256,9 +269,9 @@ def fig_trigcomp_budget():
     ax.set_ylim(0.0, 1.62)
     ax.set_yticks([])
     ax.set_xlabel("microseconds after the trigger edge crosses the input threshold")
-    ax.set_title("Setting CAL TRIGCOMP to "
-                 f"{round(excess)} us makes the delivered edge-to-output latency "
-                 f"the budgeted {CAL_STARTLAT} us", fontsize=10.5)
+    ax.set_title(f"CAL STARTLAT {startlat:.0f} us, CAL TRIGCOMP {trigcomp:.0f} us: "
+                 f"the edge-to-output latency delivered is {lat:.2f} us",
+                 fontsize=10.5)
     ax.grid(alpha=0.3, axis="x")
     ax.legend(handles=[
         Patch(color=C_BUDGET, alpha=0.85, label="budgeted by the firmware"),

@@ -322,10 +322,12 @@ by `P` and reported by `IDN`), the ramp sample interval is per slot (`L`'s 7th h
 repetitions instead of being refused (`MEAS` `fit`). The trigger ISRs timestamp the edge and the
 engine measures the start latency from that timestamp, so interrupt entry and the arm-time
 precomputation are spent *inside* `CAL STARTLAT` rather than added to it — which is why
-`STARTLAT` has to be wide enough to hold the arm, is 35 µs rather than 20, and is reported by
-name when a train's arm does not fit it. `BENCHARM` measures the arm and `BENCHSETTLE` measures
-the settling time, so of the four budgets that once needed an oscilloscope only `TRIGCOMP`
-still does.
+`STARTLAT` has to be wide enough to hold the arm, and is reported by name when a train's arm does
+not fit it. Since phase 14 prepared the arm in `loop()` it is **20 µs** on the board in hand (a
+6.0 µs warmed arm plus `PRELOAD + DACPROG2 + 3 + TRIGCOMP`), against a compiled default of 35 that
+still covers the cold path and the independent route. `BENCHARM` measures the arm and
+`BENCHSETTLE` the settling time; `TRIGCOMP`, the last of the four budgets that needed an
+oscilloscope, was measured in phase 16 and is 2 µs.
 
 **Remaining work.**
 

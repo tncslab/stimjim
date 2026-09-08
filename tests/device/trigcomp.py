@@ -1,11 +1,18 @@
 """Configuration B: check the wiring, then measure `CAL TRIGCOMP`.
 
-`CAL TRIGCOMP` is the delay from the physical rising edge at trigger input IN0
-to the trigger ISR's first instruction. It is the one term of the delivered
-start latency the firmware cannot observe, because software only ever sees the
-instant it is already running. A scope that watches the edge and the output at
-the same time can see both, which is what this bench configuration is for
-(docs/bench-wiring.md, configuration B):
+`CAL TRIGCOMP` is named for the delay from the physical rising edge at trigger
+input IN0 to the trigger ISR's first instruction, but what it has to absorb --
+and what this measures -- is the whole delay from that edge to the *output*
+moving. Three things are in there: the pin-to-ISR delay, the PIT wake with its
+0.8 us scheduling quantum, and the AD5752's own latch-to-output delay. A scope
+on the trigger input and one output sees only their sum, because NLDAC is not
+brought out to a connector. On the Teensy 3.5 in hand the sum is 2.27 us, which
+is an order of magnitude more than the pin-to-ISR delay alone would be.
+
+Software cannot see any of it: it only ever knows the instant it is already
+running. A scope that watches the edge and the output at the same time sees
+both ends, which is what this bench configuration is for (docs/bench-wiring.md,
+configuration B):
 
     PicoScope AWG ---+---> StimJim trigger input IN0
                      |
@@ -485,6 +492,9 @@ def cmd_measure(scope, sj, shots, amps, set_cal, ref_levels, threshold):
             # so the reader can move the threshold and see the cost.
             row = {
                 "shot": k, "overflow": int(overflow),
+                # The budget in force travels with the data: a figure drawn
+                # from this file must not have to be told what it was.
+                "startlat_us": startlat, "trigcomp_us": trigcomp0,
                 "step_V": A["step"], "awg_step_V": B["step"],
                 "foot_us": (A["foot"] - B["t50"]) * dt * 1e6,
                 "t50_us": (A["t50"] - B["t50"]) * dt * 1e6,

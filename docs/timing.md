@@ -4,8 +4,9 @@ This document answers, in one place, how long `stimjimAWG` takes to put signal o
 after a trigger edge, why that number is what it is, how it compares with the original
 `stimjimPulser` firmware, whether the DAC can be preloaded to fire faster, what the trigger
 interrupt actually starts, whether waveform generation occupies the CPU, and what SD logging
-costs and stores. The short answers: a trigger edge delivers the first latch a fixed **35 µs**
-later on a Teensy 3.5 with the register backends (`CAL STARTLAT`, adjustable without a rebuild),
+costs and stores. The short answers: a trigger edge delivers the first latch a fixed **20 µs**
+later on a Teensy 3.5 with the register backends (`CAL STARTLAT`, adjustable without a rebuild,
+and 20 rather than the compiled default of 35 because phase 14's pre-arm made it reachable),
 of which the arm is now a small part — `loop()` prepares the whole of it into the engine's spare
 player before the edge, leaving the edge ISR to place `t0`, attach the plan, swap the player and
 program the timer — and none of which is the DAC write; the original firmware had no fixed
@@ -38,11 +39,32 @@ t0 = <edge timestamp> − CAL TRIGCOMP + CAL STARTLAT + <slot delay_us>
 
 ![the start path, by execution context](../figs/stimjim-timing-latch.png)
 
-`STARTLAT` is **35 µs** by default on a Teensy 3.5 at 120 MHz with the register backends, and
-120 µs on the portable (Arduino-SPI + `IntervalTimer`) build. It is runtime state:
-`CAL,STARTLAT,<us>` changes it, `P` persists it, `CAL?` reports what a running board uses. A board
-that already has an EEPROM image keeps the budget it stored — the image is not rejected over a
-default that only got smaller — so adopting the new one takes `CAL,STARTLAT,35` and `P`.
+`STARTLAT` is **20 µs** and `TRIGCOMP` **2 µs** on the Teensy 3.5 in hand, set and persisted on
+2026-09-08. The *compiled* defaults are still 35 and 0 (120 µs on the portable build); these are
+runtime state, so `CAL,STARTLAT,<us>` changes them, `P` persists them into the EEPROM image, and
+`CAL?` reports what a running board uses. A board that already has an image keeps what it stored,
+so a second board adopts these with `CAL,STARTLAT,20`, `CAL,TRIGCOMP,2` and `P` — after
+re-measuring, because `TRIGCOMP` is a property of the board and not a constant to copy.
+
+20 µs is what phase 014's pre-arm made reachable, and it puts the whole start latency inside one
+default 20 µs ramp sample interval. Measured on silicon with real trigger edges
+(`tests/device/startlat_trig.py`):
+
+| route | arm | floor the firmware names | 20 µs? |
+|---|---|---|---|
+| joint (`TRIG<n>,1,…`), one engine | 6.0 µs, any shape | 17 µs | yes, 3 µs of margin |
+| independent (`TRIG<n>,2,…`), two engines from one edge | twice that | **35 µs** | **no** |
+
+The delivered edge-to-output latency that buys is **20.26 µs** (sd 41 ns), measured from the input
+pin crossing its own switching threshold — see [bench-wiring.md](bench-wiring.md) configuration B.
+
+**An independent route no longer fits.** It arms two engines from one edge, so it needs
+`CAL,STARTLAT,30` or more; below that its first latch is late and the completion says so by name.
+Nothing else changes — the warning is per train, not a refusal — but a bench that routes two slots
+independently from one input has to raise `STARTLAT` back up, and thereby give up the sample-aligned
+start latency. A single train driving both channels is the construct that keeps both, and is
+already the right one for sample-aligned stimulation for the separate reason that independent
+routes contend for their first latch (§ the ~10 µs figure configuration A measures).
 
 The latency is deterministic because the edge ISR timestamps the edge in its own first
 instruction, and everything it then does is spent *inside* `STARTLAT` rather than added after it.
@@ -54,43 +76,48 @@ What has to fit in the window:
 | `CAL PRELOAD` — how early the player ISR wakes before the first latch | 4 µs |
 | `CAL DACPROG2` — the dual-channel SPI write inside that window | 5 µs budgeted (2.75 µs measured) |
 | `SJ_MIN_SCHEDULE_US` | 3 µs |
+| `CAL TRIGCOMP` — because it moves `t0` earlier, out of this same window | 2 µs |
 
-So `STARTLAT ≥ arm + 12 µs`. The arm used to be the term that sized it; since the preparation
-moved to `loop()`, **the 12 µs floor is what sizes it** — a preload plus a dual-channel program
-plus the scheduler's minimum, none of which any scheduling change can remove (§3 is the only route
-below it, and its last step is not built). When an arm does not fit, the train still runs with a
-late first latch, and its completion names the `STARTLAT` that would have covered it.
+So `STARTLAT ≥ arm + 12 µs + TRIGCOMP`, which on this board is 6 + 12 + 2 = 20. The arm used to
+be the term that sized it; since the preparation moved to `loop()`, **the 12 µs floor is what
+sizes it** — a preload plus a dual-channel program plus the scheduler's minimum, none of which any
+scheduling change can remove (§3 is the only route below it, and its last step is not built). The
+arithmetic is about 3 µs conservative: the firmware's own verdict under real trigger edges breaks
+at 17, not 20. When an arm does not fit, the train still runs with a late first latch, and its
+completion names the `STARTLAT` that would have covered it.
 
-**The 35 µs default has not been lowered, because a start latency is measured and not derived.**
-`SJ_START_LATENCY_US` still carries the phase-13 figure for the arm this firmware no longer
-performs on the prepared path. To adopt what the preparation buys on a given board: run
-`python tests/device/bench_arm.py COM4`, read the *warmed* column, then
-`CAL,STARTLAT,<warmed arm + PRELOAD + DACPROG2>` (never below 12) and `P`. Qualify the value with
-`tests/device/startlat_trig.py`, which needs real trigger edges — a `T`/`U` start is not charged
-for the arm and passes every candidate.
+**The compiled default is still 35, because a start latency is measured and not derived.**
+`SJ_START_LATENCY_US` carries the phase-13 figure for the arm this firmware no longer performs on
+the prepared path; the board in hand runs 20 from its EEPROM image. To adopt what the preparation
+buys on another board: run `python tests/device/bench_arm.py COM4`, read the *warmed* column, then
+`CAL,STARTLAT,<warmed arm + PRELOAD + DACPROG2 + TRIGCOMP>` (never below 12) and `P`. Qualify the
+value with `tests/device/startlat_trig.py`, which needs real trigger edges — a `T`/`U` start is
+not charged for the arm and passes every candidate.
 
-The case that used to exceed the 35 µs default no longer does: a `TRIG` route in independent mode
-arms two engines inside one ISR and pays the remainder twice, which on the prepared path is a few
-microseconds rather than the ~39 µs two ten-stage `L` trains once needed. What still pays the old
-cost is a start whose prepared player describes something else — `loop()` starved, or the slot
-edited since it last ran — and the default covers the worst of those (20.0 µs, a ten-stage `L`
-train compiling its own ten-point plan). A train has to *finish* before its engine can be re-armed,
-so `loop()` starved for a whole train is what that takes, not merely a fast trigger.
+Two cases still pay more than the warmed arm, and both were measured at 20 µs:
+
+- **An independent `TRIG` route** arms two engines inside one ISR and pays the remainder twice. It
+  does not fit 20: the firmware asks for **35 µs**, and 30 passes. This is the case that decides
+  whether a bench can use 20 at all.
+- **A start whose prepared player describes something else** — `loop()` starved, or the slot edited
+  since it last ran — falls back to the cold arm, the 9.0–20.0 µs §7 tabulates. A train has to
+  *finish* before its engine can be re-armed, so `loop()` starved for a whole train is what that
+  takes, not merely a fast trigger.
 
 Jitter, not latency, is what the design buys: residual latch jitter is **42 ns** (`BENCHPIT` with
 a preload), and the per-slot delay is exact to the scope's own sample interval (2000 µs set →
 1999.3 µs measured, 20000 → 19996.0).
 
-Two qualifications on the 35 µs:
+Two qualifications on the 20 µs:
 
-- **`CAL TRIGCOMP` is measured at 2.27 µs, and is left at 0.** The absolute figure is now
-  captured: on a Teensy 3.5 the output leaves its baseline 37.27 µs (sd 49 ns) after the input pin
-  crosses its own 1.757 V switching threshold, against a `STARTLAT` of 35. The 2.27 µs difference
-  is the pin-to-ISR delay *plus* the PIT wake and its 0.8 µs quantum *plus* the AD5752's
-  latch-to-output delay; a scope on the trigger input and one output sees only their sum, and
-  `NLDAC` is not brought out to separate them. It stays at 0 because `TRIGCOMP` is subtracted on
-  the trigger path only, while two of its three terms apply to a `T`/`U` start too, so setting it
-  makes triggered trains lead software-started ones by ~2 µs. See
+- **`CAL TRIGCOMP` is 2 µs, measured.** The hardware delay between the pin edge and the output
+  moving is 2.27 µs on this board: the pin-to-ISR delay *plus* the PIT wake and its 0.8 µs quantum
+  *plus* the AD5752's latch-to-output delay. A scope on the trigger input and one output sees only
+  their sum, and `NLDAC` is not brought out to separate them. `CAL` takes whole microseconds, so 2
+  is set and 0.26 µs is left over — which is why the delivered latency is 20.26 and not 20.00.
+  **It is subtracted on the trigger path only**, while two of its three terms apply to a `T`/`U`
+  start as well, so a triggered train's output now leads a software-started one by about 2 µs.
+  That is the intended trade: it buys an absolute, repeatable edge-to-output latency. See
   [bench-wiring.md](bench-wiring.md) configuration B.
 - **The analog path adds its own 8–9 µs.** After a latch the output needs that long to reach its
   final value (`BENCHSETTLE`), so the load sees the onset at `STARTLAT` and full amplitude 8–9 µs
@@ -123,9 +150,9 @@ The consequences are structural rather than tunable:
 - **The first pulse can be preempted by its own repeat.** The pin ISR runs at the core default
   priority while the repeat `IntervalTimer` runs at 64.
 - **Desk arithmetic, not a measurement:** the non-print terms sum to roughly 10 µs, so the best
-  case is under the 35 µs of `stimjimAWG` and the worst case is unbounded. Neither
-  firmware's absolute edge-to-output latency has been measured on this bench; what is measured is
-  the arm cost (`BENCHARM`) and the delay accuracy.
+  case is under the 20 µs of `stimjimAWG` and the worst case is unbounded. `stimjimPulser`'s own
+  absolute edge-to-output latency has never been measured; `stimjimAWG`'s has (20.26 µs, §1), and
+  the same bench would measure the other for a direct comparison.
 
 `stimjimAWG` differs by construction: no ISR ever prints (completions go through a ring and
 `loop()` prints them), `t0` is anchored to the edge timestamp so the arm is subtracted rather than
@@ -189,9 +216,10 @@ amplitude, so their first latch changes nothing at the output; moving it earlier
 timebase, not the onset. In that practical sense, the expectation that this matters for square
 waves is right, with those two extensions.
 
-The ceiling stands regardless: the output still needs 8–9 µs after the latch to reach full
-amplitude, so a pre-armed path would move the onset from ~35 µs to a few µs without sharpening the
-rise.
+The ceiling stands regardless: the output needs a further 1.9 µs after the latch to reach 90 % of
+an 8 V step (measured on a scope; the 8–9 µs `BENCHSETTLE` reports is mostly the ADC read path, not
+the output), so a pre-armed path would move the onset from the present 20 µs to a few µs without
+sharpening the rise.
 
 ## 4. What the trigger interrupt starts
 
@@ -441,18 +469,18 @@ the seventh against the eighth: **nine extra stages cost 2.2 µs on an `S` train
 | per further stage | 0.25 µs (`S`) / 0.31 µs (`L`) | one 64-bit `dur_us × 120` into `cum[]` and, for `L`, the sample-count division `rampStageN`. Both feed the measurement plan, so they cannot be deferred the way the rest of a stage can |
 | per measurement point | 0 | compiled and cleared in `loop()`. 0.55 µs to clear, and 3.1 µs more to compile, only when an engine is re-triggered before `loop()` ran |
 
-`CAL STARTLAT` is still **35 µs**, and that number belongs to the table above rather than to the
-firmware that now ships. It was set from the worst warmed arm — the ten-stage `L` train's 15.0 µs,
-needing 15.0 + `PRELOAD` + `DACPROG2` = 24 µs, which is not arithmetic alone: set
-`CAL,STARTLAT,23`, put a real trigger edge on that train, and the engine reports
-`set CAL STARTLAT >= 24 us`, while 25 and everything above runs clean. The worst *cold* arm — an
-engine re-triggered with `loop()` starved, compiling its own ten-point plan — is 19.96 µs and needs
-29, and 35 covers both.
+The table above is the *cold* arm, which is what the compiled default of 35 µs was set from: the
+worst warmed arm of phase 13 — a ten-stage `L` train's 15.0 µs — needed 24, and the worst cold arm
+— an engine re-triggered with `loop()` starved, compiling its own ten-point plan — is 19.96 µs and
+needs 29; 35 covered both.
 
-Item 9 makes the prepared path cost a fraction of that and leaves the cold path where it is, so 35
-is now a conservative default rather than a measured one, and lowering it is a `BENCHARM` run away
-(§1). Nothing is wrong while it stands: a start latency that is too generous costs latency, never
-correctness.
+Item 9 changed the warmed figure and left the cold one alone. Re-measured on silicon after phase
+14, `bench_arm.py`'s warmed column is **5.92–6.00 µs for every shape** — flat in stage count, flat
+in whether the train is measured, which is what "the preparation is done in `loop()`" means when it
+works. That puts the joint-route floor at 6.0 + `PRELOAD` + `DACPROG2` + 3 + `TRIGCOMP` = 20 µs by
+arithmetic and at **17 µs** by the firmware's own verdict under real trigger edges, and the board
+now runs `CAL STARTLAT` = 20 (§1). What did *not* improve is the independent route, which arms
+twice and still asks for 35.
 
 **The 8 µs target is not reachable by removing work from the arm, and the floor was reviewed term
 by term to establish that.** 9.04 µs at 120 MHz is 1085 cycles over roughly 150–250 instructions —
@@ -631,7 +659,9 @@ Ordered by what the measurements say each is worth, largest first.
 - **Pre-arm the whole train and fire on a bare `NLDAC` pulse** (§3). This makes the arm's cost
   irrelevant rather than smaller, and is the only path to a single-digit *total* trigger latency —
   and, given the 9.0 µs floor, the only path to an arm inside one latch interval.
-- **`CAL TRIGCOMP`** is measured (2.27 µs) but deliberately still 0: applying it would make a
-  triggered train's output lead a `T`-started one, because two of the three delays it lumps
-  together are common to both start paths. [bench-wiring.md](bench-wiring.md) configuration B has
-  the measurement and the argument.
+- **Separating the three delays `CAL TRIGCOMP` lumps together** — pin-to-ISR, PIT wake, DAC
+  latch-to-output — needs a probe on `NLDAC`, which no connector carries. Until then a triggered
+  start leads a `T`/`U` start by the 2 µs of compensation, because two of the three are common to
+  both paths. [bench-wiring.md](bench-wiring.md) configuration B has the measurement.
+- **An independent `TRIG` route does not fit `STARTLAT` = 20** and needs 30 µs or more; §1 has the
+  measured floors.

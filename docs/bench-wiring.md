@@ -92,8 +92,9 @@ is absent at every other delay.
 ## Configuration B — trigger edge and output on the scope at the same time
 
 **Measures: the absolute delay from the physical edge at the input pin to the output actually
-moving — the quantity `CAL TRIGCOMP` exists to cancel. Measured on a Teensy 3.5: 37.27 µs against
-a `CAL STARTLAT` of 35, so `TRIGCOMP` is 2.27 µs, with a shot-to-shot spread of 49 ns.**
+moving — the quantity `CAL TRIGCOMP` exists to cancel. On the Teensy 3.5 in hand the hardware part
+is 2.27 µs and the shot-to-shot spread 41–49 ns. `CAL TRIGCOMP` is now set to 2 and
+`CAL STARTLAT` to 20, which delivers 20.26 µs from the edge to the output.**
 
 `tests/device/trigcomp.py` drives the whole of this section: `check` verifies the wiring
 connection by connection, `threshold` measures the input pin's own switching level, and `measure`
@@ -133,10 +134,12 @@ CH0(−) rather than partway down a chain, CH1 and the LED branch are gone, and 
 resistor. The last of those is measured through **both** output modes, because one mode on its own
 cannot tell a bad contact from a miscalibrated readback — see the load fault below.
 
-`measure` sets `CAL,TRIGCOMP,0` and `CAL,STARTLAT,35`, defines `S20,90,3,100000,1000;8000,0,2000`,
-routes `TRIG0,1,20,-1,0`, and captures 30 shots at 5 Hz per amplitude. Mode 90 rather than 0 turns
-in-train measurement off, which keeps the USB serial quiet during the captures without touching
-the path being timed.
+`measure` reads whatever `CAL STARTLAT` and `CAL TRIGCOMP` the board is running (it never sets
+them), defines `S20,90,3,100000,1000;8000,0,2000`, routes `TRIG0,1,20,-1,0`, and captures 30 shots
+at 5 Hz per amplitude. Mode 90 rather than 0 turns in-train measurement off, which keeps the USB
+serial quiet during the captures without touching the path being timed. Both budgets are written
+into every row of `tmp/stimjim-trigcomp.csv`, so the figures describe the run that produced them.
+To measure the raw hardware delay rather than the residual, set `CAL,TRIGCOMP,0` first.
 
 ### Two things the original procedure got wrong
 
@@ -159,9 +162,10 @@ agreement is the check that the load and the settling are not inside the number.
 | | |
 |---|---|
 | edge (at 1.757 V) → output leaves baseline | **37.27 µs**, sd 49 ns over 30 shots |
-| `CAL STARTLAT` in force | 35 µs |
-| unaccounted, i.e. `CAL TRIGCOMP` | **2.27 µs** |
+| `CAL STARTLAT` in force for that measurement | 35 µs, `TRIGCOMP` 0 |
+| hardware delay the budget does not cover | **2.27 µs** |
 | output settling, foot to 90 % | 1.91 µs at 8 V, 2.93 µs at 2 V |
+| after setting `STARTLAT` 20 and `TRIGCOMP` 2 | **20.26 µs** delivered, sd 41 ns |
 
 ![what the 37.3 µs is made of](../figs/stimjim-trigcomp-budget.png)
 ![why the reference instant decides the answer](../figs/stimjim-trigcomp-reference.png)
@@ -176,14 +180,19 @@ between the edge and the output, and this wiring sees only their sum:
 
 Separating them needs a probe on `NLDAC`, which is not brought out to a connector. So `TRIGCOMP`
 is best read as *everything between the edge and the output that `STARTLAT` does not already
-cover*, and setting it to 2 makes the delivered edge-to-output latency the budgeted 35 µs.
+cover*, and setting it brings the delivered edge-to-output latency down to the budget.
 
-**Setting it is a decision, not a formality.** `TRIGCOMP` is subtracted only on the trigger path
+**It is now set to 2, and that was a decision.** `TRIGCOMP` is subtracted only on the trigger path
 (`t0 = edge − TRIGCOMP + STARTLAT + delay`), while two of its three terms — the PIT wake and the
-DAC's latch-to-output delay — apply to a `T`/`U` start as well. Setting `TRIGCOMP` to the full
-2.27 µs therefore makes a triggered train's output lead a `T`-started one by about 2 µs. Set it if
-what matters is the edge-to-output latency of a triggered train; leave it at 0 if what matters is
-that both start paths behave alike. It is left at 0 until that is decided.
+DAC's latch-to-output delay — apply to a `T`/`U` start as well, so a triggered train's output now
+leads a `T`-started one by about 2 µs. That trade buys an absolute, repeatable edge-to-output
+latency, which is what a trigger input is for. `CAL` takes whole microseconds, so 0.26 µs of the
+2.27 is left over.
+
+Re-measured with `CAL STARTLAT` = 20 and `CAL TRIGCOMP` = 2 in force, the delivered latency is
+**20.263 µs** at 8000 mV and **20.278 µs** at 2000 mV — `t0` at 18 µs plus the same 2.26 µs of
+hardware, which is the check that the hardware term does not depend on the budget it is measured
+against.
 
 This is the only configuration that measures the instrument's **absolute** trigger-to-output
 latency. Everything else on this bench is differential — the same edge starts a reference pulse on

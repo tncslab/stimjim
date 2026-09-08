@@ -43,11 +43,12 @@ from matplotlib.patches import FancyArrowPatch, Patch
 
 FIGS = pathlib.Path(__file__).resolve().parents[2] / "figs"
 
-# CAL in microseconds (Teensy 3.5, register backends). STARTLAT is the candidate
-# the pre-armed path makes reachable, not the build default of 35 -- see the
-# panel A note and docs/timing.md section 1.
+# CAL in microseconds (Teensy 3.5, register backends), as measured and set on
+# 2026-09-08: STARTLAT 20 is what the pre-armed path makes reachable and is now
+# the value in the EEPROM image, and TRIGCOMP 2 is the measured hardware delay
+# between the pin edge and the output moving. See docs/timing.md section 1.
 CAL = dict(PRELOAD=4, DACPROG1=3, DACPROG2=5, ADCREAD=3, ADCSWITCH=4,
-           GUARD=1, SETTLE=9, STARTLAT=20, TRIGCOMP=0)
+           GUARD=1, SETTLE=9, STARTLAT=20, TRIGCOMP=2)
 MIN_SCHEDULE = 3          # SJ_MIN_SCHEDULE_US, the slack Cal::validate insists on
 
 # What the BENCH group measures on that board: (min, max) over n = 2000.
@@ -186,7 +187,12 @@ def fig_latch():
 
     # -- panel A: trigger edge to the first output sample --------------------
     lat = CAL["STARTLAT"]
-    trigcomp = 0.4                      # CAL TRIGCOMP is 0/unmeasured; nominal
+    # The pin-to-ISR delay drawn on its own. It is NOT CAL["TRIGCOMP"]: that
+    # setting is 2 us and covers the whole edge-to-output hardware delay, of
+    # which pin-to-ISR is only the first term (docs/bench-wiring.md config B).
+    # 0.4 us is a nominal for the drawing; the three terms have never been
+    # separated, because NLDAC is not brought out to a connector.
+    trigcomp = 0.4
     arm_lo, arm_hi = ARM["prepared"]
     cold_lo, cold_hi = ARM["cold"]
     wake = lat - CAL["PRELOAD"] - CAL["DACPROG2"]     # 11: preload window opens
@@ -256,7 +262,8 @@ def fig_latch():
     instant(ax0, 0, -0.20, 4.21, "trigger pin edge", ha="left")
     instant(ax0, wake, -0.20, 4.21, "PIT fires")
     instant(ax0, lat, -0.20, 4.21, "t0: output steps")
-    ax0.annotate("TRIGCOMP = 0: the pin edge to\nISR entry, unseen by software",
+    ax0.annotate("the pin edge to ISR entry, unseen by software:\n"
+                 "the first of the three delays that CAL\nTRIGCOMP = 2 us covers together",
                  xy=(trigcomp + 0.1, 2.68), xytext=(-13.8, 2.30), ha="left",
                  va="center", fontsize=7, color=C_WAIT, linespacing=1.3,
                  arrowprops=dict(arrowstyle="-|>", lw=0.7, color=C_WAIT,

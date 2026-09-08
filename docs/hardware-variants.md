@@ -163,13 +163,23 @@ in this order:
 `TRIGCOMP`. The one that actually sizes it is **the cost of `Engine::startTrain`**, because `t0`
 is measured from the start request and every microsecond of arming is spent inside the latency
 rather than added to it. `BENCHARM` measures that per slot, and `tests/device/bench_arm.py` sweeps the
-shapes: on the Teensy 3.5 register build, 9.0 µs for a slot that drives nothing, 11–12 µs for a
-one-stage `S`, `L` or `W` train, 13.3 µs for a ten-stage `S` and 15.0 µs for a ten-stage `L`, with
-in-train measurement costing nothing on any of them and stage count costing about 0.3 µs a stage.
-Roughly double on the portable route. The defaults are 35 µs and 120 µs. A `TRIG` route in independent mode arms two engines from one edge
-and so needs twice the arm; when an arm does not fit, the train's completion says so and names the
-`STARTLAT` that would have covered it, so this is one of the values a board can be qualified for
-over the serial port alone.
+shapes. Since phase 14 moved the preparation into `loop()`, the *warmed* arm on the Teensy 3.5
+register build is **5.92–6.00 µs for every shape** — flat in stage count, flat in whether the train
+is measured, flat across `S`, `L` and `W` — because what is left after the edge is placing `t0`,
+attaching the plan, swapping the player and programming the timer. The *cold* arm, taken when the
+prepared player describes another slot, still costs the phase-13 figures: 9.0 µs undriven, up to
+20.0 µs for a ten-stage `L` compiling its own ten-point plan. Roughly double on the portable route.
+
+So the floor is `arm + PRELOAD + DACPROG2 + 3 + TRIGCOMP`, and on this board that is 20 µs by
+arithmetic and 17 µs by the firmware's own verdict under real trigger edges. The compiled defaults
+are 35 µs and 120 µs; the board in hand is set to and persisted at **20**.
+
+**A `TRIG` route in independent mode arms two engines from one edge and needs twice the arm**, and
+it is the case that decides the number: measured at `STARTLAT` 20 it does not fit and the firmware
+asks for 35, while 30 passes. When an arm does not fit, the train still runs and its completion
+says so and names the `STARTLAT` that would have covered it, so this is one of the values a board
+can be qualified for over the serial port alone — `tests/device/startlat_trig.py` does exactly
+that, and covers both route modes.
 
 Those figures assume a running `loop()`, which is what prepares each engine's next measurement plan
 and clears the last train's accumulators, and a train that has started, which is what derives the

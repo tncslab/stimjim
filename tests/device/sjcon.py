@@ -63,7 +63,13 @@ class StimJim:
 
     # Lines the firmware emits on its own schedule from loop(), which can land
     # in the middle of any reply: end-of-train summaries and deferred warnings.
-    ASYNC = ("Train #", "Note: no measurement", "WARN trigger:", "MSUM,", "MDATA,")
+    # `MRANGE` accompanies every `MSUM` (one per measured point) and `WARN
+    # engine:` follows a completion whose arm or whose latches did not fit --
+    # both arrive from loop() at train end, never as a reply to a command. The
+    # setter warnings cmd1 handles below are `WARN <cmd>:` for the command word
+    # actually sent, so naming the two loop() sources here does not shadow them.
+    ASYNC = ("Train #", "Note: no measurement", "WARN trigger:", "WARN engine:",
+             "MSUM,", "MRANGE,", "MDATA,")
 
     def cmd1(self, line, **kw):
         """Send a command expected to answer with exactly one record line.
