@@ -198,19 +198,25 @@ This is the only configuration that measures the instrument's **absolute** trigg
 latency. Everything else on this bench is differential — the same edge starts a reference pulse on
 the other engine — so the delays above cancel there and are invisible.
 
-### The load fault this configuration found
+### What this configuration found about measuring current
 
-The 1 kΩ across CH0 read as **3988 Ω** through the board's own voltage-mode measurement, stably,
-linearly and symmetrically, at every amplitude. It is not the load and not the contacts: driving
-the same resistor in **current** mode, where the pump forces a known current and the scope reads
-the voltage, gives **993 Ω ± 3 %**. The board's voltage readback agrees with the scope throughout,
-so what is wrong is the **channel-0 current readback in voltage mode, low by a factor of 4.02**.
+The 1 kΩ across CH0 read as **3988 Ω** through the board's own voltage-mode measurement — stably,
+linearly and symmetrically, at every amplitude. Neither the load nor the contacts: driving the same
+resistor in **current** mode, where the pump forces a known current and the scope reads the
+voltage, gives **991 Ω ± 2 %**, and the board's voltage readback agrees with the scope throughout.
 
-![the same resistor through both modes](../figs/stimjim-load-two-modes.png)
+The cause is in the analog path, not in the ADC. The DG409 output mux has a second bank that ties
+`I_OUT` — the branch holding the 100 Ω sense shunt — to `CHANNEL_OUT` in current mode and to an
+on-board 1 kΩ dummy in every other mode. So in voltage mode the sense amplifier was reading the
+Howland pump's own current into that dummy, which tracks the DAC code and says nothing about the
+load. **There is no shunt in the voltage path at all: on this hardware the load current in voltage
+mode is not measurable.** The firmware no longer reports one, and says why once per train.
 
-This matters well beyond the bench: every voltage-mode `MSUM`, `MDATA` and `READ` current figure
-is a quarter of the truth, and the load resistances the OLED result pages compute from them are
-four times it. See [hardware-notes.md](hardware-notes.md).
+![measuring the load through the mode that can](../figs/stimjim-load-two-modes.png)
+
+Check 6 therefore measures the load in current mode with the scope as the voltage reference, and
+fails if a current appears in voltage mode. See [hardware-notes.md](hardware-notes.md) for the
+topology and [serial-protocol.md](serial-protocol.md) §`MEAS` for what the rule does to `what`.
 
 ---
 

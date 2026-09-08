@@ -211,8 +211,15 @@ def main():
         names = [l.split(",")[1] for l in cal[:-1]]
         eq(names[0], "PRELOAD", "first parameter is PRELOAD")
         check("TRIGCOMP" in names, "TRIGCOMP is in the set")
-        eq(sj.cmd1("CAL,TRIGCOMP?"), "CAL,TRIGCOMP,0",
-           "trigger compensation is 0 until someone measures it")
+        # No value is asserted here. A board that has been through
+        # docs/bench-wiring.md configuration B runs a measured TRIGCOMP and a
+        # lowered STARTLAT (docs/timing.md section 1), and a regression run has
+        # no business insisting on the build defaults.
+        check(sj.cmd1("CAL,TRIGCOMP?").startswith("CAL,TRIGCOMP,"),
+              "trigger compensation round-trips through its query")
+        # CALDEF below resets the whole runtime budget, so keep a copy: a smoke
+        # run must not be what silently un-calibrates an instrument.
+        entry_cal = list(cal[:-1])
         settle = sj.cmd1("CAL,SETTLE?")
         eq(sj.cmd1("CAL,SETTLE,6"), "CAL,SETTLE,6", "one parameter set echoes back")
         eq(sj.cmd1("CAL,SETTLE?"), "CAL,SETTLE,6", "and is what the board now uses")
@@ -229,6 +236,17 @@ def main():
         eq(sj.cmd("CALDEF", quiet=0.6, limit=15)[-1], "OK", "CALDEF ends with OK")
         eq(sj.cmd1("CAL,SETTLE?"), settle, "CALDEF restored the build default")
         check(any("cal=default" in l for l in sj.cmd("IDN")), "IDN reports the default budget")
+        # Put back what the board was running. In the order CAL? prints them,
+        # which puts STARTLAT before TRIGCOMP -- the one ordering that cannot
+        # trip the "STARTLAT covers TRIGCOMP + the programming" invariant on the
+        # way through.
+        for line in entry_cal:
+            _, name, val = line.split(",")
+            r = sj.cmd1(f"CAL,{name},{val}")
+            if r.startswith("ERR"):
+                check(False, f"restoring CAL {name}={val}: {r}")
+        eq(sj.cmd("CAL?", quiet=0.6, limit=15)[:-1], entry_cal,
+           "the CAL section leaves the budget as it found it")
 
         print("\n[DT: the per-slot ramp sample interval]")
         eq(sj.cmd1("L8,0,1,10000,200000,0,25;4095,1000,1000"),
@@ -336,8 +354,12 @@ def main():
         eq(stat(sj)["slot0"], -1, "engine idle again after the train")
 
         print("\n[measurement: MSUM, MDATA and the fit refusal]")
-        # 2 ms stages, V+I on both channels: the widest measurement point there
-        # is, and it must fit without pushing a latch late.
+        # 2 ms stages, channel 0 in voltage mode and channel 1 in current mode.
+        # That is three reads, not four: the current line is dropped for a
+        # voltage-mode channel, because there the sense shunt sits in the
+        # branch the output mux has parked on an on-board dummy and carries the
+        # current pump's own current rather than the load's (serial-protocol.md
+        # section MEAS). It must fit without pushing a latch late.
         sj.cmd1("S4,0,1,10000,50000;5000,1000,2000;-5000,-1000,2000")
         r = run_train(sj, "T4", 1.2)
         msum = [l for l in r if l.startswith("MSUM,")]
@@ -367,12 +389,27 @@ def main():
             eq(g0[1], msum[0].split(",")[1], "MRANGE names the same slot")
             eq(g0[3], msum[0].split(",")[3], "MRANGE names the same point")
             f0 = msum[0].split(",")
-            for pos, name in ((4, "V0"), (6, "I0")):
+            # V0 (channel 0, voltage mode) and I1 (channel 1, current mode).
+            # I0 is deliberately empty -- checked separately below.
+            for pos, name in ((4, "V0"), (10, "I1")):
                 lo, hi = float(g0[pos]), float(g0[pos + 1])
                 mean = float(f0[pos])
                 check(lo <= mean <= hi,
                       f"{name}: min {lo} <= mean {mean} <= max {hi}")
-                check(lo < hi, f"{name}: the readings actually varied ({lo}..{hi})")
+                # Only the driven line is required to show a spread. Whether a
+                # reading varies at all is a property of the signal, not of the
+                # accumulator: channel 1 has nothing connected on this bench, so
+                # its current sits on one ADC code and min == max honestly.
+                if name == "V0":
+                    check(lo < hi, f"{name}: the readings actually varied ({lo}..{hi})")
+            # The rule this train exists to exercise: a voltage-mode channel
+            # reports no current at all, in MSUM and in MRANGE alike.
+            check(f0[6] == "" and f0[7] == "",
+                  f"MSUM: no current for the voltage-mode channel: {f0[6]!r}")
+            check(g0[6] == "" and g0[7] == "",
+                  f"MRANGE: no current for the voltage-mode channel: {g0[6]!r}")
+            check(any("current line is not measured" in l for l in r),
+                  "the train says why the current field is empty")
 
             # The panel reads the same accumulators, so the RESULT pages appear
             # as soon as a measured train completes and the firmware jumps to
@@ -422,7 +459,13 @@ def main():
         # fit = 1 measures all four lines over four consecutive pulses. Stage 1
         # is long and does not rotate. 20 pulses, so each line of stage 0
         # accumulates about five samples.
-        sj.cmd1("S6,0,1,10000,200000;5000,1000,30;-5000,-1000,1000")
+        #
+        # Both channels in *current* mode, because that is what makes four
+        # lines: a voltage-mode channel reports no current (serial-protocol.md
+        # section MEAS), which would make this a three-line rotation and stop it
+        # testing the four-group path. Amplitudes in uA here, kept under the
+        # 3000 uA the DAC converts correctly.
+        sj.cmd1("S6,1,1,10000,200000;2000,1000,30;-2000,-1000,1000")
         sj.cmd1("MEAS6,3,3,0,-1,0,0")
         r = run_train(sj, "T6", 1.6)
         check(any(l.startswith("WARN MEAS:") and "not measured" in l for l in r),

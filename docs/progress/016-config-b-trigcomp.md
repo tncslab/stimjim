@@ -1,5 +1,12 @@
 # 016 — configuration B: the absolute trigger latency, and two faults found on the way
 
+> **Correction, phase 018.** The "channel-0 current readback is 4× low in voltage mode" conclusion
+> below is wrong, and so is reading the voltage droop as a gain error. The reading was not
+> miscalibrated: in voltage mode the output mux parks the sense shunt's branch on an on-board
+> dummy, so the sense amplifier was measuring the current pump's own branch and not the load at
+> all — the apparent factor of 4 was an artefact of the 1 kΩ load. The trigger-latency results in
+> this entry are unaffected. See `018-voltage-mode-current.md`.
+
 The last quantity in the stimjimAWG firmware without a measured value now has one. On a Teensy 3.5
 running fw 0.8.0 with the register backends, the channel-0 output leaves its baseline **37.27 µs
 (sd 49 ns over 30 shots)** after the physical rising edge at trigger input IN0 crosses the level

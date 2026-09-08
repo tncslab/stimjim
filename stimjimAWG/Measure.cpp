@@ -158,8 +158,24 @@ static void planCompile(Plan& pl, uint8_t slot, const TrainDef& def, const Geome
   // `what` (0 none, 1 V, 2 I, 3 both) is already a line bitmask: bit0 = line 0
   // (output voltage), bit1 = line 1 (current sense). A channel the train does
   // not drive is never measured, whatever MEAS says (protocol §4).
-  pl.lines[0] = (g.chMask & 1) ? (uint8_t)(def.meas.what0 & 3) : 0;
-  pl.lines[1] = (g.chMask & 2) ? (uint8_t)(def.meas.what1 & 3) : 0;
+  //
+  // Line 1 is dropped in *voltage* mode, because there it does not measure the
+  // load. The DG409 (U23/U12) steers CHANNEL_OUT from V_OUT and parks I_OUT on
+  // R14, the on-board 1 kOhm dummy; the 100 Ohm shunt the AD8421 reads (R12)
+  // sits in the I_OUT branch, so what it carries is the Howland pump's own
+  // current into that dummy. The pump is driven by the same DAC code whatever
+  // the mux does, so the reading is real, linear and entirely unrelated to the
+  // load — it is the DAC code reinterpreted as a current, measured to 0.8 %.
+  // There is no shunt anywhere in the V_OUT path, so in voltage mode the load
+  // current is not measurable on this hardware and must not be reported as if
+  // it were. Current mode is unaffected: there I_OUT *is* the output.
+  const uint8_t keep0 = (def.mode0 & 1) ? 3u : 1u;   // voltage mode: line 0 only
+  const uint8_t keep1 = (def.mode1 & 1) ? 3u : 1u;
+  pl.lines[0] = (g.chMask & 1) ? (uint8_t)(def.meas.what0 & 3 & keep0) : 0;
+  pl.lines[1] = (g.chMask & 2) ? (uint8_t)(def.meas.what1 & 3 & keep1) : 0;
+  // Only flag a channel that actually asked for the current it cannot have.
+  if ((g.chMask & 1) && (def.meas.what0 & 2) && !(def.mode0 & 1)) pl.vModeNoI |= 1;
+  if ((g.chMask & 2) && (def.meas.what1 & 2) && !(def.mode1 & 1)) pl.vModeNoI |= 2;
   pl.nReads = (uint8_t)(bitCount2(pl.lines[0]) + bitCount2(pl.lines[1]));
   if (pl.nReads == 0) return;              // on stays false
 
@@ -649,6 +665,14 @@ static void printNote(uint8_t eng) {
   if (p.peakMismatch)
     Serial.printf("WARN MEAS: slot %u sine peaks follow channel %u; the other measured "
                   "channel has a different frequency or phase\n", p.slot, p.peakChannel);
+  if (p.vModeNoI)
+    // Said once per train rather than per point: it is a property of the
+    // channel's output mode, so every point of the train shares it.
+    Serial.printf("# MEAS: slot %u: channel %s in voltage mode, where the current sense sits "
+                  "in the disconnected I_OUT branch and reads the current pump's own current "
+                  "into the on-board 1 kOhm dummy, not the load's — the current line is not "
+                  "measured. Use current mode to measure current.\n",
+                  p.slot, p.vModeNoI == 3 ? "0 and 1 are" : (p.vModeNoI == 1 ? "0 is" : "1 is"));
 }
 
 // Everything an MDATA line and a log row have in common, appended at `p`:

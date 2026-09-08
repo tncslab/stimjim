@@ -271,6 +271,28 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>,<fit>
   (§2): mode 90/91 forces 0; a plain 0/1 promotes a stored 0 back to 3 (an explicit 1/2 is
   preserved). Channels the train does not drive (mode 2/3) are never measured; setting a
   non-zero `what` on one is accepted with `WARN` (meaningless until the mode changes).
+
+  **The current line is dropped for a channel in voltage mode**, whatever `what` asks for. It is
+  not a limitation of the measurement code: the 100 Ω shunt the sense amplifier reads sits in the
+  `I_OUT` branch, and the output mux ties that branch to the output only in current mode — in
+  voltage mode it is parked on an on-board 1 kΩ dummy while the output comes from `V_OUT`, which
+  has no shunt in it at all. A reading taken there is the current pump's own branch current, which
+  tracks the DAC code and is unrelated to the load, so reporting it as the load's would be worse
+  than reporting nothing. The stored `what` is untouched — switch the slot to current mode and the
+  current comes back. `MSUM`, `MRANGE` and `MDATA` leave the current fields empty, the OLED result
+  pages show `--` for I and R, and one `#` line per train says why:
+
+  ```
+  # MEAS: slot 40: channel 0 and 1 are in voltage mode, where the current sense sits in the
+  disconnected I_OUT branch and reads the current pump's own current into the on-board 1 kOhm
+  dummy, not the load's — the current line is not measured. Use current mode to measure current.
+  ```
+
+  Dropping the line also shrinks `nReads`, so a voltage-mode point needs a narrower gap than the
+  tables below assume: one line on one channel rather than two. The immediate commands `READ` and
+  the legacy `E` still read both ADC lines unconditionally — `E`'s reply is byte-frozen by the
+  compatibility contract (§1) — so line 1 there carries the same unusable number outside current
+  mode.
 - `when` — the measurement instant inside the selected stage/period; codes are type-specific
   and a mismatch → `ERR` (changing a slot's type auto-coerces `when` and `stage` to the new
   type's defaults):

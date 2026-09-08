@@ -22,7 +22,7 @@ Teensy-based boards; a port would replace `FastIO`/`Engine` internals.
 | AD5752 (U6/U17) | 16-bit dual bipolar DAC; SPI 30 MHz max, mode 1/2; 24-bit frames; two's complement; output latched by NLDAC pin |
 | AD7321 (U7/U18) | 12-bit-plus-sign (13-bit signed) 2-input SAR ADC; SPI 10 MHz, mode 2; input selected via control register (line 0 = output voltage, line 1 = current sense); has intrinsic "bipolar zero error" → boot offset calibration |
 | AD8421 (U24/U29) | instrumentation amp, current sense |
-| DG409 (U12/U23) | 4:1 analog mux — output mode steering via `OE0_x`/`OE1_x` (voltage / current / hi-Z / ground) |
+| DG409 (U12/U23) | **dual** 4:1 analog mux, addressed by `OE1:OE0` = the mode bits. Bank B picks what `CHANNEL_OUT` sees (`V_OUT` / `I_OUT` / open / `GRND`); bank A picks what `I_OUT` is tied to — `CHANNEL_OUT` in current mode, and R14, a 1 kΩ on-board dummy to ground, in all three others. That second bank is why the current sense reads nothing useful outside current mode |
 | OPA197 (×6) | Howland current pump + buffers |
 | LT1995 (U27/U28) | difference/gain amp (voltage path, gain 1.505) |
 | AD1582 (U8/U19) | 2.5 V reference |
@@ -40,7 +40,7 @@ Teensy-based boards; a port would replace `FastIO`/`Engine` internals.
 
 ```
 MICROAMPS_PER_DAC  0.1017   // 20 V span · (1/3000 V/A) / 2^16
-MICROAMPS_PER_ADC  0.85     // (1/(100·(1+49.9k/1.8k)) V/A) · 20 V / 2^13
+MICROAMPS_PER_ADC  0.85     // (1/(100·(1+9.9k/360)) V/A) · 20 V / 2^13   [R12 shunt, R13 gain]
 MILLIVOLTS_PER_DAC 0.4574   // 20 V / 2^16 · gain 1.505
 MILLIVOLTS_PER_ADC 2.44     // 20 V / 2^13
 ```
@@ -92,21 +92,25 @@ Three figures from the configuration B session (`tests/device/trigcomp.py`,
 [bench-wiring.md](bench-wiring.md)). All three are properties of this board, not of the firmware,
 and none of them has been checked on a second one.
 
-- **The channel-0 current readback is 4.02× low in voltage mode.** Driving a 1 kΩ resistor in
-  voltage mode, the board reports 441.9 µA where 1.77 mA flows; driving the same resistor in
-  current mode it reports 990.4 µA for 1000 µA set, which is right. The voltage readback agrees
-  with a scope in both modes, so the fault is on the current path in voltage mode alone. The error
-  is a clean constant factor across ±1 V to ±4 V and both polarities, which points at the AD7321's
-  input range or the sense chain's gain rather than at anything analog and load-dependent.
-  **Consequence:** every voltage-mode `MSUM`/`MDATA`/`READ` current is a quarter of the truth, and
-  the load resistance the OLED result pages derive from `V/I` is four times it — a 1 kΩ preparation
-  reads as 4 kΩ. Current-mode measurement is unaffected. Not yet diagnosed in the firmware.
-- **The voltage-mode output is 10–15 % below the commanded amplitude, and the shortfall grows with
-  load current.** Into 1 kΩ: 500 mV commanded gives 448 mV (−10.4 %), 4000 gives 3510 (−12.2 %),
-  8000 gives 6820 (−14.8 %), the last confirmed on a scope at 6.90 V. The incremental gain falls
-  from 0.885 to 0.80 over that span, so it is a gain error of about 0.89 plus compression above
-  ~4 mA rather than a pure scale factor. Current mode does not show it: 1000 µA set puts 1.017 V
-  across the same 1 kΩ.
+- **In voltage mode the load current is not measurable at all**, and the firmware no longer
+  reports one. The DG409 (U23/U12) is a dual 4:1 mux addressed by `OE1:OE0` = the mode bits: in
+  current mode (01) it ties `I_OUT` to `CHANNEL_OUT`, but in voltage mode (00) it steers
+  `CHANNEL_OUT` from `V_OUT` and parks `I_OUT` on R14, an on-board 1 kΩ dummy to the channel's
+  ground. The 100 Ω shunt the AD8421 measures (R12) is in the `I_OUT` branch, between the Howland
+  pump's R2 and that mux input — so in voltage mode it carries the pump's own current into the
+  dummy, and there is no shunt anywhere in the `V_OUT` path. The pump is driven by the same DAC
+  code whatever the mux does, so the reading was real, linear and completely unrelated to the
+  load: it is the DAC code reinterpreted as a current, and matches
+  `commanded_mV / MILLIVOLTS_PER_DAC × MICROAMPS_PER_DAC` to 0.8 % at every amplitude. Measure
+  current in current mode. (Modes 2 and 3 park `I_OUT` on the same dummy, so nothing is measurable
+  there either — but those channels are not driven anyway.)
+- **The voltage output is accurate unloaded and droops under load: its source impedance is about
+  135 Ω.** An unloaded channel reads 1996 mV for 2000 commanded (−0.2 %); the same command into
+  1 kΩ gives 1766 mV (−12 %), confirmed on a scope. That is (2000 − 1766) mV over the 1.77 mA
+  drawn. Earlier revisions of this document read the droop as a gain error, which the unloaded
+  measurement rules out. Plan for it: a preparation of a few hundred ohms will see noticeably less
+  than the commanded voltage, and the board's own voltage readback reports the delivered value
+  rather than the requested one.
 - **The analog output settles far faster than a reading of it does.** On a scope the output reaches
   90 % of an 8 V step 1.91 µs after it starts moving (2.93 µs for a 1.8 V step). `BENCHSETTLE`
   reports 8–9 µs for the same board, so most of `CAL SETTLE` is the ADC path — conversion, the

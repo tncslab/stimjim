@@ -103,6 +103,9 @@ struct Plan {
   uint32_t reps;                 // repetitions the train will deliver (duration/period)
   uint8_t  peakChannel;          // SINE: channel whose phase the peaks follow
   bool     peakMismatch;         // SINE: the other measured channel differs from it
+  uint8_t  vModeNoI;             // bit c: channel c asked for the current line but
+                                 // drives in voltage mode, where the shunt is not
+                                 // in the load path — the read was dropped
   uint32_t needCyc, roomCyc;     // fit arithmetic of the first refused point
   uint32_t budgetCyc;            // unsplit ADC window (all nReads in one gap)
   uint64_t atCyc[SJ_MEAS_POINTS];   // ascending offsets from pulseStart

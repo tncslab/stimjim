@@ -32,18 +32,17 @@ wire to look at rather than reporting a number that happens to be wrong:
   3  scope A is on CH0(+)             (a train appears on A)
   4  scope gnd is at CH0(-)           (A is single-ended, not a divider tap)
   5  CH1 and the LED chain are gone   (a CH0 pulse does not appear on B)
-  6  the load is a plain resistor     (the same value through both modes)
+  6  the load is a plain resistor     (current mode, anchored by the scope)
 
-Check 6 measures the load twice, once through each output mode, because one
-route on its own cannot tell a bad contact from a miscalibrated readback.
-Voltage mode drives a known voltage and reads the current back; current mode
-drives a known current and reads the voltage back; the scope watches the load
-throughout, so the voltage across it is known independently of the board. A
-resistor gives the same value both ways, in both polarities, at every
-amplitude. A bad contact gives an unstable value both ways. A readback that is
-out of calibration gives a stable, linear, wrong value one way only -- which is
-what this board does: its voltage-mode current readback on channel 0 is low by
-a factor of 4, so `V/I` in voltage mode reports a 1 kOhm load as 4 kOhm.
+Check 6 drives the load in *current* mode and reads the voltage across it on
+the scope, so the resistance rests on nothing the board calibrates. It has to
+be current mode: the 100 ohm shunt the sense amp reads (R12) sits in the I_OUT
+branch, and in voltage mode the DG409 parks that branch on an on-board 1 kOhm
+dummy while the output comes from V_OUT. There is no shunt anywhere in the
+V_OUT path, so a load current in voltage mode is not measurable on this
+hardware and the firmware reports none -- the check fails if a number appears
+there, because that would mean the current pump's own branch current is being
+passed off as the load's. It runs voltage mode too, for the voltage.
 
 `measure` then takes the number. The delivered latency is
 `TRIGCOMP + STARTLAT`, so with `CAL TRIGCOMP` at 0 the edge-to-output time
@@ -220,11 +219,16 @@ def load_sweep(scope, sj, v_amps=(1000, 2000, 4000), i_amps=(500, 1000, 1500)):
                 if not ln.startswith("MSUM"):
                     continue
                 f = ln.split(",")
-                point, v, i = int(f[3]), float(f[4]), float(f[6])
+                # The current fields are empty in voltage mode by design: the
+                # shunt is in the disconnected I_OUT branch there, so the
+                # firmware refuses to report a load current it cannot measure.
+                point, v = int(f[3]), float(f[4])
+                i = float(f[6]) if f[6] else None
                 rows.append({
                     "mode": "V" if mode == 0 else "I",
                     "set": amp if point == 0 else -amp, "unit": unit,
-                    "n": int(f[2]), "V_mV": v, "I_uA": i,
+                    "n": int(f[2]), "V_mV": v,
+                    "I_uA": i if i is not None else float("nan"),
                     "scope_V": scope_hi if point == 0 else scope_lo,
                     "R_board": v / i * 1000 if i else float("nan"),
                 })
@@ -309,10 +313,12 @@ def cmd_check(scope, sj):
     print(f"  5  CH1 / LED chain absent  B moves {b_span:5.2f} V while CH0 pulses"
           f"   {'ok' if ok else 'FAIL: CH0 couples into B, the chain is wired'}")
 
-    # 6. the load itself, measured through both output modes.
+    # 6. the load itself. Only current mode can measure it: in voltage mode the
+    #    100 ohm shunt sits in the I_OUT branch the mux has parked on the
+    #    on-board dummy, so the firmware reports no current at all there. The
+    #    scope anchors the voltage, so the resistance needs nothing calibrated.
     rows = load_sweep(scope, sj)
     r_i = [abs(r["R_scope"]) for r in rows if r["mode"] == "I"]
-    r_v = [abs(r["R_board"]) for r in rows if r["mode"] == "V"]
     spread = (max(r_i) - min(r_i)) / statistics.fmean(r_i)
     ok = spread < 0.10
     bad += not ok
@@ -322,22 +328,22 @@ def cmd_check(scope, sj):
     print("       mode  set        board V     board I     scope V    R board"
           "   R scope")
     for r in rows:
-        rs_ = f"{r['R_scope']:8.0f}" if r["R_scope"] == r["R_scope"] else "      --"
+        # nan means "the firmware reported nothing", which in voltage mode is
+        # the correct answer, not a missing measurement.
+        def cell(x, w, p):
+            return f"{x:+{w}.{p}f}" if x == x else "--".rjust(w + 1)
         print(f"       {r['mode']:>4s} {r['set']:+6d} {r['unit']:<3s} "
-              f"{r['V_mV']:+9.2f} mV {r['I_uA']:+9.1f} uA {r['scope_V']:+8.3f} V "
-              f"{r['R_board']:8.0f} {rs_}")
-    # The same resistor through the two modes. Current mode is anchored by the
-    # scope, so a ratio far from 1 indicts the voltage-mode current readback,
-    # not the load: a bad contact cannot be selective about the output mode.
-    ratio = statistics.fmean(r_v) / statistics.fmean(r_i)
-    if abs(ratio - 1) > 0.10:
+              f"{r['V_mV']:+9.2f} mV {cell(r['I_uA'], 9, 1)} uA "
+              f"{r['scope_V']:+8.3f} V "
+              f"{cell(r['R_board'], 7, 0)} {cell(r['R_scope'], 7, 0)}")
+    # Voltage mode must report no current at all. A number here means the
+    # firmware is back to reporting the current pump's branch as the load's.
+    leaked = [r for r in rows if r["mode"] == "V" and r["I_uA"] == r["I_uA"]]
+    if leaked:
         bad += 1
-        print(f"       FAIL: voltage mode reports {statistics.fmean(r_v):.0f} ohm "
-              f"for the same load, {ratio:.2f}x the current-mode figure.")
-        print(f"             The board V readback agrees with the scope, so it "
-              f"is the voltage-mode")
-        print(f"             CURRENT readback that is low by {ratio:.2f}x. The "
-              f"load and the contacts are fine.")
+        print(f"       FAIL: voltage mode reported a current "
+              f"({leaked[0]['I_uA']:.1f} uA). The shunt is not in the load path "
+              f"there; that number is the current pump's own branch.")
     sj.cmd1(f"S{SLOT_LOAD},3,3,10000,500000")
     write_load_csv(rows)
     return bad

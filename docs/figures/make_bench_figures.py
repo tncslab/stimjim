@@ -6,9 +6,9 @@ obvious. Everything is drawn from measured data written to `tmp/` by
 talks to hardware, so re-running those scripts and then this one keeps the
 figures and the numbers in step.
 
-  figs/stimjim-load-two-modes.png     why a 1 kOhm resistor read as 4 kOhm, and
-                                      why that indicts a readback and not a
-                                      contact
+  figs/stimjim-load-two-modes.png     why voltage mode reported a current that
+                                      was not the load's, and the mux bank that
+                                      explains it
   figs/stimjim-trigcomp-reference.png why the measured trigger latency depends
                                       on where on the input edge you call "the
                                       trigger", and what pins it down
@@ -61,69 +61,76 @@ def num(x):
 
 # ---------------------------------------------------------------- figure 1
 
+# The voltage-mode current readings this figure explains away. They cannot be
+# re-measured: the firmware now refuses to report them, which is the fix. Taken
+# on 2026-09-08 with a 1 kOhm load, commanded amplitude -> reported microamps.
+PRE_FIX_VMODE_UA = {1000: 221.7, 2000: 441.9, 4000: 882.3}
+MV_PER_DAC, UA_PER_DAC = 0.4574, 0.1017     # Stimjim.h conversion constants
+LOAD_OHM = 991.0                            # current mode, scope-anchored
+
+
 def fig_load_two_modes():
-    """The same 1 kOhm resistor, measured through both output modes."""
+    """Why voltage mode reported a current, and why it was not the load's."""
     r = rows("stimjim-load-modes.csv")
-    v = [x for x in r if x["mode"] == "V"]
+    v = [x for x in r if x["mode"] == "V" and float(x["set"]) > 0]
     i = [x for x in r if x["mode"] == "I"]
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10.5, 4.2), dpi=130,
-                                   gridspec_kw={"width_ratios": [1.35, 1]})
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.4), dpi=130,
+                                   gridspec_kw={"width_ratios": [1, 1.25]})
 
-    # Left: current against voltage across the load, both modes on one plane.
-    # A resistor is a straight line through the origin whichever axis is driven,
-    # so two modes that disagree are two different claims about the same line.
-    vv = [num(x["V_mV"]) / 1000 for x in v]
-    vi = [num(x["I_uA"]) / 1000 for x in v]
-    iv = [num(x["scope_V"]) for x in i]
-    ii = [num(x["set"]) / 1000 for x in i]
-    ax0.plot(vv, vi, "o", color=C_BAD, ms=6,
-             label="voltage mode: board's own V and I readback")
-    ax0.plot(iv, ii, "s", color=C_OK, ms=6,
-             label="current mode: commanded I, scope-measured V")
+    # Left: the reading voltage mode used to give, against the two things it
+    # could have been. It tracks the DAC code, not the load.
+    cmd = sorted(PRE_FIX_VMODE_UA)
+    got = [PRE_FIX_VMODE_UA[c] for c in cmd]
+    # The same DAC code read as a current -- the pump's own branch, which is
+    # what the shunt was actually carrying.
+    pump = [round(c / MV_PER_DAC) * UA_PER_DAC for c in cmd]
+    scope_v = {abs(float(x["set"])): abs(num(x["scope_V"])) for x in v}
+    load = [scope_v[c] / LOAD_OHM * 1e6 for c in cmd if c in scope_v]
 
-    lim = max(max(map(abs, vv)), max(map(abs, iv))) * 1.15
-    xs = [-lim, lim]
-    ax0.plot(xs, [x / 1.0 for x in xs], "-", color=C_OK, lw=1.0, alpha=0.7,
-             label="1 kOhm (brown black red gold)")
-    ax0.plot(xs, [x / 4.0 for x in xs], "--", color=C_BAD, lw=1.0, alpha=0.7,
-             label="4 kOhm, what voltage mode implies")
-    ax0.axhline(0, color="0.7", lw=0.6)
-    ax0.axvline(0, color="0.7", lw=0.6)
-    ax0.set_xlabel("voltage across the load (V)")
-    ax0.set_ylabel("current through the load (mA)")
-    ax0.set_title("Both modes drive the same resistor.\n"
-                  "Only one of them reads the current correctly.", fontsize=10)
+    ax0.plot(cmd, pump, "-", color=C_ALT, lw=1.8,
+             label="the pump's own branch:\nthe same DAC code as a current")
+    ax0.plot(cmd, got, "o", color=C_BAD, ms=8, label="what voltage mode reported")
+    if len(load) == len(cmd):
+        ax0.plot(cmd, load, "s--", color=C_OK, ms=6, lw=1.4,
+                 label=f"what the load actually drew:\nscope volts / {LOAD_OHM:.0f} ohm")
+    ax0.set_xlabel("commanded output (mV)")
+    ax0.set_ylabel("current (uA)")
+    ax0.set_title("The reading was real, and was not the load.\n"
+                  "It follows the DAC code to 0.8 %.", fontsize=10)
     ax0.legend(fontsize=7.5, loc="upper left")
     ax0.grid(alpha=0.3)
 
-    # Right: the resistance each route reports, which is the same data said
-    # plainly. The scope-anchored current-mode figure is the true one.
-    rv = [abs(num(x["R_board"])) for x in v]
-    ri = [abs(num(x["R_scope"])) for x in i]
-    ax1.axhline(1000, color=C_OK, lw=1.0, alpha=0.7)
-    ax1.annotate("1 kOhm, the part fitted", (0.02, 1000), xycoords=("axes fraction", "data"),
-                 fontsize=7.5, va="bottom", color=C_OK)
-    for k, val in enumerate(rv):
-        ax1.plot(k, val, "o", color=C_BAD, ms=6)
-    for k, val in enumerate(ri):
-        ax1.plot(k + len(rv) + 1, val, "s", color=C_OK, ms=6)
-    ax1.set_xticks([statistics.fmean(range(len(rv))),
-                    statistics.fmean(range(len(rv) + 1, len(rv) + 1 + len(ri)))])
-    ax1.set_xticklabels([f"voltage mode\nboard V / board I\n"
-                         f"{statistics.fmean(rv):.0f} Ohm",
-                         f"current mode\nscope V / set I\n"
-                         f"{statistics.fmean(ri):.0f} Ohm"], fontsize=8)
-    ax1.set_ylim(0, max(rv) * 1.15)
-    ax1.set_ylabel("resistance the route reports (Ohm)")
-    ax1.set_title(f"{statistics.fmean(rv)/statistics.fmean(ri):.2f}x apart, and "
-                  "stable to a few per cent\nin both: a readback, not a contact.",
-                  fontsize=10)
-    ax1.grid(alpha=0.3, axis="y")
+    # Right: why. The mux bank that decides what the shunt is in series with.
+    ax1.axis("off")
+    ax1.set_title("The output mux has a second bank, and it moves\n"
+                  "the shunt out of the load path.", fontsize=10)
+    rows_txt = [
+        (0.86, "current mode   OE1:OE0 = 01", C_OK, True),
+        (0.74, "  pump --[R2 3k]--[R12 100]--+-- CHANNEL_OUT -- load", "0.15", False),
+        (0.67, "                     ^shunt  |", "0.15", False),
+        (0.60, "                             I_OUT", "0.15", False),
+        (0.60, "", C_OK, False),
+        (0.44, "voltage mode   OE1:OE0 = 00", C_BAD, True),
+        (0.32, "  pump --[R2 3k]--[R12 100]-- I_OUT --[R14 1k]-- GND", "0.15", False),
+        (0.25, "                     ^shunt reads THIS branch", C_BAD, False),
+        (0.14, "  DAC ------ V_OUT ---------- CHANNEL_OUT -- load", "0.15", False),
+        (0.07, "                     no shunt anywhere in this path", C_BAD, False),
+    ]
+    for y, txt, col, bold in rows_txt:
+        if not txt:
+            continue
+        ax1.text(0.0, y, txt, fontsize=8.4 if not bold else 9,
+                 family=None if bold else "monospace",
+                 weight="bold" if bold else "normal", color=col, va="center")
+    ax1.text(0.0, -0.04,
+             f"Load in current mode, scope-anchored: "
+             f"{statistics.fmean([abs(num(x['R_scope'])) for x in i]):.0f} ohm",
+             fontsize=8.5, color=C_OK, va="center")
 
-    fig.suptitle("Channel 0's current readback is 4x low in voltage mode "
-                 "(Teensy 3.5, fw 0.8.0)", fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.suptitle("In voltage mode the load current is not measurable, so the firmware "
+                 "reports none", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     out = FIGS / "stimjim-load-two-modes.png"
     fig.savefig(out)
     plt.close(fig)

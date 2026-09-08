@@ -85,6 +85,13 @@ static void defaultDef(TrainDef& t, uint8_t mode0, uint8_t mode1) {
 // Read mask bit of one (channel, line) pair, as Plan::grpMask packs it.
 static uint8_t readBit(uint8_t ch, uint8_t line) { return (uint8_t)(1u << (ch * 2 + line)); }
 
+// Most plans below are built in *current* mode on both channels, because that
+// is what makes a four-read point (V+I on two channels): in voltage mode the
+// current line is dropped, since the shunt sits in the disconnected I_OUT
+// branch and does not carry the load's current. testVoltageModeDropsCurrent
+// covers that rule; everything else here is about the fit arithmetic and wants
+// the widest plan it can get.
+
 // ---------------------------------------------------------------- peak solver
 
 static void testPeakSolver() {
@@ -114,9 +121,63 @@ static void testPeakSolver() {
 
 // ------------------------------------------------------------- HOLD / S plans
 
+// --------------------------------------------- voltage mode drops the current
+
+// In voltage mode the DG409 steers CHANNEL_OUT from V_OUT and parks I_OUT on
+// the on-board 1 kOhm dummy, so the shunt the sense amp reads is not in the
+// load path: what it carries is the current pump's own branch current, which
+// tracks the DAC code and says nothing about the load. planCompile therefore
+// drops line 1 for a channel in voltage mode, and flags the channels that had
+// asked for it so the train can say why the field is empty.
+static void testVoltageModeDropsCurrent() {
+  uint64_t cum[2] = {0, 5000 * (uint64_t)CYC};
+  Geometry g;
+  TrainDef t;
+  Plan p;
+
+  auto build = [&](uint8_t m0, uint8_t m1, uint8_t what0, uint8_t what1,
+                   uint8_t chMask) {
+    defaultDef(t, m0, m1);
+    t.meas.what0 = what0;
+    t.meas.what1 = what1;
+    t.nStages = 1;
+    t.stages[0].dur_us = 5000;
+    fillGeometry(g, PIECEWISE_HOLD, chMask);
+    g.nStages = 1;
+    g.cum     = cum;
+    planBuild(p, 7, t, g);
+  };
+
+  build(0, 1, 3, 3, 0b11);          // ch0 voltage, ch1 current, both want V+I
+  CHECK_EQ(p.lines[0], 1);          // voltage line only
+  CHECK_EQ(p.lines[1], 3);          // current mode keeps both
+  CHECK_EQ(p.nReads, 3);
+  CHECK_EQ(p.vModeNoI, 1);          // channel 0 asked and was refused
+
+  build(0, 0, 3, 3, 0b11);          // both in voltage mode
+  CHECK_EQ(p.lines[0], 1);
+  CHECK_EQ(p.lines[1], 1);
+  CHECK_EQ(p.nReads, 2);
+  CHECK_EQ(p.vModeNoI, 3);
+
+  build(0, 0, 1, 1, 0b11);          // asked for the voltage only: nothing refused
+  CHECK_EQ(p.nReads, 2);
+  CHECK_EQ(p.vModeNoI, 0);
+
+  build(1, 1, 3, 3, 0b11);          // current mode is untouched by the rule
+  CHECK_EQ(p.nReads, 4);
+  CHECK_EQ(p.vModeNoI, 0);
+
+  build(0, 3, 3, 3, 0b01);          // ch1 undriven: never measured, never flagged
+  CHECK_EQ(p.lines[0], 1);
+  CHECK_EQ(p.lines[1], 0);
+  CHECK_EQ(p.nReads, 1);
+  CHECK_EQ(p.vModeNoI, 1);
+}
+
 static void testHoldPlan() {
   TrainDef t;
-  defaultDef(t, 0, 1);                               // both channels driven
+  defaultDef(t, 1, 1);            // both driven, both in current mode
   t.nStages = 3;
   const uint32_t dur[3] = {100, 200, 50};            // us
   uint64_t cum[4] = {0, 0, 0, 0};
@@ -158,7 +219,7 @@ static void testHoldPlan() {
 // Pre-poisoning the struct is what catches it.
 static void testPlanResetsWhatItMustNotInherit() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.nStages = 2;
   uint64_t cum[3] = {0, 100 * CYC, 300 * CYC};
   t.stages[0].dur_us = 100;
@@ -206,7 +267,7 @@ static void testHoldStageTooShort() {
   // V+I on both channels needs roomOf(4) = 42 us; a 30 us stage cannot host it
   // and must be refused rather than pushing the next latch late.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.nStages = 2;
   t.stages[0].dur_us = 30;
   t.stages[1].dur_us = 500;
@@ -237,7 +298,7 @@ static void testHoldStageTooShort() {
 
 static void testStageSelection() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.nStages = 3;
   uint64_t cum[4] = {0, 100u * CYC, 300u * CYC, 600u * CYC};
   for (int i = 0; i < 3; i++) t.stages[i].dur_us = 100;
@@ -260,7 +321,7 @@ static void testUndrivenAndDisabled() {
   TrainDef t;
 
   // Channel 1 not driven (mode 3): MEAS may ask for it, the plan must not.
-  defaultDef(t, 0, 3);
+  defaultDef(t, 1, 3);
   t.nStages = 1;
   t.stages[0].dur_us = 1000;
   fillGeometry(g, PIECEWISE_HOLD, 0b01);
@@ -283,7 +344,7 @@ static void testUndrivenAndDisabled() {
 
 static void testEnvelopeGate() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.nStages = 1;
   t.stages[0].dur_us = 1000;
   t.env.rampIn_us = 5000;
@@ -306,7 +367,7 @@ static void testRampGapIsTheSampleInterval() {
   // A 1 ms ramp stage sampled every 20 us has 50 samples: the free gap is
   // 20 us, not the 1000 us stage, so a four-read point cannot fit.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.nStages = 1;
   t.stages[0].dur_us = 1000;
   uint64_t cum[2] = {0, 1000u * CYC};
@@ -334,7 +395,7 @@ static void testRampGapIsTheSampleInterval() {
 
 static void testSinePlan() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.when = 3;                          // both peaks
   const uint32_t inc = 0x04000000u;         // 64 samples per turn
   Geometry g;
@@ -379,7 +440,7 @@ static void testSinePlan() {
 
 static void testSineTooFast() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.when = 1;
   Geometry g;
   fillGeometry(g, SINE, 0b11);
@@ -400,7 +461,7 @@ static void testSineTooFast() {
 
 static void testSinePeakChannelMismatch() {
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.when = 1;
   Geometry g;
   fillGeometry(g, SINE, 0b11);
@@ -424,7 +485,7 @@ static void testSinePeakChannelMismatch() {
 static void testSineBurstTooShort() {
   // The peak lies inside the burst, but the reads would run past its end.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.when  = 1;
   t.meas.what0 = 1;
   t.meas.what1 = 0;
@@ -447,7 +508,7 @@ static void testRotateHoldStage() {
   // stage therefore holds exactly one read per repetition, and the four reads
   // of a V+I-on-both-channels point become four groups.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.fit = SJ_FIT_ROTATE;
   t.nStages = 1;
   t.stages[0].dur_us = 25;
@@ -503,7 +564,7 @@ static void testRotateRamp() {
   // help; at 25 us one read fits per gap, so four repetitions cover the four
   // lines and the ramp itself is untouched.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.fit = SJ_FIT_ROTATE;
   t.nStages = 1;
   t.stages[0].dur_us = 1000;
@@ -534,7 +595,7 @@ static void testRotationShortTrain() {
   // One repetition cannot cover four groups: the plan says so rather than
   // reporting three lines with n = 0 and no explanation.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.fit    = SJ_FIT_ROTATE;
   t.period_us   = 10000;
   t.duration_us = 10000;                    // exactly one pulse
@@ -562,7 +623,7 @@ static void testRotateSine() {
   // 40 us between samples holds three reads but not four, so the four reads
   // split into two balanced groups of two.
   TrainDef t;
-  defaultDef(t, 0, 1);
+  defaultDef(t, 1, 1);
   t.meas.fit  = SJ_FIT_ROTATE;
   t.meas.when = 1;                          // positive peak only
   Geometry g;
@@ -702,7 +763,7 @@ static void testAccumRange() {
   g.nStages = 2;
   g.cum = cum;
   TrainDef def;
-  defaultDef(def, 0, 1);
+  defaultDef(def, 1, 1);
   planBuild(pl, 0, def, g);
   CHECK_EQ(pl.nPoints, 2);
   for (uint8_t i = 0; i < pl.nPoints; i++)
@@ -716,6 +777,7 @@ static void testAccumRange() {
 
 int main() {
   testPeakSolver();
+  testVoltageModeDropsCurrent();
   testHoldPlan();
   testPlanResetsWhatItMustNotInherit();
   testHoldStageTooShort();
