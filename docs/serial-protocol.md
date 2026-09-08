@@ -674,18 +674,56 @@ TRIG<t>?  → canonical line
   the fixed `START_LATENCY` plus the slot's `delay_us`, not something that depends on how busy
   `loop()` is. Loop-context `T`/`U` takes the bus lock around `startTrain` so a trigger edge
   cannot interleave with it.
-- **The latency is 35 µs** on a Teensy 3.5 with the register backends (`CAL STARTLAT`; 120 µs on
-  the portable build), repeatable to the 42 ns residual latch jitter, and 9–15 µs of it is the arm
-  itself rather than the 2.75 µs DAC write. **The edge ISR emits no sample**: it timestamps the
+- **The latency is 20 µs** on the Teensy 3.5 in hand (`CAL STARTLAT`, set and persisted; the
+  compiled default is 35, and 120 µs on the portable build), repeatable to the 42 ns residual
+  latch jitter, and only about 6 µs of it is the arm itself — `loop()` prepares the rest before
+  the edge — rather than the 2.75 µs DAC write. **The edge ISR emits no sample**: it timestamps the
   edge, arms, computes `t0 = edge − TRIGCOMP + STARTLAT + delay_us`, and programs its player's PIT
   channel to wake one `PRELOAD` before `t0`. The first latch, like every later one, happens in the
   player ISR — the interrupt supplies the time reference, the clock emits the samples, which is
   what makes the latency independent of the train's complexity. Preloading the DAC input register
   before the edge (the AD5752 latches on a 0.44 µs `NLDAC` pulse) would only help if the arm moved
   before the edge too; [timing.md](timing.md) §3 works through what that would cost and buy.
-- In mode 2 the two engines are armed one after the other inside the same ISR, which puts
-  engine 1 about **7.5 µs** behind engine 0 (measured). Trains that must be sample-
-  synchronous belong in one slot driving both channels (mode 1), not in two.
+- In mode 2 both engines compute the *same* `t0` from the one edge timestamp, but they cannot
+  reach it together: the two arms run one after the other inside the same ISR, and then the two
+  players want the same latch instant, so the second engine's first latch waits for the first
+  player's ISR to return. Measured on a scope, that costs about **10 µs**
+  ([bench-wiring.md](bench-wiring.md) configuration A). Two consequences: trains that must be
+  sample-synchronous belong in one slot driving both channels (mode 1), not in two; and
+  `CAL STARTLAT` has to cover *two* arms for mode 2, which is why the 20 µs this board runs is a
+  joint-mode figure and mode 2 needs 30 or more.
+
+**Which engine a route uses is fixed, and mode 1 always uses engine 0.** `Triggers::fireRoute`
+calls `fire(0, slot0)` for mode 1 whichever input the edge arrived on, so two joint routes cannot
+run side by side — the second edge finds engine 0 busy and is dropped. To give each input its own
+engine, use mode 2 and leave the other slot at −1: `fire()` returns immediately on a −1, so
+exactly one engine is armed and the route costs one arm, not two.
+
+```
+S30,0,3,20000,4000000;3000,0,4000;-3000,0,4000   # slot 30 drives CH0 only (mode1 = 3)
+S31,3,0,20000,4000000;0,3000,4000;0,-3000,4000   # slot 31 drives CH1 only (mode0 = 3)
+TRIG0,2,30,-1,0                                  # IN0 -> engine 0 plays slot 30
+TRIG1,2,-1,31,0                                  # IN1 -> engine 1 plays slot 31
+```
+
+That is the arrangement for two unrelated signals started by two different triggers and free to
+overlap. Because only one engine is armed per edge, it keeps the joint-mode `CAL STARTLAT`; the
+"mode 2 has to cover two arms" rule above applies to a route that really does fill both slots.
+
+**A train never touches a channel it does not claim.** Programming, the latch, `setOutputMode` at
+the first and last event, and the grounding at train end are all gated on the train's own channel
+mask, so two trains on the two engines do not disturb each other's output — which is what modes
+2/3 in a *train definition* mean (§2). The two rules to respect, both of which drop the start with
+a `WARN` rather than corrupting anything:
+
+- **the two slots must claim disjoint channels.** The check is per channel, not per engine: with
+  engine 0 driving CH0, a CH0 train on the free engine 1 is refused with `channel conflict with
+  the running T train — start dropped`;
+- **one train per engine.** A start on a busy engine is refused with `engine busy (slot <n>)`.
+
+Sample alignment is still not on offer here: if the two trains happen to want the same latch
+instant, the second player's ISR waits for the first (~10 µs, measured). One train driving both
+channels remains the only construct that latches them together.
 
 ### `CLK` — the wall clock and the anchor a log is tied by
 
