@@ -296,15 +296,25 @@
 
 // Sine sample-rate policy (plan §3.5): Fs = clamp(SAMPLES_PER_CYC * f_max,
 // FS_MIN, FS_MAX), realized as an exact integer number of CPU cycles per
-// sample. FS_MAX is provisional pre-bench (min sample period 20 us >> the
-// preload+program budget) and must be replaced by the measured dual-channel
-// ceiling with ~30 % margin. f_max above FS_MAX/2 is refused at start.
+// sample. f_max above FS_MAX/2 is refused at start.
+//
+// The register build's FS_MAX is measured, not estimated. On a Teensy 3.5 at
+// 120 MHz a continuous two-channel sine misses no deadline at all up to
+// 115 kHz, misses one latch per train (not per sample) from 128 to 147 kHz,
+// starts missing in proportion to the sample count at 150 kHz (0.1 per 1000)
+// and collapses at 160 kHz (212 per 1000, and past 179 kHz every event is
+// already due when the player reaches it). 100 kHz is the fastest rate
+// measured with zero late latches and sits a third below where lateness
+// begins to scale — the margin docs/bench-wiring.md configuration C asks for.
+// Overridable with -D for a board that has been re-measured.
 #define SJ_SINE_SAMPLES_PER_CYC 64
 #define SJ_FS_MIN_HZ            1000
-#if SJ_FASTIO_REGISTER
-  #define SJ_FS_MAX_HZ          50000
-#else
-  #define SJ_FS_MAX_HZ          25000   // RECALIBRATE: halved for the slower portable route
+#ifndef SJ_FS_MAX_HZ
+  #if SJ_FASTIO_REGISTER
+    #define SJ_FS_MAX_HZ        100000
+  #else
+    #define SJ_FS_MAX_HZ        25000   // RECALIBRATE: halved for the slower portable route
+  #endif
 #endif
 
 // ------------------------------------------------------------------ protocol

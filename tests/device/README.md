@@ -16,6 +16,8 @@ there is nothing else to install.
 | `pico2000a.py` | the same for the newer `ps2000a` driver. Unused on this bench; kept for 2000a-series models |
 | `capture.py` | Oscilloscope acceptance: trigger-to-output delay, and the `S`/`L`/`W` shapes. Figures to `figs/`, raw samples to `tmp/` |
 | `trigcomp.py` | Configuration B (docs/bench-wiring.md): `check` verifies the wiring one connection at a time, `threshold` measures the level IN0 actually switches at, `measure` times the physical edge to the output leaving baseline. The absolute trigger latency and hence `CAL TRIGCOMP`. `check` also measures the load through both output modes, which is what caught the 4× current-readback fault |
+| `dualchan.py` | Configuration C (docs/bench-wiring.md): both channels loaded and watched separately against a common ground. `check` verifies the nine connections one at a time, `c1` compares one train's two channels against two independently routed trains — with a control that separates the two engines' latches so contention can be told apart from a constant offset — `c2` walks the two-channel sine sample rate up to where the player stops making its deadlines, and `usecase` plays a biphasic current stimulus on CH0 against a delayed gate burst on CH1, in both output modes |
+| `longrun.py` | Serial-only: one long train, to catch a missed extension of the 32-bit cycle counter (it wraps every 35.79 s at 120 MHz). Checks the pulse count, the wall-clock duration and the firmware's own timing counters. Needs time and nothing else |
 | `scope_timebase.py` | Scope-only: does each PicoScope timebase deliver the sample interval it reports? Captures the unit's own AWG at a known frequency and measures the period back. Needs no StimJim, only the AWG on a scope channel |
 
 ```
@@ -24,6 +26,8 @@ python bench_arm.py COM4
 python stage_timing.py COM4 --out ../../tmp/stage.txt
 python capture.py all
 python trigcomp.py check && python trigcomp.py measure --threshold 1.757
+python dualchan.py check && python dualchan.py c1
+python longrun.py COM4 --seconds 300
 python scope_timebase.py
 ```
 

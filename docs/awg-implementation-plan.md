@@ -331,12 +331,12 @@ oscilloscope, was measured in phase 16 and is 2 µs.
 
 **Remaining work.**
 
-- **Sine ceiling and dual-channel collisions.** `SJ_FS_MAX_HZ` is still the desk estimate. A
-  single unmeasured sine train keeps every deadline up to Fs = 49.9 kHz, so the ceiling is not
-  obviously wrong, but the *dual-channel* collision case (two independent trains contending for
-  the SPI bus) has not been measured, and that is what sets the published FsMax table with its
-  ~30 % margin. The remaining scope work is long-run drift (≤ 1 µs cumulative over a 10 s train)
-  and the full trigger-latency battery.
+- **Sine ceiling and dual-channel collisions — measured.** `SJ_FS_MAX_HZ` is now 100 kHz on the
+  register backend, from a two-channel sweep that is clean to 115 kHz and fails in proportion to
+  the sample count from 150 kHz; the dual-channel collision costs **7.39 µs** at every coincident
+  latch, and one train driving both channels latches them 0.16 µs apart
+  ([bench-wiring.md](bench-wiring.md) configuration C). The portable backend's 25 kHz is still a
+  hand-halved guess.
 - **One number still guessed.** `CAL TRIGCOMP`, the pin-edge-to-ISR-entry delay of the trigger
   path, is 0 because software cannot see the physical edge. It is the only budget left that
   needs an oscilloscope; [bench-wiring.md](bench-wiring.md) describes the wiring and the

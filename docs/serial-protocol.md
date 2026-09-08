@@ -174,8 +174,9 @@ Playback (plan §3.5): each period runs one burst of `burst_us`; the **phase res
 `phase` every burst** (bursts are identical and drift-free; legacy-consistent), and the output
 parks at offset + grounds between bursts. `burst_us = period_us` is continuous sine except for a
 few-µs park at each period boundary (same as legacy; a gapless mode may suppress the off event
-later). Sample rate per train: `Fs = clamp(64·f_max, 1 kHz, 50 kHz)` on an exact CPU-cycle grid
-(the 50 kHz ceiling is a desk estimate, not a measured limit). Frequencies above `Fs/2 = 25 kHz`
+later). Sample rate per train: `Fs = clamp(64·f_max, 1 kHz, 100 kHz)` on an exact CPU-cycle grid
+(the 100 kHz ceiling is measured — [bench-wiring.md](bench-wiring.md) C2 — and is a build-time
+constant, so a re-measured board can carry a different one). Frequencies above `Fs/2 = 50 kHz`
 are accepted at parse time but **refused at start** with a `WARN` (Nyquist).
 
 Known hardware limit (see [hardware-notes.md](hardware-notes.md)): amplitudes above 3000 µA
@@ -344,7 +345,7 @@ That room must fit the free gap the point lives in:
 |---|---|
 | `S` | the stage duration |
 | `L` | the stage's *ramp sample interval* (stage duration / N, 20 µs by default) — not the stage |
-| `W` | the sine sample interval `1/Fs`, which is never shorter than 20 µs because Fs is capped |
+| `W` | the sine sample interval `1/Fs`, which is never shorter than 10 µs because Fs is capped |
 
 On a Teensy 3.5 with the default `CAL` budget that works out to:
 
@@ -709,8 +710,9 @@ TRIG<t>?  → canonical line
 - In mode 2 both engines compute the *same* `t0` from the one edge timestamp, but they cannot
   reach it together: the two arms run one after the other inside the same ISR, and then the two
   players want the same latch instant, so the second engine's first latch waits for the first
-  player's ISR to return. Measured on a scope, that costs about **10 µs**
-  ([bench-wiring.md](bench-wiring.md) configuration A). Two consequences: trains that must be
+  player's ISR to return. Measured on a scope, that costs **7.39 µs**
+  ([bench-wiring.md](bench-wiring.md) C1, against a control that puts the two latches 20 µs apart
+  and reads 0.06 µs, so the figure is contention and not a constant engine-to-engine offset). Two consequences: trains that must be
   sample-synchronous belong in one slot driving both channels (mode 1), not in two; and
   `CAL STARTLAT` has to cover *two* arms for mode 2, which is why the 20 µs this board runs is a
   joint-mode figure and mode 2 needs 30 or more.
@@ -744,7 +746,7 @@ a `WARN` rather than corrupting anything:
 - **one train per engine.** A start on a busy engine is refused with `engine busy (slot <n>)`.
 
 Sample alignment is still not on offer here: if the two trains happen to want the same latch
-instant, the second player's ISR waits for the first (~10 µs, measured). One train driving both
+instant, the second player's ISR waits for the first (7.39 µs, measured). One train driving both
 channels remains the only construct that latches them together.
 
 ### `CLK` — the wall clock and the anchor a log is tied by
@@ -860,8 +862,10 @@ The `BENCHPIT` figures are independent of the event rate: 14 / 15 / 19 cycles of
 
 **Two engines started by one trigger edge cannot latch at the same instant.** Both player ISRs
 run at the same NVIC priority, so the second one waits for the first to return: measured at
-**7.3 µs** by the engine's own overdue counter and **9–10 µs** at the output on a PicoScope
-(`figs/stimjim-trigger-contention.png`). It is not a defect to be tuned away — the two engines
+**7.3 µs** by the engine's own overdue counter and **7.39 µs** at the output on a PicoScope
+(`figs/stimjim-dual-latch.png`; the earlier 9–10 µs came from configuration A's differential
+method through the LED chain). It applies to every coincident latch for the life of the train,
+not only to the first one after the arm. It is not a defect to be tuned away — the two engines
 share one SPI bus and one DAC latch line. Two channels that must be sample-aligned belong in
 **one train that drives both** (a `TRIG` route in joint mode, or `T`/`U` on a two-channel slot),
 where a single `dacProgramBoth` and a single `NLDAC` pulse serve both channels. An independent

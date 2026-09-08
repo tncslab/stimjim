@@ -64,7 +64,7 @@ Nothing else changes — the warning is per train, not a refusal — but a bench
 independently from one input has to raise `STARTLAT` back up, and thereby give up the sample-aligned
 start latency. A single train driving both channels is the construct that keeps both, and is
 already the right one for sample-aligned stimulation for the separate reason that independent
-routes contend for their first latch (§ the ~10 µs figure configuration A measures).
+routes contend for every coincident latch (§ the 7.39 µs figure configuration C measures).
 
 The latency is deterministic because the edge ISR timestamps the edge in its own first
 instruction, and everything it then does is spent *inside* `STARTLAT` rather than added after it.
@@ -125,7 +125,9 @@ Two qualifications on the 20 µs:
 
 An independent two-engine route is additionally limited by latch contention: both player ISRs run
 at priority 64, so the second waits for the first and lands **7.3 µs** later by the firmware's own
-counter, 9–10 µs at the output. Two channels that must be sample-aligned belong in one train that
+counter and **7.39 µs** at the output ([bench-wiring.md](bench-wiring.md) C1, against a control
+that separates the two latches by 20 µs and reads 0.06 µs). It costs the same at every coincident
+latch, not only at the first one after the arm. Two channels that must be sample-aligned belong in one train that
 drives both, where a single `dacProgramBoth` and a single latch pulse serve both.
 
 ## 2. Comparison with the original `stimjimPulser`
@@ -255,7 +257,7 @@ PIT wakes CAL PRELOAD (4 µs) early
 Between events the PIT is armed and the CPU is in `loop()` running serial, SD and display work —
 it is not spinning. The CPU cost per event is about `PRELOAD + program ≈ 7 µs` with both channels
 driven, so a 20 µs event grid (the default `DT`, and a 50 kHz sine) runs at roughly a third duty
-cycle.
+cycle, and the 10 µs grid of a 100 kHz sine — the measured `SJ_FS_MAX_HZ` — at about two thirds.
 
 Two places where the ISR stays in and spins longer:
 

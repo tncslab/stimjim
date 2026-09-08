@@ -189,10 +189,14 @@ stage derivation adds is `SJ_STAGE_DERIVE_US` — what deriving one stage costs,
 the player does it in a gap before a latch or falls back to the stage boundary. 4 µs on the
 Teensy 3.5; a slower target should raise it in proportion to `BENCHARM`'s per-stage figure.
 
-Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at
-which the measured preload + DAC programming budget fills the sample period. It is 50 kHz for the
-register backend and starts at 25 kHz for the portable one — both still provisional, though a
-single unmeasured sine train on a Teensy 3.5 does meet every deadline right up to Fs = 49.9 kHz.
+Then `SJ_FS_MAX_HZ`, the sine sample-rate ceiling: it must sit about 30 % below the rate at which
+the player stops making its deadlines with **both** channels driven. On the Teensy 3.5 register
+backend that rate is measured: a continuous two-channel sine is late on nothing up to 115 kHz and
+becomes late in proportion to the sample count from 150 kHz, so the constant is **100 kHz**
+([bench-wiring.md](bench-wiring.md) C2 has the full curve and the method). The portable backend
+starts at 25 kHz and is still provisional — halved by hand for the slower route, never measured.
+The constant is `#ifndef`-guarded, so a re-measured board can carry its own value from a `-D`
+without editing `Config.h`.
 
 **Acceptance without an oscilloscope.** Every latch compares itself against its own deadline, so
 a recalibrated board can be qualified over the serial port alone: run a train of each type with
