@@ -387,16 +387,23 @@ epoch may be a compile time. A file contains, in order:
    budget, so the budget the readings were taken with is recorded next to them);
 2. a `# columns: timestamp_us,slot,pulse,point,V0_mV,I0_uA,V1_mV,I1_uA` line;
 3. a `# train:` block for every train that arms while the file is open — that slot's canonical
-   waveform line, its `ENV` line if non-default, and its `MEAS` line. This is what records
-   configuration changes made after the file was opened, and what keeps a log self-describing when
-   trains were fired by trigger edges with no host attached;
+   waveform line, its `ENV` line if non-default, and its `MEAS` line. This is what keeps a log
+   self-describing when trains were fired by trigger edges with no host attached;
 4. `# clock: <ISO 8601> src=<build|batt|host> us=<since boot>` anchor lines, at file open, before
    every `# train:` block and at most once a minute while rows are being written. The CSV columns
    carry no wall clock; a row's `us` maps through the nearest anchor above it, and the drift
    between two anchors is visible in the file rather than hidden inside it;
-5. one CSV row per measurement repetition, for slots whose `MEAS` `report` has bit 1 set (`+2`):
+5. one `# set: us=<since boot> <line>` line per configuration change made while the file is open,
+   in the canonical form the setter echoed over serial — what records changes made *after* the
+   header's `DUMP` block was written — and one `# done:` (or `# stop:`) line per train carrying
+   its pulse count and both timing-fault counters;
+6. one CSV row per measurement repetition, for slots whose `MEAS` `report` has bit 2 set (`+4`):
    `<timestamp_us>,<slot>,<pulse>,<point>,<V0_mV>,<I0_uA>,<V1_mV>,<I1_uA>`, timestamp in µs since
-   boot. Lines that were not read are empty fields.
+   boot. Lines that were not read are empty fields;
+7. five rows per measured point at train end, for slots whose `report` has bit 1 set (`+2`) — the
+   `MSUM` and `MRANGE` numbers in the same column shape, distinguished by a negative code in the
+   repetition column (`-1` mean, `-2` sd, `-3` min, `-4` max, `-5` per-line `n`). See
+   [serial-protocol.md](serial-protocol.md) §4.
 
 Files this firmware creates also carry a real FAT modification timestamp, but only when the clock
 source is not `build`: a wrong file date is worse than none, because a host sorting by date would

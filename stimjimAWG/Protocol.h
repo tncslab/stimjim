@@ -31,6 +31,11 @@ void poll();
 // paste-back-able set-commands, without the trailing `OK`. Written to Serial by
 // `DUMP` and into the SD log header by SdLog.
 void writeDump(Print& out);
+// Open an SD log if any slot's `MEAS` report asks for one (SJ_REPORT_SD).
+// Called after every slot commit and once from setup() after the EEPROM
+// restore, which is what makes a headless box log from boot. Silent and
+// harmless with no card in the socket — see SdLog::autoOpen.
+void logIfConfigured();
 }
 
 #endif // STIMJIMAWG_PROTOCOL_H

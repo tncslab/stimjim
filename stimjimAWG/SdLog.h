@@ -38,6 +38,30 @@ uint32_t    bytes();
 // was opened. No-op while no file is open.
 void noteTrain(uint8_t slot);
 
+// One `# <tag>: us=<n> <text>` session-event line, stamped with the same
+// microsecond timebase the rows carry. The tags in use are `set` (a
+// configuration change, `text` being the canonical round-trip line the setter
+// echoed over serial), `done` (a train's own account of itself) and `stop` (a
+// train ended by hand). Between them these are what make a file describe what
+// happened *after* it was opened, rather than only the DUMP block from when it
+// was. Gated on a file being open and nothing else: `report` selects
+// measurement destinations, a session event is not a measurement. No-op while
+// no file is open.
+void noteEvent(const char* tag, const char* text);
+
+// Open the next free LOGnnnn.CSV without being asked, because something is
+// configured to write to a log. Differs from openLog() in the two ways that
+// matter on a board with an empty socket: a missing card is not an error and
+// prints nothing, and the SDIO bus is never re-probed (begin() mounted once at
+// boot; LOG1 and SDINFO still retry). Whether to call it at all -- and whether
+// an explicit LOG0 has latched the automatic path off -- is Commands' decision,
+// so that opening BENCHSD's scratch file cannot disturb it.
+//
+// Returns whether there was a card to try, so the caller can spend its one
+// automatic attempt on a real attempt: with an empty socket nothing happened
+// and nothing should be counted against the box.
+bool autoOpen();
+
 // ----------------------------------------------------------- `LOG` backend
 // Each prints exactly one status line: LOG,<open>,<name>,<bytes>.
 void status();

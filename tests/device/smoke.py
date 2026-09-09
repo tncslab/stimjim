@@ -510,6 +510,13 @@ def main():
         if info[1] != "1":
             notes.append("no SD card in the socket - SD checks skipped")
         else:
+            # Nothing in this suite has asked for a log, but the S4 definition
+            # above drives and measures both channels, so its report was
+            # promoted to +2 and a log opened itself (serial-protocol.md, LOG).
+            auto = sj.cmd1("LOG?").split(",")
+            eq(auto[1], "1", f"a log opened itself when a slot asked for one: {auto}")
+            auto_name = auto[2]
+
             name = "SMOKE.CSV"
             sj.cmd("SDDEL," + name)                     # ignore "does not exist"
             opened = sj.cmd1("LOG1," + name).split(",")
@@ -517,13 +524,22 @@ def main():
             eq(opened[1], "1", "log reports itself open")
             eq(opened[2], name, "log file name")
             check(int(opened[3]) > 0, f"header written: {opened[3]} bytes")
+            # LOG1 closed the automatic one; leave the card as we found it.
+            sj.cmd("SDDEL," + auto_name)
 
-            sj.cmd1("MEAS4,3,3,0,-1,2")                 # report bit 1: rows to SD
+            # report +4 = per-repetition rows to SD, +2 = MSUM/MRANGE rows.
+            sj.cmd1("MEAS4,3,3,0,-1,6")
             run_train(sj, "T4", 1.2)
             closed = sj.cmd1("LOG0").split(",")
             eq(closed[1], "0", "log reports itself closed")
             rows_bytes = int(closed[3]) - int(opened[3])
             check(rows_bytes > 0, f"rows appended: {rows_bytes} bytes")
+
+            # A deliberate close stays closed: the same MEAS line that would
+            # have opened one at boot must not reopen it now.
+            sj.cmd1("MEAS4,3,3,0,-1,6")
+            eq(sj.cmd1("LOG?").split(",")[1], "0",
+               "LOG0 latches the automatic path off for the rest of the boot")
 
             listing = sj.cmd("SDLIST", quiet=0.6, limit=15)
             check(any(l.startswith("SDLIST," + name + ",") for l in listing),
@@ -541,10 +557,29 @@ def main():
                 check("# train: S4," in text, "log records the waveform each train played")
                 check("# columns: timestamp_us,slot,pulse,point," in text,
                       "log header carries the column names")
-                data = [l for l in text.splitlines() if l and l[0].isdigit()]
+                check("# set: us=" in text and "MEAS4,3,3,0,-1,6" in text,
+                      "log records the config change made while it was open")
+                done = [l for l in text.splitlines() if l.startswith("# done:")]
+                check(len(done) == 1, f"one run line per train: {len(done)}")
+                if done:
+                    kv = dict(f.split("=", 1) for f in done[0].split()[2:])
+                    eq(kv["slot"], "4", "run line names the slot")
+                    check(int(kv["pulses"]) > 0, f"run line counts pulses: {kv['pulses']}")
+                    eq(kv["late"], "0", "run line reports no late latch")
+                rows = [l.split(",") for l in text.splitlines() if l and l[0].isdigit()]
+                for r in rows:
+                    eq(len(r), 8, "CSV row field count")
+                data = [r for r in rows if int(r[2]) >= 0]
                 check(len(data) == 10, f"one CSV row per point per pulse: {len(data)}")
-                if data:
-                    eq(len(data[0].split(",")), 8, "CSV row field count")
+                # Five summary rows per measured point, codes -1..-5 (§4). One
+                # point here, so exactly one of each and nothing else.
+                codes = sorted(int(r[2]) for r in rows if int(r[2]) < 0)
+                eq(codes, [-5, -4, -3, -2, -1], "one summary row per record code")
+                sums = {int(r[2]): r for r in rows if int(r[2]) < 0}
+                eq(sums[-5][4], str(len(data)), "the -5 row's V0 count matches the data rows")
+                # The mean has to sit inside the range, as MSUM does inside MRANGE.
+                mean, lo, hi = (float(sums[c][4]) for c in (-1, -3, -4))
+                check(lo <= mean <= hi, f"logged mean {mean} within [{lo}, {hi}]")
 
                 # A partial read must frame and check the chunk, not the file.
                 chunk, crc2, total2 = sdget(sj, name, 0, 40)

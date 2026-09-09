@@ -114,6 +114,53 @@ static void ok()                                   { Serial.println("OK"); }
 static void err(const char* cmd, const char* msg)  { Serial.printf("ERR %s: %s\n", cmd, msg); }
 static void warn(const char* cmd, const char* msg) { Serial.printf("WARN %s: %s\n", cmd, msg); }
 
+// ------------------------------------------------ configuration into the log
+//
+// Every setter below already prints the canonical round-trip line of what it
+// stored. The same line goes into an open log, so a file records the changes
+// made *after* it was opened and not only the DUMP block from when it was.
+// Deliberately out of scope: `V`/`A` (immediate output writes, which a host
+// sweeping amplitudes would fill the file with) and `B`/`C` (offset
+// recalibration). Gated on a log being open and nothing else -- `report`
+// selects measurement destinations, a configuration change is a session event.
+static void echo(const char* line) {
+  Serial.println(line);
+  SdLog::noteEvent("set", line);
+}
+
+// The automatic path gets one turn, and a deliberate `LOG0` overrules it: both
+// set this, `LOG1` clears it. One flag for both, because they want the same
+// thing — do not open a log behind the operator's back again until asked. The
+// single attempt is what keeps a failure quiet: `openLog` reports a card with
+// no free LOGnnnn.CSV name, and repeating that on every slot commit would be
+// worse than not logging. The latch lives here rather than in SdLog so that
+// BENCHSD, which opens and closes a scratch file of its own, cannot move it.
+static bool autoLogDone = false;
+
+// A log opens itself when something is configured to write to one. The decision
+// lives here and not in SdLog, which does not know what a slot is. Cheap enough
+// to run after every commit: it returns on the first test once a file is open,
+// and the scan that follows otherwise is 100 byte tests in command context.
+// Public because setup() calls it after the EEPROM restore, which is what makes
+// a headless box log from boot.
+void logIfConfigured() {
+  if (autoLogDone || SdLog::isOpen()) return;
+  for (uint8_t i = 0; i < SJ_NUM_SLOTS; i++) {
+    // Both halves are needed. The SD bit alone is not enough: the promotion in
+    // §2 never *clears* a bit, so a slot switched back to undriven modes keeps
+    // the one it was given and would otherwise keep opening logs it can write
+    // no rows to.
+    const TrainDef& t = TrainStore::slotConst(i);
+    if ((t.meas.report & SJ_REPORT_SD) && TrainStore::isMeasured(t)) {
+      // Only a real attempt spends the turn: with an empty socket nothing was
+      // tried, so a card inserted later (and remounted by SDINFO or LOG1) is
+      // still picked up by the next commit.
+      if (SdLog::autoOpen()) autoLogDone = true;
+      return;
+    }
+  }
+}
+
 // Last mode commanded per channel (`M` shadow state, protocol §3; original
 // numbering 0-3). Boot state is grounded: Stimjim.begin() ends inside
 // getCurrentOffsets with setOutputMode(ch,3). Trains switch the OE pins
@@ -245,9 +292,10 @@ static void handleTrain(char letter, const char* args) {
   // where microseconds are free, rather than inside the start latency.
   Engine::deriveSine(idx);
 
+  logIfConfigured();      // the definition may have asked for SD summaries
   char line[SJ_SERIALIZE_MAX];
   TrainStore::serializeTrain(idx, staged, line, sizeof line);
-  Serial.println(line);   // echo the canonical round-trip line of what was stored
+  echo(line);             // the canonical round-trip line of what was stored
 }
 
 // ----------------------------------------------------------------- DELAY
@@ -283,7 +331,7 @@ static void handleDelay(const char* args) {
   staged.delay_us = (uint32_t)v[0];
   TrainStore::commit(idx, staged);
   TrainStore::serializeDelay(idx, staged.delay_us, line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 // -------------------------------------------------------------------- DT
@@ -326,7 +374,7 @@ static void handleDt(const char* args) {
   staged.dt_us = (uint32_t)v[0];
   TrainStore::commit(idx, staged);
   TrainStore::serializeDt(idx, staged.dt_us, line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 // ------------------------------------------------------------------- CAL
@@ -336,8 +384,15 @@ static void handleDt(const char* args) {
 // restores the compiled defaults. Sets are refused while a train runs: the
 // engine takes its copy at arm time, so a mid-train change would describe a
 // board the running waveform is not using.
-static void printCalLine(uint8_t id) {
+// `note` distinguishes a setter's echo from the CAL? listing: a query must not
+// write to the log, a change must. The serial form stays the printf it always
+// was, down to the bare newline -- only the log gets the composed line.
+static void printCalLine(uint8_t id, bool note = false) {
   Serial.printf("CAL,%s,%u\n", Cal::NAME[id], Cal::live().us[id]);
+  if (!note) return;
+  char line[32];
+  snprintf(line, sizeof line, "CAL,%s,%u", Cal::NAME[id], Cal::live().us[id]);
+  SdLog::noteEvent("set", line);
 }
 
 static void handleCal(const char* args) {
@@ -375,7 +430,7 @@ static void handleCal(const char* args) {
   const char* msg = Cal::apply(Cal::live(), (uint8_t)id, v[0], staged);
   if (msg) { err("CAL", msg); return; }
   Cal::set(staged);
-  printCalLine((uint8_t)id);
+  printCalLine((uint8_t)id, true);
 }
 
 static void handleCalDef() {
@@ -384,7 +439,7 @@ static void handleCalDef() {
     return;
   }
   Cal::set(Cal::defaults());
-  for (uint8_t i = 0; i < Cal::N_ID; i++) printCalLine(i);
+  for (uint8_t i = 0; i < Cal::N_ID; i++) printCalLine(i, true);
   ok();
 }
 
@@ -442,6 +497,11 @@ static void handleClk(const char* args) {
   if (*p)      { err("CLK", "trailing characters after CLK,<unix>[,<ms>]"); return; }
   if (ms > 999) { err("CLK", "ms must be 0-999"); return; }
   Clock::set((uint32_t)secs, (uint16_t)ms);
+  // A new epoch changes what every later anchor line means, so the log records
+  // the moment of the change as well as the value.
+  char line[40];
+  snprintf(line, sizeof line, "CLK,%lu,%lu", secs, ms);
+  SdLog::noteEvent("set", line);
   clkStatus();
 }
 
@@ -496,7 +556,7 @@ static void handleEnv(const char* args) {
   staged.env = e;
   TrainStore::commit(idx, staged);
   TrainStore::serializeEnv(idx, e, line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 static void handleMeas(const char* args) {
@@ -522,7 +582,7 @@ static void handleMeas(const char* args) {
   }
   // keep the narrow casts below honest (detailed validation in validateMeas)
   if (v[0] > 3 || v[1] > 3 || v[2] > 3 || v[3] >= SJ_MAX_STAGES ||
-      (n >= 5 && v[4] > 3) || (n >= 6 && v[5] > SJ_FIT_ROTATE)) {
+      (n >= 5 && v[4] > (long)SJ_REPORT_MAX) || (n >= 6 && v[5] > SJ_FIT_ROTATE)) {
     err("MEAS", "field out of range");
     return;
   }
@@ -532,26 +592,29 @@ static void handleMeas(const char* args) {
     return;
   }
 
-  MeasDef m;
-  m.what0  = (uint8_t)v[0];
+  TrainDef staged = TrainStore::slotConst(idx);
+  MeasDef& m = staged.meas;              // edited in place, so the default below
+  m.what0  = (uint8_t)v[0];              // sees this line's own `what` fields
   m.what1  = (uint8_t)v[1];
   m.when   = (uint8_t)v[2];
   m.stage  = (int8_t)v[3];
-  // Omitted optional fields take the boot default, not the stored value: a
-  // MEAS line fully defines the slot's measurement configuration, the same way
-  // an S/L/W line fully defines its header.
-  m.report = (n >= 5) ? (uint8_t)v[4] : 0;
   m.fit    = (n >= 6) ? (uint8_t)v[5] : (uint8_t)SJ_FIT_ROTATE;
+  // Omitted optional fields take the default, not the stored value: a MEAS line
+  // fully defines the slot's measurement configuration, the same way an S/L/W
+  // line fully defines its header. The default `report` is a property of the
+  // train rather than a constant -- a driven, measured channel writes its
+  // summary to the card -- so it is derived from the slot's modes and the
+  // `what` fields just parsed, exactly as an S/L/W line derives it.
+  m.report = (n >= 5) ? (uint8_t)v[4] : TrainStore::defaultReport(staged);
   char warnbuf[SJ_MSG_MAX];
-  const char* msg = TrainStore::validateMeas(TrainStore::slotConst(idx), m, warnbuf, sizeof warnbuf);
+  const char* msg = TrainStore::validateMeas(staged, m, warnbuf, sizeof warnbuf);
   if (msg) { err("MEAS", msg); return; }
   if (warnbuf[0]) warn("MEAS", warnbuf);
 
-  TrainDef staged = TrainStore::slotConst(idx);
-  staged.meas = m;
   TrainStore::commit(idx, staged);
+  logIfConfigured();      // this line may have asked for SD summaries or rows
   TrainStore::serializeMeas(idx, m, line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 // ------------------------------------------------------- T / U (start/stop)
@@ -563,6 +626,39 @@ static uint32_t trainCount = 0;
 // The two faults have different fixes, so they are reported separately: a late
 // latch is a budget to recalibrate, an overdue event is a waveform whose own
 // deadlines collide. Only the first is a defect.
+// What a train actually did, for a log that has to answer "what happened" with
+// no host having been attached: the pulse count and both fault counters, which
+// until now existed only on the serial port. One fixed-shape line -- every
+// counter is present even at zero, so a parser needs no optional keys.
+//
+// `snprintf` here is the integer path (no %f, so no `_dtoa_r`) and runs once
+// per train in loop(), not per row: this is not the path phase 15 cleared out.
+static void noteRun(uint32_t trainNo, const Engine::Completion& c) {
+  if (!SdLog::isOpen()) return;
+  char line[160];
+  snprintf(line, sizeof line,
+           "train=%lu slot=%u pulses=%lu late=%lu maxlate_ns=%lu "
+           "overdue=%lu maxoverdue_ns=%lu startneed_us=%u",
+           (unsigned long)trainNo, c.slot, (unsigned long)c.nPulses,
+           (unsigned long)c.lateEvents, (unsigned long)cycToNs(c.maxLateCyc),
+           (unsigned long)c.overdueEvents, (unsigned long)cycToNs(c.maxOverdueCyc),
+           (unsigned)c.startNeedUs);
+  SdLog::noteEvent("done", line);
+}
+
+// A hand-stopped train pushes no completion record, so only the slot and the
+// fault counters are known -- `Engine::timingFaults` fills nothing else. A
+// separate tag rather than a `done` line with invented fields.
+static void noteStop(uint8_t slot, const Engine::Completion& f) {
+  if (!SdLog::isOpen()) return;
+  char line[128];
+  snprintf(line, sizeof line,
+           "slot=%u late=%lu maxlate_ns=%lu overdue=%lu maxoverdue_ns=%lu",
+           slot, (unsigned long)f.lateEvents, (unsigned long)cycToNs(f.maxLateCyc),
+           (unsigned long)f.overdueEvents, (unsigned long)cycToNs(f.maxOverdueCyc));
+  SdLog::noteEvent("stop", line);
+}
+
 static void printTimingFaults(const Engine::Completion& c) {
   if (c.lateEvents)
     Serial.printf("WARN engine: %lu latch(es) overran their deadline by up to %lu ns — "
@@ -604,6 +700,7 @@ static void handleStart(char letter, const char* args) {
       Engine::Completion f;
       Engine::timingFaults(eng, f);
       printTimingFaults(f);
+      noteStop((uint8_t)stopped, f);
       UiMenu::noteResult(trainCount, eng, (uint8_t)stopped);
       Measure::printSummary(eng, (uint8_t)stopped);
       SdLog::flushNow();
@@ -651,6 +748,7 @@ void poll() {
     Serial.print(" complete. Delivered "); Serial.print(c.nPulses);
     Serial.println(" pulses.");
     printTimingFaults(c);
+    noteRun(trainCount, c);
     // Before printSummary, which is what releases the finished train's plan
     // buffer back to loop()'s housekeeping.
     UiMenu::noteResult(trainCount, c.eng, c.slot);
@@ -731,6 +829,10 @@ static void handleM(const char* args) {
 
   Serial.print("Set channel "); Serial.print((int)v[0]);
   Serial.print(" to mode ");    Serial.println((int)v[1]);
+  // The reply is byte-frozen legacy prose, so the log gets the canonical form.
+  char line[16];
+  snprintf(line, sizeof line, "M%ld,%ld", v[0], v[1]);
+  SdLog::noteEvent("set", line);
 }
 
 static void handleV(const char* args) {
@@ -840,6 +942,7 @@ static void handleP() {
   TriggerRoute trig[2] = {Triggers::route(0), Triggers::route(1)};
   TrainStore::eepromSave(trig);
   Serial.println("First 10 slot definitions and the trigger table saved to EEPROM.");
+  SdLog::noteEvent("set", "P");   // what the box will boot with next time
 }
 
 // ------------------------------------------------- TRIG / R (queries only)
@@ -880,7 +983,7 @@ static void handleTrig(const char* args) {
 
   Triggers::setRoute((uint8_t)t, r);
   serializeTrig((uint8_t)t, line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 static void handleR(const char* args) {
@@ -918,7 +1021,7 @@ static void handleR(const char* args) {
 
   char line[48];
   serializeTrig((uint8_t)v[0], line, sizeof line);
-  Serial.println(line);
+  echo(line);
 }
 
 // --------------------------------------------------------------------- DUMP
@@ -984,13 +1087,15 @@ static void handleLog(const char* args) {
   const char* p = args;
   while (*p == ' ') p++;
   if (*p == '\0' || *p == '?') { SdLog::status(); return; }
-  if (*p == '0' && p[1] == '\0') { SdLog::closeLog(); return; }
+  if (*p == '0' && p[1] == '\0') { autoLogDone = true; SdLog::closeLog(); return; }
   if (*p == '1') {
     p++;
     while (*p == ' ') p++;
-    if (*p == '\0') { SdLog::openLog(nullptr); return; }
+    // An explicit open re-arms the automatic path -- but only once the line has
+    // parsed, so a malformed LOG1 leaves the latch where it was.
     char name[80];
-    if (*p == ',' && nextToken(p, name, sizeof name)) { SdLog::openLog(name); return; }
+    if (*p == '\0')                                   { autoLogDone = false; SdLog::openLog(nullptr); return; }
+    if (*p == ',' && nextToken(p, name, sizeof name)) { autoLogDone = false; SdLog::openLog(name); return; }
     err("LOG", "expected LOG1[,<name>]");
     return;
   }

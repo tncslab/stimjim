@@ -120,6 +120,11 @@ void setup() {
   Measure::begin();
   SJ_TRACE("-> SdLog::begin");
   SdLog::begin();
+  // After the restore and the mount, so a box whose stored slots ask for SD
+  // summaries starts logging with no host attached. No card, or nothing
+  // configured to log: silent no-op.
+  SJ_TRACE("-> Commands::logIfConfigured");
+  Commands::logIfConfigured();
   SJ_TRACE("-> UiInput::begin");
   UiInput::begin();
   SJ_TRACE("-> UiMenu::begin");

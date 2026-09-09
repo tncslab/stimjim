@@ -84,6 +84,24 @@ uint8_t lastWritten() { return lastWritten_; }
 
 uint8_t defaultWhen(uint8_t type) { return type == SINE ? 3 : 0; }
 
+// Whether this train would measure anything at all: a channel has to be driven
+// (mode 0/1) *and* have a non-zero `what`. After normalizeMode that is exactly
+// "the line carried a plain 0/1 mode field", since 90/91 store mode 0/1 with
+// `what` forced to 0 and mode 2/3 is a channel the train does not drive.
+bool isMeasured(const TrainDef& t) {
+  return (t.mode0 <= 1 && t.meas.what0 != 0) ||
+         (t.mode1 <= 1 && t.meas.what1 != 0);
+}
+
+// The default `report` is a property of the train, the way `when` is a property
+// of its type: a train that measures something writes its MSUM/MRANGE summary
+// to the card without being asked (protocol §2/§4). A 90/91 channel promotes
+// nothing, which is right — with no measurement points there is no summary to
+// write either.
+uint8_t defaultReport(const TrainDef& t) {
+  return isMeasured(t) ? (uint8_t)SJ_REPORT_SD_SUM : 0u;
+}
+
 bool isDefaultTrain(const TrainDef& t) {
   return t.type == PIECEWISE_HOLD && t.mode0 == 3 && t.mode1 == 3 &&
          t.period_us == 10000 && t.duration_us == 500000 &&
@@ -95,7 +113,7 @@ bool isDefaultEnv(const EnvDef& e) {
 bool isDefaultMeas(const TrainDef& t) {
   return t.meas.what0 == 3 && t.meas.what1 == 3 &&
          t.meas.when == defaultWhen(t.type) && t.meas.stage == -1 &&
-         t.meas.report == 0 && t.meas.fit == SJ_FIT_ROTATE;
+         t.meas.report == defaultReport(t) && t.meas.fit == SJ_FIT_ROTATE;
 }
 
 // -------------------------------------------------------------- scan helpers
@@ -233,6 +251,11 @@ bool parseTrainBody(char letter, const char* body, const TrainDef& current,
     setMsg(err, errsz, "mode must be 0-3 or 90/91 (V/I without measurement)");
     return false;
   }
+  // Same shape as the what promotion inside normalizeMode: an unset report
+  // takes the train's default, a non-zero one is a deliberate refinement and
+  // survives a redefinition. Has to run after both modes are known, because
+  // the default is a property of the train and not of one channel.
+  if (staged.meas.report == 0) staged.meas.report = defaultReport(staged);
   if (!expect(p, ',') || !scanULong(p, period))   { setMsg(err, errsz, "bad or missing period_us"); return false; }
   if (!expect(p, ',') || !scanULong(p, duration)) { setMsg(err, errsz, "bad or missing duration_us"); return false; }
   if (period == 0) { setMsg(err, errsz, "period_us must be > 0"); return false; }
@@ -418,7 +441,8 @@ const char* validateEnv(const TrainDef& t, const EnvDef& e) {
 const char* validateMeas(const TrainDef& t, const MeasDef& m, char* warn, size_t warnsz) {
   if (warn && warnsz) warn[0] = '\0';
   if (m.what0 > 3 || m.what1 > 3) return "what must be 0-3";
-  if (m.report > 3)               return "report must be 0-3 (+1 stream, +2 SD)";
+  if (m.report > SJ_REPORT_MAX)
+    return "report must be 0-7 (+1 stream MDATA, +2 MSUM/MRANGE to SD, +4 MDATA to SD)";
   if (m.fit > SJ_FIT_ROTATE)
     return "fit must be 0 (refuse a point that does not fit) or 1 (rotate over repetitions)";
   if (t.type == SINE) {

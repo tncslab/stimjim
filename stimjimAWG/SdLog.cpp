@@ -31,6 +31,8 @@ bool cardPresent()                      { return false; }
 const char* name()                      { return ""; }
 uint32_t bytes()                        { return 0; }
 void noteTrain(uint8_t)                 { }
+void noteEvent(const char*, const char*) { }
+bool autoOpen()                         { return false; }
 void status()                           { noCard("LOG"); }
 void openLog(const char*)               { noCard("LOG"); }
 void closeLog()                         { noCard("LOG"); }
@@ -146,13 +148,26 @@ void noteTrain(uint8_t slot) {
   const TrainDef& t = TrainStore::slotConst(slot);
   char line[SJ_SERIALIZE_MAX];
   TrainStore::serializeTrain(slot, t, line, sizeof line);
-  logFile.printf("# train: %s\n", line);
+  logBytes += (uint32_t)logFile.printf("# train: %s\n", line);
   if (t.type != SINE && !TrainStore::isDefaultEnv(t.env)) {
     TrainStore::serializeEnv(slot, t.env, line, sizeof line);
-    logFile.printf("# train: %s\n", line);
+    logBytes += (uint32_t)logFile.printf("# train: %s\n", line);
   }
   TrainStore::serializeMeas(slot, t.meas, line, sizeof line);
-  logFile.printf("# train: %s\n", line);
+  logBytes += (uint32_t)logFile.printf("# train: %s\n", line);
+}
+
+// A session event, stamped with the same microsecond timebase every row
+// carries, so it maps to a wall clock through the nearest anchor exactly the
+// way a row does. `us=` is the key an anchor line already uses for it.
+void noteEvent(const char* tag, const char* text) {
+  if (!logFile) return;
+  char us[24];
+  Protocol::u64str(SJ_CYC_TO_US(FastIO::cycles64()), us);
+  logBytes += (uint32_t)logFile.printf("# %s: us=%s %s\n", tag, us, text);
+  // Counted as a row so the flush policy in poll() eventually commits it; the
+  // counter is a flush trigger and not a statistic, so mixing the two is fine.
+  rowsSinceFlush++;
 }
 
 // ---------------------------------------------------------------- `LOG`
@@ -172,6 +187,16 @@ static void writeHeader() {
   Commands::writeDump(logFile);
   logFile.println("# columns: timestamp_us,slot,pulse,point,V0_mV,I0_uA,V1_mV,I1_uA");
   writeAnchor();
+}
+
+bool autoOpen() {
+  // cardPresent(), not mount(): a board with an empty socket must not pay an
+  // SDIO probe timeout on every slot commit, and nothing here is worth a line
+  // of output. LOG1 and SDINFO remain the way to pick up a card inserted after
+  // boot, both of which remount.
+  if (logFile || !mounted) return false;
+  openLog(nullptr);
+  return true;
 }
 
 void openLog(const char* name) {

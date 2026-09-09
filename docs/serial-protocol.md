@@ -90,6 +90,15 @@ a deliberate `MEAS` refinement — is preserved, a stored 0 is promoted back to 
 Queries render 90/91 whenever the stored `what` is 0, so the flag round-trips through
 `S<idx>?`/`DUMP`. Any other mode value → `ERR`.
 
+A plain `0`/`1` also promotes a stored `MEAS` `report` of 0 to `+2`, so **a channel that is both
+driven and measured writes its `MSUM`/`MRANGE` summary to the card without being asked** — the
+same promotion rule, one field over: 0 means "unset", a non-zero value is a deliberate refinement
+and survives a redefinition. `90`/`91` promote nothing, because with `what` forced to 0 there are
+no measurement points and so no summary either. Turning the card off for a slot that is driven
+and measured therefore takes an explicit `MEAS<idx>,…,0` *after* the waveform line, the same
+asymmetry `DELAY` has. Nothing is written when no card is in the socket, and nothing is reported
+about it.
+
 > Lab-firmware migration note: the previous lab firmware re-documented 2/3 as
 > voltage/current-without-measurement and 4/5 as hi-Z/ground. That numbering is retired
 > (see §6.8): scripts using modes 2/3 for unmeasured stimulation must switch to 90/91 —
@@ -308,7 +317,26 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>,<fit>
   earlier first-stage-only mode). `W` slots require −1. An `S`/`L` redefinition that shrinks
   the stage count below a stored selection → `ERR` (reset `MEAS` first) — same policy as a
   preserved `ENV` that no longer fits.
-- `report` bitmask: 0 end-of-train summary (always kept), +1 stream `MDATA` lines, +2 log to SD.
+- `report` bitmask, one bit per destination. The end-of-train `MSUM`/`MRANGE` records over serial
+  are always printed, whatever the bits say.
+
+  | bit | | destination |
+  | --- | --- | --- |
+  | 0 | `+1` | stream `MDATA` lines over serial |
+  | 1 | `+2` | `MSUM`/`MRANGE` rows to the SD log |
+  | 2 | `+4` | `MDATA` rows to the SD log |
+
+  A train asking only for `+2` costs the player nothing per repetition — the summary comes out of
+  the accumulators, so no record enters the `MDATA` ring at all.
+
+  **Bit 1 changed meaning.** Before this revision `+2` meant "per-repetition rows to SD"; those
+  moved to `+4`. A script asking for `report=2` now gets four or five summary rows per point
+  instead of one row per repetition.
+
+  The **default** is not a constant: it is `+2` when a channel is both driven and measured, and 0
+  otherwise (§2). An omitted `report` field on a `MEAS` line takes that same default, and `DUMP`
+  serializes a `MEAS` line whenever the stored value differs from it — which is what keeps
+  `report=0` on a driven slot from being promoted back to `+2` by a paste-back.
 - `fit`: what to do when a point's reads do not fit the free gap they live in. **0** = refuse the
   point (nothing measured, reported twice — the pre-Phase-8 behaviour), **1** = rotate the reads
   over consecutive repetitions (the default). Both are detailed below.
@@ -320,7 +348,8 @@ MEAS<idx>? →  MEAS<idx>,<what0>,<what1>,<when>,<stage>,<report>,<fit>
   (documented trade-off; adequate for 13-bit ADC data at the repetition counts a train can
   reach), chosen so a waveform averaged over many repetitions also yields a spread estimate.
 - Defaults: `what0=what1=3`, `when=0` for `S`/`L` slots / `3` for `W` slots, `stage=-1`,
-  `report=0`, `fit=1` — measure everything, summary only (reproduces legacy averaging behavior).
+  `fit=1`, and `report` per §2 (`+2` when a channel is driven and measured, else 0) — measure
+  everything, summary over serial, summary to the card if there is one.
 
 ![what a measurement point needs](../figs/stimjim-timing-measurement.png)
 
@@ -433,6 +462,36 @@ prints its summary, so a long averaging run can be ended when it has enough repe
 `MRANGE,<slot>,<n>,<point>,<V0_min>,<V0_max>,<I0_min>,<I0_max>,<V1_min>,<V1_max>,<I1_min>,<I1_max>`
 — the extremes of the *individual* readings, in the same units and the same field positions the
 means occupy in `MSUM`, empty where not measured.
+
+**`MSUM`/`MRANGE` on the card** (`report` bit 1). The CSV column shape does not change, so a
+summary is not a new record type: it is a normal row whose **repetition column carries a negative
+record code** instead of a pulse index. The `point` column is untouched, so per-point (per-stage)
+reporting survives, and a host that already parses log rows only has to learn five codes:
+
+| `<pulse>` | what the four value columns hold |
+| --- | --- |
+| `-1` | `MSUM` means |
+| `-2` | `MSUM` sample standard deviations |
+| `-3` | `MRANGE` minima |
+| `-4` | `MRANGE` maxima |
+| `-5` | each line's own repetition count `n` |
+
+Five rows per measured point, all sharing one timestamp — when the summary was written, a few
+microseconds after the train's completion record was popped. Empty fields mean the same thing they
+do in a data row. The `-5` row carries four counts rather than `MSUM`'s single "largest of the
+lines' counts": under read rotation the lines differ, and which line got how many reads is exactly
+what one field cannot say. Its columns are counts, not mV/µA — the record code is what says so.
+
+```
+# columns: timestamp_us,slot,pulse,point,V0_mV,I0_uA,V1_mV,I1_uA
+1204993,4,0,0,2207.34,,1997.90,        <- a data row (report +4)
+1214993,4,1,0,2207.10,,1997.88,
+1450221,4,-1,0,2207.22,,1997.95,       <- MSUM mean
+1450221,4,-2,0,0.31,,0.28,             <- MSUM sd
+1450221,4,-3,0,2206.12,,1996.90,       <- MRANGE min
+1450221,4,-4,0,2208.56,,1999.34,       <- MRANGE max
+1450221,4,-5,0,512,,512,               <- n per line
+```
 
 A mean and a spread describe the bulk of a train and hide a single excursion almost completely:
 one repetition in five hundred that reached the output driver's ceiling moves the mean by a
@@ -584,10 +643,27 @@ LOG1[,<name>]  →  same record                      open; no name = next free L
 LOG0           →  same record                      close and flush
 ```
 
-Rows are written only for slots whose `MEAS` `report` has bit 1 set (`+2`), in the frozen CSV
-form above. Only `loop()` touches the card, on the Teensy's native SDIO — never the DAC/ADC SPI
-bus — so a write-latency spike cannot disturb a waveform. Data is flushed at each train end,
-every 64 rows, or once a second, whichever comes first.
+**A log opens itself.** At boot, after the EEPROM restore, and after every slot commit, the box
+opens the next free `LOGnnnn.CSV` if any slot's `MEAS` `report` has an SD bit set (`+2` or `+4`)
+and no file is open — which, with the `+2` promotion of §2, means a stored waveform that drives
+and measures a channel is enough. So a headless box wired to a trigger logs from power-up with no
+host involved.
+
+The automatic path gets **one attempt**, and `LOG0` overrules it: after either, no log opens
+behind the operator's back until `LOG1` asks for one. The single attempt is what keeps a failure
+quiet — a card with no free `LOGnnnn.CSV` name reports itself once instead of on every slot
+commit.
+
+With no card in the socket nothing is attempted, nothing is printed, and the SDIO bus is never
+re-probed: the automatic path costs an empty socket a hundred byte tests per commit and no more.
+Because no attempt was made, none was spent — insert a card, remount it with `SDINFO` or `LOG1`,
+and the next slot commit opens a log as it would have at boot.
+
+Rows are written for slots whose `MEAS` `report` asks for them: summary rows on `+2`,
+per-repetition rows on `+4`, in the frozen CSV form above. Only `loop()` touches the card, on the
+Teensy's native SDIO — never the DAC/ADC SPI bus — so a write-latency spike cannot disturb a
+waveform. Data is flushed at each train end, every 64 rows, or once a second, whichever comes
+first.
 
 **What a write-latency spike does cost** is measurement records, never waveform timing: the player
 ISR (priority 64, preempting `loop()` unconditionally) only pushes a record into the 128-entry
@@ -606,11 +682,33 @@ no host attached, so the file carries:
    taken with is recorded next to them — written when the file is opened;
 2. the `# columns:` names;
 3. a `# train:` block for every train that arms while the file is open, giving that slot's
-   canonical `S`/`L`/`W` line plus its `ENV`/`MEAS` lines. This is what records configuration
-   changes made *after* the file was opened;
+   canonical `S`/`L`/`W` line plus its `ENV`/`MEAS` lines — what that train actually plays;
 4. `# clock: <ISO 8601> src=<build|batt|host> us=<microseconds since boot>` anchor lines, written
    when the file is opened, before every `# train:` block, and at most once a minute while rows
-   are being written.
+   are being written;
+5. one `# set: us=<microseconds since boot> <line>` line per configuration change made while the
+   file is open, `<line>` being the canonical round-trip form the setter echoed over serial. This
+   is what records changes made *after* the file was opened, rather than only the header's `DUMP`
+   block from when it was. The setters in scope are `S`/`L`/`W`, `ENV`, `MEAS`, `DT`, `DELAY`,
+   `TRIG`, `R`, `CAL`, `CALDEF`, `M`, `P` and `CLK`. Deliberately out of scope: `V`/`A`, which are
+   immediate output writes rather than configuration and which a host sweeping amplitudes would
+   fill a file with, and `B`/`C` offset recalibration. The `us=` value maps to a wall clock
+   through the nearest anchor, exactly the way a row's timestamp does;
+6. one line per train recording what it actually did — the pulse count and both timing-fault
+   counters, which otherwise exist only on the serial port, so a file can answer "what happened"
+   and not merely "what was configured". Both shapes are fixed: every counter is present even at
+   zero, so a parser needs no optional keys.
+
+   ```
+   # done: us=<n> train=<n> slot=<n> pulses=<n> late=<n> maxlate_ns=<n> overdue=<n> maxoverdue_ns=<n> startneed_us=<n>
+   # stop: us=<n> slot=<n> late=<n> maxlate_ns=<n> overdue=<n> maxoverdue_ns=<n>
+   ```
+
+   `stop` is a train ended by hand (`T-1`/`U-1`), which pushes no completion record: only the slot
+   and the fault counters are known there, so a separate tag rather than a `done` line with
+   invented fields. The counters mean what §4's `WARN engine:` and `# engine:` lines mean, and
+   `startneed_us` is 0 unless the arm did not fit `CAL STARTLAT`. Neither line is gated on
+   `report`: a train running is a session event, not a measurement.
 
 **The CSV columns do not change and will not.** Host tools depend on their shape, and rendering a
 wall clock per row would add cost to exactly the path this phase set out to make cheaper. Any
@@ -814,7 +912,7 @@ the calibration offsets), so outputs never move; `BENCHSQ`/`BENCHSQL` do drive t
 | `BENCHCYC[,n]` | `cycles64()` overhead |
 | `BENCHK[,n]` | re-run the `K_RELOAD` self-calibration, print residual min/med/max (item 6) |
 | `BENCHFMT[,n]` | the number formatting of one `MDATA`/log row: four field conversions plus the row, with no serial write and no card. What it bounds is the sustainable row rate and through that the `MDATA` ring's headroom — never waveform timing |
-| `BENCHSD[,rows]` | the card write after the formatting: SdFat's buffered `println` plus the flush policy, driven as `loop()` drives it. Writes and then deletes `BENCHSD.CSV`, and is refused while a log is open |
+| `BENCHSD[,rows]` | the card write after the formatting: SdFat's buffered `println` plus the flush policy, driven as `loop()` drives it. Writes and then deletes `BENCHSD.CSV`, and is refused while a log is open — which, since a log now opens itself, usually means `LOG0` first. Its own scratch file does not touch the auto-open latch |
 | `BENCHARM,slot[,n]` | `Engine::startTrain` on that slot — the arm cost `CAL STARTLAT` has to cover. The train is stopped again inside the same bus lock, so nothing plays and the outputs stay parked |
 | `BENCHSETTLE,ch,code,dmax_us[,n]` | the same DAC step latched over and over and read back at delays 0…`dmax_us`, so the delay at which the readings stop moving is `CAL SETTLE`. Drives the output — set the channel's mode first (`M<ch>,0`) and print a `WARN` |
 | `BENCHPIT,period_us,n[,preload_us]` | PIT wake (preload 0) or post-spin latch jitter vs absolute deadline, histogram in 0.5 µs bins |
@@ -935,8 +1033,16 @@ Deliberate behavior changes (documented compat risk, all fail-loudly):
     defined by the line, never inherited.
 12. `R` now writes the routing table instead of erroring, and `DUMP` emits `TRIG` lines as real
     set-commands rather than `#` comments, so a dump pastes back complete.
-13. `MEAS` with a non-zero `report` no longer warns that streaming is deferred — both `MDATA`
-    streaming (bit 0) and SD logging (bit 1) now do what they say.
+13. `MEAS` `report` has three bits, not two, and **bit 1 changed meaning**: `+2` is now
+    `MSUM`/`MRANGE` to the card and the per-repetition rows moved to `+4` (§4). A script asking
+    for `report=2` gets summary rows where it used to get one row per repetition. Fails quietly
+    rather than loudly — it is a different, valid request — so it is called out here and in §4.
+    Two consequences follow from the same change: a plain `0`/`1` mode field promotes an unset
+    `report` to `+2`, so a driven and measured channel logs its summary by itself (§2), and the
+    default `report` is therefore no longer the constant 0.
+
+    A stored EEPROM image is not invalidated (no struct change, no version bump), so a persisted
+    `report=2` shifts meaning the same way — check with `MEAS<idx>?` after an upgrade.
 14. `BENCHDAC2` reaches the dual-channel bench. The command word is the leading *alphabetic*
     run of a line, which stopped in front of the `2`, so `BENCHDAC2,2000` used to run
     `BENCHDAC` with a repetition count of 2 — visible only in its own reply. `BENCH`

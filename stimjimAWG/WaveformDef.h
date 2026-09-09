@@ -55,7 +55,8 @@ struct EnvDef {
 // onto what=0); when: type-specific — S/L: 0 = near stage end; W: 1 = +peak,
 // 2 = -peak, 3 = both peaks (one period per burst); stage: -1 = all stages,
 // 0..nStages-1 = that stage only (S/L; W requires -1);
-// report bitmask: +1 stream MDATA, +2 log to SD (summary always kept);
+// report bitmask (SJ_REPORT_* below); the end-of-train summary over serial is
+// always kept, whatever the bits say.
 // fit: what to do when the reads of one point do not fit the free gap they
 // live in — 0 = refuse the point (loud, nothing measured), 1 = rotate, i.e.
 // split the reads into groups that do fit and fire one group per repetition.
@@ -70,6 +71,18 @@ struct MeasDef {
 };
 #define SJ_FIT_STRICT 0
 #define SJ_FIT_ROTATE 1
+
+// MeasDef.report, one bit per destination. Bit 1 used to mean "rows to SD" and
+// now means "summaries to SD": the per-repetition rows moved to bit 2, so the
+// two things a log can hold are selectable independently.
+#define SJ_REPORT_STREAM   1u   // MDATA lines over serial
+#define SJ_REPORT_SD_SUM   2u   // MSUM/MRANGE rows to the card
+#define SJ_REPORT_SD_DATA  4u   // MDATA rows to the card
+#define SJ_REPORT_SD       (SJ_REPORT_SD_SUM | SJ_REPORT_SD_DATA)
+// Which bits make the player push into the MDATA ring at all: a train asking
+// only for summaries costs the ring, and loop(), nothing per repetition.
+#define SJ_REPORT_PER_REP  (SJ_REPORT_STREAM | SJ_REPORT_SD_DATA)
+#define SJ_REPORT_MAX      (SJ_REPORT_STREAM | SJ_REPORT_SD)
 
 struct TrainDef {
   uint8_t  type;          // TrainType

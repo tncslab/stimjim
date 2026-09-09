@@ -92,6 +92,15 @@ void milliToStr(long long milli, char* buf);
 
 // ------------------------------------------------------------------ defaults
 uint8_t defaultWhen(uint8_t type);            // 0 for S/L, 3 for W (protocol §5)
+// Whether the train would measure anything: some channel driven (mode 0/1) with
+// a non-zero `what`. What decides both the default `report` and whether a slot
+// counts as "configured to write to a log" — a stored SD bit on a slot that
+// measures nothing would produce no rows, so it must not open one.
+bool isMeasured(const TrainDef& t);
+// The slot's default `report`: SJ_REPORT_SD_SUM when the train measures
+// something, else 0 (protocol §2). Needed outside this module because an
+// omitted `report` field on a MEAS line takes it, the same as `when` does.
+uint8_t defaultReport(const TrainDef& t);
 bool isDefaultTrain(const TrainDef& t);       // ignores env/meas
 bool isDefaultEnv(const EnvDef& e);
 bool isDefaultMeas(const TrainDef& t);        // auto-when aware

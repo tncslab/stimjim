@@ -207,13 +207,67 @@ int main() {
   CHECK(warn[0] == '\0');
   CHECK(TrainStore::validateMeas(cur, {4, 3, 0, -1, 0, 0}, warn, sizeof warn) != nullptr);  // what > 3
   CHECK(TrainStore::validateMeas(cur, {3, 3, 1, -1, 0, 0}, warn, sizeof warn) != nullptr);  // sine-peak code on S slot
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 4, 0}, warn, sizeof warn) != nullptr);  // report > 3
+  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 8, 0}, warn, sizeof warn) != nullptr);  // report > 7
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  0, 0, 0}, warn, sizeof warn) != nullptr);  // stage 0 on a 0-stage slot
-  // Both report bits are implemented now, so neither warns any more.
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 1, 0}, warn, sizeof warn) == nullptr);  // stream MDATA
-  CHECK(warn[0] == '\0');
-  CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, 3, 0}, warn, sizeof warn) == nullptr);  // stream + SD
-  CHECK(warn[0] == '\0');
+  // All three report bits are implemented, so none of them warns.
+  for (uint8_t r = 0; r <= SJ_REPORT_MAX; r++) {
+    CHECK(TrainStore::validateMeas(cur, {3, 3, 0, -1, r, 0}, warn, sizeof warn) == nullptr);
+    CHECK(warn[0] == '\0');
+  }
+
+  // ------------------------------------------- default report (protocol §2/§4)
+  //
+  // A channel that is both driven and measured writes its summary to the card
+  // without being asked; 90/91 (V/I, measurement off) ask for nothing, and so
+  // does an undriven channel.
+  TrainDef dr;
+  TrainStore::slotDefault(dr);                       // modes 3/3: not driven
+  CHECK(!TrainStore::isMeasured(dr));
+  CHECK(TrainStore::defaultReport(dr) == 0);
+  dr.mode0 = 0;                                      // driven and measured (what0 = 3)
+  CHECK(TrainStore::isMeasured(dr));
+  CHECK(TrainStore::defaultReport(dr) == SJ_REPORT_SD_SUM);
+  dr.meas.what0 = 0;                                 // what 90 stores
+  CHECK(!TrainStore::isMeasured(dr));
+  CHECK(TrainStore::defaultReport(dr) == 0);
+  dr.mode1 = 1; dr.meas.what1 = 3;                   // the other channel carries it
+  CHECK(TrainStore::isMeasured(dr));
+  CHECK(TrainStore::defaultReport(dr) == SJ_REPORT_SD_SUM);
+  // The promotion never clears a bit, so a slot switched back to undriven modes
+  // keeps the report it was given -- and must then not count as "configured to
+  // log", because it can write no rows. That is what isMeasured is for.
+  dr.mode0 = dr.mode1 = 3;
+  dr.meas.report = SJ_REPORT_SD_SUM;
+  CHECK(!TrainStore::isMeasured(dr));
+  CHECK((dr.meas.report & SJ_REPORT_SD) != 0);
+
+  // The promotion happens at parse time, on the same rule normalizeMode uses
+  // for `what`: an unset report takes the default, a deliberate one survives.
+  TrainDef pr;
+  TrainStore::slotDefault(pr);
+  CHECK(parse('S', ",0,1,1000,10000;1,1,10", t, err, warn, &pr));
+  CHECK(t.meas.report == SJ_REPORT_SD_SUM);          // plain 0/1 promotes
+  CHECK(TrainStore::isDefaultMeas(t));               // ... and stays "default"
+  CHECK(parse('S', ",90,91,1000,10000;1,1,10", t, err, warn, &pr));
+  CHECK(t.meas.what0 == 0 && t.meas.what1 == 0);
+  CHECK(t.meas.report == 0);                         // nothing measured, nothing logged
+  // 90/91 is not a default MEAS and never was: `what` is 0 rather than 3, which
+  // round-trips through the mode field of the S line and a MEAS line both.
+  CHECK(!TrainStore::isDefaultMeas(t));
+  CHECK(parse('S', ",2,3,1000,10000;1,1,10", t, err, warn, &pr));
+  CHECK(t.meas.report == 0);                         // undriven channels ask for nothing
+  pr.meas.report = SJ_REPORT_STREAM;                 // an explicit refinement ...
+  CHECK(parse('S', ",0,0,1000,10000;1,1,10", t, err, warn, &pr));
+  CHECK(t.meas.report == SJ_REPORT_STREAM);          // ... survives a redefinition
+  CHECK(!TrainStore::isDefaultMeas(t));              // ... and so serializes in DUMP
+  pr.meas.report = 0;
+
+  // A DUMP round-trip in both directions: a slot whose owner turned the card
+  // off must serialize a MEAS line, or replaying its S line would turn it back
+  // on. This is what the default-report rule in isDefaultMeas is there for.
+  TrainDef off = t;
+  off.meas.report = 0;
+  CHECK(!TrainStore::isDefaultMeas(off));
   cur.nStages = 2;                                                     // per-stage selection in range
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  1, 0, 0}, warn, sizeof warn) == nullptr);
   CHECK(TrainStore::validateMeas(cur, {3, 3, 0,  2, 0, 0}, warn, sizeof warn) != nullptr);

@@ -525,7 +525,9 @@ void fire(uint8_t eng, uint32_t pulseIdx, uint64_t atCyc, int32_t envQ15) {
     }
   }
 
-  if (!(p.report & 3)) return;             // summary only: nothing to stream
+  // Summary-only trains never reach the ring: MSUM/MRANGE come out of the
+  // accumulators above, so asking for them costs the player nothing here.
+  if (!(p.report & SJ_REPORT_PER_REP)) return;
   const uint16_t h = rHead, next = (uint16_t)((h + 1) & (SJ_MDATA_RING - 1));
   if (next == rTail) { rDropped++; return; }
   Rec& r = ring[h];
@@ -633,7 +635,7 @@ static inline void fieldSpread(char* b, size_t n, bool have, double sdRaw, uint8
 // — so the log block and the warnings always precede that train's rows.
 static void printNote(uint8_t eng) {
   const Plan& p = plan_[eng][live[eng]];
-  if (p.report & 2) SdLog::noteTrain(p.slot);
+  if (p.report & SJ_REPORT_SD) SdLog::noteTrain(p.slot);
   if (p.skipMask) {
     for (uint8_t i = 0; i < p.nPoints; i++) {
       if (!(p.skipMask & (1u << i))) continue;
@@ -700,12 +702,12 @@ void poll() {
     // everything after their first field.
     char tail[128];
     const size_t tlen = (size_t)(recTail(tail, r) - tail);
-    if (r.report & 1) {
+    if (r.report & SJ_REPORT_STREAM) {
       Serial.write("MDATA,", 6);
       Serial.write((const uint8_t*)tail, tlen);
       Serial.write('\n');
     }
-    if (r.report & 2) {
+    if (r.report & SJ_REPORT_SD_DATA) {
       // Microseconds since boot outgrow 32 bits after 71 minutes, so the
       // timestamp is rendered by hand rather than trusting printf's %llu.
       char row[160];
@@ -797,6 +799,43 @@ void resultSnapshot(uint8_t eng, uint8_t slot, uint32_t trainNo, ResultSet& out)
   out.valid = (p.nPoints != 0);
 }
 
+// ------------------------------------------------- MSUM/MRANGE on the card
+//
+// The CSV column shape is a compatibility promise (protocol §4), so a summary
+// is not a new record type but a normal row whose *repetition* column carries a
+// negative record code instead of a pulse index. The point column is untouched,
+// so per-point (per-stage) reporting survives, and a host that already parses
+// rows only has to learn five codes.
+#define SJ_SUMROW_MEAN  1   // the four value columns hold MSUM means
+#define SJ_SUMROW_SD    2   // ... MSUM sample standard deviations
+#define SJ_SUMROW_MIN   3   // ... MRANGE minima
+#define SJ_SUMROW_MAX   4   // ... MRANGE maxima
+#define SJ_SUMROW_N     5   // ... each line's own repetition count
+
+// One such row. The four field strings are already formatted and calibrated by
+// the same helpers MSUM prints through, and an unread line is the empty string,
+// which is the empty column the format calls for.
+static void writeSummaryRow(uint8_t code, uint8_t slot, uint16_t point, uint64_t us,
+                            const char* v0, const char* v1,
+                            const char* v2, const char* v3) {
+  char row[160];
+  char* q = putU64(row, us);
+  *q++ = ',';
+  q = putU32(q, slot);   *q++ = ',';
+  *q++ = '-';                       // every code is negative: one sign, written here
+  q = putU32(q, code);   *q++ = ',';
+  q = putU32(q, point);
+  const char* v[4] = {v0, v1, v2, v3};
+  for (uint8_t k = 0; k < 4; k++) {
+    *q++ = ',';
+    const size_t n = strlen(v[k]);
+    memcpy(q, v[k], n);
+    q += n;
+  }
+  *q = '\0';
+  SdLog::writeRow(row);
+}
+
 bool printSummary(uint8_t eng, uint8_t slot) {
   // The finished train's buffer, not the live one: the engine may already have
   // been re-armed onto the other buffer, and with two of them that no longer
@@ -847,6 +886,34 @@ bool printSummary(uint8_t eng, uint8_t slot) {
     Serial.printf("MRANGE,%u,%lu,%u,%s,%s,%s,%s,%s,%s,%s,%s\n",
                   p.slot, (unsigned long)n, p.label[i],
                   g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+    // The same numbers to the card, in the row format. Interleaving in f/g is
+    // mean,sd / min,max per line, so the even indices are one row and the odd
+    // ones the other; the four columns are V0,I0,V1,I1 either way.
+    // isOpen() as well as the bit: with a driven channel setting the bit by
+    // itself, a board with an empty socket would otherwise format five rows per
+    // point per train and throw them all away.
+    if ((p.report & SJ_REPORT_SD_SUM) && SdLog::isOpen()) {
+      // One timestamp for the whole point, read once: this is when the summary
+      // was written, a few microseconds after the completion record was popped.
+      const uint64_t us = SJ_CYC_TO_US(FastIO::cycles64());
+      writeSummaryRow(SJ_SUMROW_MEAN, p.slot, p.label[i], us, f[0], f[2], f[4], f[6]);
+      writeSummaryRow(SJ_SUMROW_SD,   p.slot, p.label[i], us, f[1], f[3], f[5], f[7]);
+      writeSummaryRow(SJ_SUMROW_MIN,  p.slot, p.label[i], us, g[0], g[2], g[4], g[6]);
+      writeSummaryRow(SJ_SUMROW_MAX,  p.slot, p.label[i], us, g[1], g[3], g[5], g[7]);
+      // Each line's own n, not MSUM's "largest of the lines' counts": under
+      // read rotation the lines differ, and which line got how many reads is
+      // exactly what the single field cannot say. Counts, not mV/uA — the
+      // record code is what tells a reader that.
+      char c[4][12];
+      for (uint8_t ch = 0; ch < 2; ch++)
+        for (uint8_t ln = 0; ln < 2; ln++) {
+          const Accum& a = p.acc[i][ch][ln];
+          char* e = c[ch * 2 + ln];
+          if (a.n) e = putU32(e, a.n);   // unread line stays the empty field
+          *e = '\0';
+        }
+      writeSummaryRow(SJ_SUMROW_N, p.slot, p.label[i], us, c[0], c[1], c[2], c[3]);
+    }
     if (p.skipMask & (1u << i))
       Serial.printf("# MSUM point %u: needs %lu us, only %lu us free — not measured\n",
                     p.label[i],
