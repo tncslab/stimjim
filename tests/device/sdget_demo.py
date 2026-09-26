@@ -2,6 +2,7 @@
 
     python sdget_demo.py COM4
     python sdget_demo.py /dev/ttyACM0 --save logs/ --write chunk
+    python sdget_demo.py /dev/ttyACM0 --set-clock
 
 Which file is the newest: the open log if there is one (`LOG?`), otherwise the
 highest-numbered `LOGnnnn.CSV` on the card (`SDLIST`). The firmware names a new log
@@ -24,11 +25,18 @@ and whatever that train prints (completion, `MSUM`, `MDATA`, ring overflow) wait
 and arrives before the next reply. The script collects every such line and warns,
 because it means (a) the file grew after the snapshot was taken and (b) a long
 chunk kept `loop()` from draining the `MDATA` ring, which can drop records.
+
+Clock: `set_clock` gives the board this host's UTC time before a measurement, so
+the log's `# clock:` anchors read `src=host` rather than a compile time. It is
+meant to be called by the Pi that runs the session, but uses only `time.time_ns()`
+and the serial port, so any host works; on Linux it also warns when `timedatectl`
+says the host clock itself is not NTP-synchronized.
 """
 
 import argparse
 import os
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -109,6 +117,82 @@ def sdget(ser, name, offset, length, stray):
     if crc != zlib.crc32(payload):                  # zlib's CRC-32 is CRC-32/ISO-HDLC
         raise IOError(f"CRC mismatch at offset {offset}")
     return payload, total
+
+
+def clk_exchange(ser, line):
+    """Send one CLK command -> (reply fields, host ns at write, host ns at reply).
+
+    Times the exchange itself rather than going through `StimJim.cmd`, whose
+    silence wait would add 0.3 s to every round trip. Lines ahead of the record
+    (a train finishing) are dropped; the one `#` line after it is consumed.
+    """
+    deadline = time.time() + 2.0
+    t_write = time.time_ns()
+    ser.write((line + "\n").encode())
+    ser.flush()
+    while True:
+        reply = read_line(ser, deadline)
+        if reply.startswith("CLK,"):
+            break
+        if reply.startswith("ERR"):
+            raise RuntimeError(f"{line} -> {reply}")
+    t_reply = time.time_ns()
+    assert read_line(ser, deadline).startswith("#"), "missing '# clock:' line"
+    _, secs, ms, us, src = reply.split(",")
+    return (int(secs), int(ms), int(us), src), t_write, t_reply
+
+
+def host_clock_synced():
+    """True/False when the OS can say whether its clock is NTP-disciplined, else None.
+
+    A Raspberry Pi has no RTC: until NTP answers, it runs on fake-hwclock, i.e.
+    the time it was last shut down, and handing that to the board is worse than
+    leaving it at `build`, because the source would then read `host`.
+    """
+    try:
+        r = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                           capture_output=True, text=True, timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None                                 # not systemd (Windows, macOS, ...)
+    return {"yes": True, "no": False}.get(r.stdout.strip())
+
+
+def set_clock(sj, probes=5):
+    """Set the board's RTC to this host's UTC time and check it -> dict.
+
+    The firmware sets the clock when it parses the line, about half a round trip
+    after the write, so the value sent is the host time at the write plus half of
+    the shortest of `probes` `CLK?` round trips. The read-back offset is
+    board time minus the midpoint of the exchange, taken from the fastest of
+    `probes` reads; its uncertainty is half that read's round trip plus the RTC's
+    millisecond display step. `time.time_ns()` is UTC on every OS, so this works
+    the same from a Pi, a Linux PC or Windows.
+
+    Returns offset_ms, rtt_ms, src, and the (unix_ms, us_since_boot) anchor pair.
+    """
+    ser = sj.ser
+    if host_clock_synced() is False:
+        warn("host clock is not NTP-synchronized (timedatectl); the board will get "
+             "whatever this host believes, labelled src=host")
+    stray = sj.drain(quiet=0.1)                     # nothing may sit ahead of the timed replies
+    if stray:
+        warn(f"board was printing before CLK: {stray[:3]}")
+
+    rtt = min(b - a for _, a, b in (clk_exchange(ser, "CLK?") for _ in range(probes)))
+    target = time.time_ns() + rtt // 2              # when the board will parse what we send
+    secs, rem = divmod(target, 1_000_000_000)
+    (_, _, _, src), _, _ = clk_exchange(ser, f"CLK,{secs},{rem // 1_000_000}")
+    if src != "host":
+        raise RuntimeError(f"CLK accepted but src={src}, expected host")
+
+    best = None
+    for _ in range(probes):
+        (secs, ms, us, src), a, b = clk_exchange(ser, "CLK?")
+        if best is None or b - a < best[1]:
+            best = (secs * 1000 + ms - (a + b) / 2e6, b - a, secs * 1000 + ms, us)
+    offset_ms, rtt_ns, unix_ms, us = best
+    return {"offset_ms": offset_ms, "rtt_ms": rtt_ns / 1e6, "src": src,
+            "anchor": (unix_ms, us)}
 
 
 def latest_log(sj):
@@ -241,9 +325,18 @@ def main(argv):
                     help="end: write once the whole file has arrived; chunk: write each "
                          "chunk as soon as its CRC passes, so a failed transfer keeps "
                          "what arrived (default: end)")
+    ap.add_argument("--set-clock", action="store_true",
+                    help="set the board's clock to this host's UTC time first (set_clock); "
+                         "a Pi does this before a measurement so the log's '# clock:' "
+                         "anchors read src=host")
     args = ap.parse_args(argv)
 
     with StimJim(args.port) as sj:
+        if args.set_clock:
+            c = set_clock(sj)
+            print(f"clock set: offset {c['offset_ms']:+.1f} ms, round trip "
+                  f"{c['rtt_ms']:.2f} ms, src={c['src']}, anchor unix_ms={c['anchor'][0]} "
+                  f"us_since_boot={c['anchor'][1]}")
         name, is_open = latest_log(sj)
         path = None
         if args.save:
